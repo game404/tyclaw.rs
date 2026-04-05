@@ -1,0 +1,14 @@
+[package]
+name = "tyclaw-provider"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tyclaw-types = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+futures-util = { workspace = true }

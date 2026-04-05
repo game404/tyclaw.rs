@@ -1,0 +1,33 @@
+# Rust 编译产物
+target/
+
+# 运行时数据（不提交）
+.active_tasks.json
+
+# workspace 运行时产物
+workspace/logs/
+workspace/works/
+workspace/audit/
+workspace/tmp/
+workspace/.active_tasks.json
+workspace/.dispatch-*
+
+# 敏感配置（真实 key 不提交，用 config.example.yaml 作模板）
+workspace/config/config.yaml
+crates/dingtalk-gateway/config.yaml
+config.yaml
+config.yaml.backup
+key.txt
+
+# CLI 历史
+.tyclaw_cli_history
+
+AGENTS.md
+openspec/
+
+# macOS
+.DS_Store
+
+# 备份
+*.back/
+*.bak/

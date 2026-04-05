@@ -1,0 +1,28 @@
+[package]
+name = "tyclaw-orchestration"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tyclaw-types = { workspace = true }
+tyclaw-provider = { workspace = true }
+tyclaw-tools = { workspace = true }
+tyclaw-control = { workspace = true }
+tyclaw-memory = { workspace = true }
+tyclaw-prompt = { workspace = true }
+tyclaw-agent = { workspace = true }
+tyclaw-sandbox = { path = "../tyclaw-sandbox" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }
+uuid = { workspace = true }
+glob = "0.3"
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

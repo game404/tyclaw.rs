@@ -1,0 +1,14 @@
+[package]
+name = "tyclaw-sandbox"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tyclaw-types = { workspace = true }
+tyclaw-tool-abi = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+md-5 = { workspace = true }

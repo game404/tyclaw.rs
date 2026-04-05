@@ -1,0 +1,11 @@
+# DingTalk Gateway 配置
+
+dingtalk:
+  client_id: "YOUR_DINGTALK_APP_KEY"
+  client_secret: "YOUR_DINGTALK_APP_SECRET"
+  # 上游连接数（向钉钉服务器建立的 WebSocket 并发连接数）
+  upstream_connections: 30
+
+gateway:
+  # 网关监听地址（TyClaw 实例连接此地址）
+  listen_addr: "0.0.0.0:9100"

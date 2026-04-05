@@ -1,0 +1,18 @@
+[package]
+name = "tyclaw-client"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tyclaw-client"
+path = "src/main.rs"
+
+[dependencies]
+tyclaw-orchestration = { workspace = true }
+tyclaw-provider = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+serde_json = { workspace = true }

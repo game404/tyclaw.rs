@@ -1,0 +1,26 @@
+[package]
+name = "tyclaw-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tyclaw"
+path = "src/main.rs"
+
+[dependencies]
+tyclaw-provider = { workspace = true }
+tyclaw-orchestration = { workspace = true }
+tyclaw-channel = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tyclaw-tools = { workspace = true }
+tyclaw-sandbox = { path = "../tyclaw-sandbox" }
+rustyline = "17.0.2"
+reqwest = { workspace = true }
+time = { version = "0.3", features = ["local-offset", "macros", "formatting"] }

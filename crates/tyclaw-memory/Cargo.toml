@@ -1,0 +1,23 @@
+[package]
+name = "tyclaw-memory"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tyclaw-types = { workspace = true }
+tyclaw-provider = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+tyclaw-prompt = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+lazy_static = "1"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

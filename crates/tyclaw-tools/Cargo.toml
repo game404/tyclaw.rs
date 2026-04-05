@@ -1,0 +1,32 @@
+[package]
+name = "tyclaw-tools"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tyclaw-types = { workspace = true }
+tyclaw-tool-abi = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+shellexpand = "3"
+parking_lot = { workspace = true }
+glob = "0.3"
+urlencoding = { workspace = true }
+croner = "2"
+chrono-tz = "0.10"
+md-5 = { workspace = true }
+base64 = { workspace = true }
+scraper = "0.22"
+readability = "0.3.0"
+futures-util.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
