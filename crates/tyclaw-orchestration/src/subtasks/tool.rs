@@ -433,10 +433,10 @@ impl Tool for DispatchSubtasksTool {
                 } else {
                     output.clone()
                 };
+                let hint = super::prompt_loader::dispatch_single_result_hint();
                 append_dispatch_summary_metadata(
-                    format!("✅ **{}** ({:.0}s): {}\n   Detail: `{}`\n\n---\nStats: 1 succeeded | {:.1}s\n\
-                             Use `read_file` on the detail path if you need the full output.",
-                        plan.nodes[0].id, duration_s, preview, display_path, duration_s),
+                    format!("✅ **{}** ({:.0}s): {}\n   Detail: `{}`\n\n---\nStats: 1 succeeded | {:.1}s\n{}",
+                        plan.nodes[0].id, duration_s, preview, display_path, duration_s, hint.trim()),
                     &summary,
                 )
             } else {
@@ -596,11 +596,12 @@ impl Tool for DispatchSubtasksTool {
             ));
         }
 
+        let hint = super::prompt_loader::dispatch_multi_result_hint();
         result.push_str(&format!(
             "---\nStats: {succeeded} succeeded / {failed} failed / {skipped} skipped | \
-             wall time {:.1}s\n\
-             Use `read_file` on the detail paths above if you need the full output of any subtask.",
-            total_duration_ms as f64 / 1000.0
+             wall time {:.1}s\n{}",
+            total_duration_ms as f64 / 1000.0,
+            hint.trim(),
         ));
         let summary = DispatchStructuredSummary {
             plan_id: plan.id.clone(),

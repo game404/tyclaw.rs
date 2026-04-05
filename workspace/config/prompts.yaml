@@ -770,3 +770,24 @@ nudges:
   # 工具参数校验失败后催促重试
   param_error_retry: |
     [System] 你上一次工具调用的参数格式有误，导致执行失败。请检查错误信息，修正参数后重新调用工具。不要放弃，直接重试。
+
+
+# ============================================================================
+# 第四部分：内联模板文本（代码中引用，统一外置管理）
+# ============================================================================
+
+# dispatch 单节点结果返回给主控的提示
+dispatch_single_result_hint: |
+  如需查看完整输出，请对上方 detail 路径使用 `read_file`。
+
+# dispatch 多节点结果返回给主控的提示
+dispatch_multi_result_hint: |
+  如需查看某个子任务的完整输出，请对上方 detail 路径使用 `read_file`。
+
+# sub-agent 上游输出被截断时的提示（{detail_path} 运行时替换）
+upstream_truncated_hint: |
+  完整输出已保存至 `{detail_path}`，如需详情请用 `read_file` 读取。
+
+# sub-agent 上游输出完整时的路径提示
+upstream_full_hint: |
+  完整输出同时保存在 `{detail_path}`。

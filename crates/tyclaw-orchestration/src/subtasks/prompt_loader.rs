@@ -54,3 +54,21 @@ pub fn case_extractor_prompt() -> String {
 pub fn memory_consolidation_prompt() -> String {
     tyclaw_prompt::prompt_store::get("memory_consolidation_prompt")
 }
+
+pub fn dispatch_single_result_hint() -> String {
+    tyclaw_prompt::prompt_store::get("dispatch_single_result_hint")
+}
+
+pub fn dispatch_multi_result_hint() -> String {
+    tyclaw_prompt::prompt_store::get("dispatch_multi_result_hint")
+}
+
+pub fn upstream_truncated_hint(detail_path: &str) -> String {
+    tyclaw_prompt::prompt_store::get("upstream_truncated_hint")
+        .replace("{detail_path}", detail_path)
+}
+
+pub fn upstream_full_hint(detail_path: &str) -> String {
+    tyclaw_prompt::prompt_store::get("upstream_full_hint")
+        .replace("{detail_path}", detail_path)
+}

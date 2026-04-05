@@ -665,15 +665,16 @@ fn build_messages(
             // Sub-agent 可通过 read_file 按需读取完整内容。
             if output.len() > 2000 {
                 let boundary = output.floor_char_boundary(800);
+                let hint = super::prompt_loader::upstream_truncated_hint(&detail_path);
                 parts.push(format!(
-                    "[{id}] ({total} chars, full output at `{detail_path}`):\n{preview}...\n\n\
-                     Use `read_file` on `{detail_path}` if you need full details.",
+                    "[{id}] ({total} chars):\n{preview}...\n\n{hint}",
                     total = output.len(),
                     preview = &output[..boundary],
                 ));
             } else {
+                let hint = super::prompt_loader::upstream_full_hint(&detail_path);
                 parts.push(format!(
-                    "[{id}] (full output also at `{detail_path}`):\n{output}"
+                    "[{id}]:\n{output}\n\n{hint}"
                 ));
             }
         }
