@@ -22,6 +22,7 @@ use crate::types::{AgentResponse, RequestContext};
 pub struct InboundMessage {
     pub content: String,
     pub user_id: String,
+    pub user_name: String,
     pub workspace_id: String,
     pub channel: String,
     pub chat_id: String,
@@ -121,6 +122,7 @@ impl MessageBus {
 
         let req = {
             let mut r = RequestContext::new(&msg.user_id, &msg.workspace_id, &msg.channel, &msg.chat_id)
+                .with_user_name(&msg.user_name)
                 .with_images(msg.images)
                 .with_files(
                     msg.files

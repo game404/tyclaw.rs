@@ -17,9 +17,14 @@ pub struct AuditEntry {
     pub workspace_key: String,
     pub session_id: String,
     pub user_id: String,
+    #[serde(default)]
+    pub user_name: String,
     pub channel: String,
     pub request: String,
     pub tool_calls: Vec<serde_json::Value>,
+    /// 本次请求中调用的 skill 列表（从 exec 命令中自动提取）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills_used: Vec<serde_json::Value>,
     pub final_response: Option<String>,
     pub total_duration: Option<f64>,
     pub token_usage: Option<serde_json::Value>,
@@ -109,9 +114,11 @@ mod tests {
             workspace_key: workspace_key.into(),
             session_id: "s_test_001".into(),
             user_id: user_id.into(),
+            user_name: "test_user".into(),
             channel: "cli".into(),
             request: "test request".into(),
             tool_calls: vec![],
+            skills_used: vec![],
             final_response: Some("done".into()),
             total_duration: Some(1.5),
             token_usage: None,

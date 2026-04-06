@@ -96,6 +96,7 @@ impl ChatbotHandler for DingTalkBot {
             let msg = InboundMessage {
                 content: "/new".into(),
                 user_id: staff_id.clone(),
+                user_name: nick.clone(),
                 workspace_id: "default".into(),
                 channel: channel.into(),
                 chat_id: chat_id.clone(),
@@ -192,6 +193,7 @@ impl ChatbotHandler for DingTalkBot {
         let msg = InboundMessage {
             content: question_full,
             user_id: staff_id.clone(),
+            user_name: nick.clone(),
             workspace_id: "default".into(),
             channel: channel.into(),
             chat_id: chat_id.clone(),

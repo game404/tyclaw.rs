@@ -1,6 +1,7 @@
 //! 编排器辅助函数：技能路由、案例优化、上下文预算计算。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use serde_json::Value;
 
 use crate::history::normalize_text_for_dedupe;
 use crate::types::{
@@ -172,4 +173,101 @@ pub(crate) fn compute_context_budget_plan(query: &str) -> ContextBudgetPlan {
         .max_cases_chars
         .clamp(800, MAX_DYNAMIC_SIMILAR_CASES_CHARS);
     plan
+}
+
+/// 从 agent loop 的 messages 中提取实际被调用的 skill 记录。
+///
+/// 检测两种调用方式：
+/// - **工具型 skill**：exec 调用 `tool.py`/`tool.sh`
+/// - **提示型 skill**：read_file 读取 `SKILL.md`
+///
+/// 只记录有明确调用/读取证据的 skill，不含仅注入 prompt 摘要但未实际使用的。
+pub fn extract_skills_used(
+    messages: &[HashMap<String, Value>],
+    workspace_key: &str,
+    user_name: &str,
+) -> Vec<Value> {
+    let mut skills = Vec::new();
+    let mut seen = HashSet::new();
+
+    for msg in messages {
+        if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let tool_calls = match msg.get("tool_calls").and_then(|v| v.as_array()) {
+            Some(tc) => tc,
+            None => continue,
+        };
+        for tc in tool_calls {
+            let tool_name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let args_str = tc
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|a| a.as_str())
+                .unwrap_or("");
+
+            let extracted = match tool_name {
+                "exec" => extract_skill_from_exec(args_str),
+                "read_file" => extract_skill_from_read(args_str),
+                _ => None,
+            };
+
+            if let Some((skill_name, invoke_type)) = extracted {
+                if seen.insert(skill_name.clone()) {
+                    skills.push(serde_json::json!({
+                        "skill": skill_name,
+                        "type": invoke_type,
+                        "workspace_key": workspace_key,
+                        "user_name": user_name,
+                    }));
+                }
+            }
+        }
+    }
+    skills
+}
+
+/// 从 exec 命令中提取 skill 名称（匹配 tool.py/tool.sh 路径）。
+fn extract_skill_from_exec(args_json: &str) -> Option<(String, &'static str)> {
+    let args: HashMap<String, Value> = serde_json::from_str(args_json).ok()?;
+    let command = args.get("command").and_then(|v| v.as_str())?;
+
+    for segment in command.split_whitespace() {
+        let path = segment.trim_matches(|c: char| c == '"' || c == '\'');
+        if path.ends_with("/tool.py") || path.ends_with("/tool.sh") {
+            if let Some(name) = parent_dir_name(path) {
+                return Some((name, "tool"));
+            }
+        }
+    }
+    None
+}
+
+/// 从 read_file 参数中提取 skill 名称（匹配 SKILL.md 路径）。
+fn extract_skill_from_read(args_json: &str) -> Option<(String, &'static str)> {
+    let args: HashMap<String, Value> = serde_json::from_str(args_json).ok()?;
+    let path = args.get("path").and_then(|v| v.as_str())?;
+
+    if path.ends_with("/SKILL.md") {
+        if let Some(name) = parent_dir_name(path) {
+            return Some((name, "prompt"));
+        }
+    }
+    None
+}
+
+/// 提取路径中倒数第二层目录名（即 skill 名称）。
+fn parent_dir_name(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() >= 2 {
+        let name = parts[parts.len() - 2];
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    None
 }

@@ -289,9 +289,11 @@ impl Orchestrator {
                         workspace_key: workspace_key.clone(),
                         session_id,
                         user_id: "system".into(),
+                        user_name: "system".into(),
                         channel: "reaper".into(),
                         request: "workspace idle timeout".into(),
                         tool_calls: vec![],
+                        skills_used: vec![],
                         final_response: Some("consolidated and cleaned".into()),
                         total_duration: None,
                         token_usage: None,
@@ -338,6 +340,7 @@ impl Orchestrator {
     ) -> Result<AgentResponse, TyclawError> {
         let start = Instant::now();
         let user_id = req.user_id.as_str();
+        let user_name = req.user_name.as_str();
         let workspace_id = req.workspace_id.as_str();
         let channel = req.channel.as_str();
         let chat_id = req.chat_id.as_str();
@@ -379,6 +382,27 @@ impl Orchestrator {
             if let Ok(mut pending) = queue.lock() {
                 pending.push(tyclaw_agent::runtime::chat_message("user", &msg));
             }
+
+            // 审计记录：注入消息也需要留痕
+            if self.app.features.enable_audit {
+                let session_id = self.persistence.sessions.get_session_id(&workspace_key)
+                    .unwrap_or_else(|| "unknown".into());
+                let _ = self.persistence.audit.log(&AuditEntry {
+                    timestamp: chrono::Utc::now(),
+                    workspace_key: workspace_key.clone(),
+                    session_id,
+                    user_id: user_id.into(),
+                    user_name: user_name.into(),
+                    channel: channel.into(),
+                    request: format!("[injected] {}", msg.chars().take(500).collect::<String>()),
+                    tool_calls: vec![],
+                    skills_used: vec![],
+                    final_response: Some("injected into running agent loop".into()),
+                    total_duration: Some(start.elapsed().as_secs_f64()),
+                    token_usage: None,
+                });
+            }
+
             return Ok(AgentResponse {
                 text: String::new(),
                 tools_used: vec![],
@@ -1002,6 +1026,9 @@ impl Orchestrator {
 
         // 13. 写入审计日志
         if self.app.features.enable_audit {
+            // 从 exec 命令中提取实际调用的 skill 记录
+            let skills_used = helpers::extract_skills_used(&result.messages, &workspace_key, user_name);
+
             let session_id = self.persistence.sessions.get_session_id(&workspace_key)
                 .unwrap_or_else(|| "unknown".into());
             let _ = self.persistence.audit.log(&AuditEntry {
@@ -1009,12 +1036,14 @@ impl Orchestrator {
                 workspace_key: workspace_key.clone(),
                 session_id,
                 user_id: user_id.into(),
+                user_name: user_name.into(),
                 channel: channel.into(),
                 request: user_message.chars().take(500).collect(),
                 tool_calls: tools_used
                     .iter()
                     .map(|t| serde_json::json!({"name": t}))
                     .collect(),
+                skills_used,
                 final_response: Some(final_content.chars().take(500).collect()),
                 total_duration: Some(duration),
                 token_usage: None,

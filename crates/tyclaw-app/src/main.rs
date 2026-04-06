@@ -653,6 +653,7 @@ fn spawn_timer_consumer(
             let msg = InboundMessage {
                 content: format!("[Scheduled Task: {}] {}", job.name, job.payload.message),
                 user_id: job.payload.user_id.clone(),
+                user_name: "timer".into(),
                 workspace_id: job.payload.workspace_id.unwrap_or_else(|| "default".into()),
                 channel: job.payload.channel.unwrap_or_else(|| "cli".into()),
                 chat_id: job.payload.chat_id.unwrap_or_else(|| "direct".into()),

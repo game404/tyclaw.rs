@@ -35,6 +35,7 @@ pub(crate) const RESET_ON_START_FIELD: &str = "_reset_iterations_next_run";
 #[derive(Debug, Clone)]
 pub struct RequestContext {
     pub user_id: String,
+    pub user_name: String,
     pub workspace_id: String,
     pub channel: String,
     pub chat_id: String,
@@ -53,6 +54,7 @@ impl Default for RequestContext {
     fn default() -> Self {
         Self {
             user_id: "user".into(),
+            user_name: String::new(),
             workspace_id: "default".into(),
             channel: "api".into(),
             chat_id: "direct".into(),
@@ -72,6 +74,7 @@ impl RequestContext {
     ) -> Self {
         Self {
             user_id: user_id.into(),
+            user_name: String::new(),
             workspace_id: workspace_id.into(),
             channel: channel.into(),
             chat_id: chat_id.into(),
@@ -79,6 +82,12 @@ impl RequestContext {
             image_data_uris: Vec::new(),
             file_attachments: Vec::new(),
         }
+    }
+
+    /// 设置用户名（builder 风格）。
+    pub fn with_user_name(mut self, name: impl Into<String>) -> Self {
+        self.user_name = name.into();
+        self
     }
 
     /// 设置 conversation_id（builder 风格）。

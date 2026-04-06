@@ -88,6 +88,7 @@ impl CliChannel {
             let msg = InboundMessage {
                 content: input,
                 user_id: self.user_id.clone(),
+                user_name: "cli_user".into(),
                 workspace_id: self.workspace_id.clone(),
                 channel: "cli".into(),
                 chat_id: "direct".into(),
