@@ -13,8 +13,9 @@ pub(crate) const MAX_SIMILAR_CASES_CHARS: usize = 2500;
 /// 历史消息在上下文窗口中的预算比例。
 pub(crate) const HISTORY_BUDGET_RATIO: usize = 45;
 /// 历史消息绝对 Token 上限（防止在大 Context Window 下历史无限制膨胀）。
-/// 中间档上限：避免过小导致失忆，也避免过大引入噪音。
-pub(crate) const MAX_HISTORY_TOKENS_HARD_LIMIT: usize = 49_152;
+/// 16K tokens ≈ 50-80 条消息，保留最近 2-3 轮完整上下文，
+/// 避免大量旧 tool results 稀释当前用户意图。
+pub(crate) const MAX_HISTORY_TOKENS_HARD_LIMIT: usize = 16_384;
 /// 历史消息最小 token 预算。
 pub(crate) const MIN_HISTORY_BUDGET_TOKENS: usize = 256;
 /// 动态预算下，历史消息最大预算比例。

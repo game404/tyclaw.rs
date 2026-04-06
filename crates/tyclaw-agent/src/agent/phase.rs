@@ -82,15 +82,14 @@ pub(crate) fn sync_context_state_for_iteration(
     ctx_state.upsert_plan(plan);
 }
 
-/// 供调用方在 `render_prompt_context` 时使用的 snapshot 字符上限。
-#[inline]
-pub(crate) fn state_snapshot_limit_chars(total_iterations: usize) -> usize {
-    if total_iterations == 1 {
-        FIRST_TURN_STATE_SNAPSHOT_CHARS
-    } else {
-        STATE_SNAPSHOT_CHARS
-    }
-}
+// STATE_VIEW 暂时禁用（破坏 prompt cache 前缀匹配），函数保留备用。
+// pub(crate) fn state_snapshot_limit_chars(total_iterations: usize) -> usize {
+//     if total_iterations == 1 {
+//         FIRST_TURN_STATE_SNAPSHOT_CHARS
+//     } else {
+//         STATE_SNAPSHOT_CHARS
+//     }
+// }
 
 /// 探索阶段在一轮工具执行后的结果：是否应切换到产出阶段，以及要追加的 system 消息。
 pub(crate) struct ExplorePhaseAfterTools {

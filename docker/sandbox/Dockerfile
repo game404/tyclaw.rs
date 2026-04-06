@@ -1,7 +1,17 @@
 FROM python:3.11-slim
 
-# 安装系统工具 + OpenCV 运行时依赖
+# 安装系统工具 + 开发环境 + OpenCV 运行时依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    wget \
+    jq \
+    zip \
+    unzip \
+    build-essential \
+    pkg-config \
+    ca-certificates \
+    gnupg \
     ripgrep \
     ffmpeg \
     tesseract-ocr \
@@ -15,7 +25,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
-# 预装常用包
+# Node.js 22 LTS + TypeScript
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g typescript ts-node
+
+# Rust (stable, minimal profile)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
+    && . /root/.cargo/env \
+    && rustup component add clippy rustfmt
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Python 常用包
 RUN pip install --no-cache-dir \
     pandas \
     numpy \

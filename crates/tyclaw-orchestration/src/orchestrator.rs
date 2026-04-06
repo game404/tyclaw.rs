@@ -787,8 +787,7 @@ impl Orchestrator {
             None
         };
 
-        // 记录初始消息数——agent_loop 只在此后追加新消息，save_turn 据此跳过前缀
-        let initial_messages_len = initial_messages.len();
+        // turn_id 由 agent_loop 生成并打在每条新消息上，save_turn 按此筛选。
 
         let cache_scope = format!("session:{workspace_key}");
         let run_future = self.runtime.run(
@@ -896,7 +895,7 @@ impl Orchestrator {
             );
             // 保存暂停时已完成的轮次到会话
             if !result.messages.is_empty() {
-                    self.save_turn(&workspace_key, &result.messages, initial_messages_len);
+                    self.save_turn(&workspace_key, &result.messages, &result.turn_id);
             }
             // 保存完整消息历史，以便恢复时使用
             self.pending_ask_user
@@ -922,7 +921,7 @@ impl Orchestrator {
 
         // 10. 保存轮次到会话
         if !result.messages.is_empty() {
-            self.save_turn(&workspace_key, &result.messages, initial_messages_len);
+            self.save_turn(&workspace_key, &result.messages, &result.turn_id);
         }
 
         // 11. 合并后检查
@@ -1040,25 +1039,23 @@ impl Orchestrator {
         &self,
         workspace_key: &str,
         messages: &[std::collections::HashMap<String, serde_json::Value>],
-        initial_messages_len: usize,
+        turn_id: &str,
     ) {
         use serde_json::Value;
 
-        // 通过标记字段定位本轮起始位置（比硬算 skip 更可靠）
-        let skip = messages
-            .iter()
-            .rposition(|m| {
-                m.get(RESET_ON_START_FIELD)
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-            })
-            .map(|i| i + 1) // 跳过标记本身
-            .unwrap_or(initial_messages_len); // 兜底：没有标记时用 initial_messages_len
-
         let mut entries = Vec::new();
 
-        for m in messages.iter().skip(skip) {
+        for m in messages.iter() {
+            // 只保存带有匹配 _turn_id 的消息（agent_loop 本轮新增的）
+            let msg_turn_id = m.get("_turn_id").and_then(|v| v.as_str()).unwrap_or("");
+            if msg_turn_id != turn_id {
+                continue;
+            }
+
             let mut entry = m.clone();
+            // 移除内部标记字段，不写入 history
+            entry.remove("_turn_id");
+
             let role = entry
                 .get("role")
                 .and_then(|v| v.as_str())

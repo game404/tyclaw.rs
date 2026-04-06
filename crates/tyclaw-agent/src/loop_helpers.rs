@@ -178,10 +178,9 @@ pub(crate) const ASSISTANT_TEXT_COMPACT_THRESHOLD: usize = 700;
 pub(crate) const ASSISTANT_TEXT_KEEP_PREFIX: usize = 180;
 pub(crate) const ASSISTANT_TEXT_KEEP_SUFFIX: usize = 100;
 pub(crate) const COMPACT_ASSISTANT_MARKER: &str = "[[TYCLAW_COMPACT_ASSISTANT]]";
-/// 默认状态快照长度（每轮注入到 system）。
-pub(crate) const STATE_SNAPSHOT_CHARS: usize = 3000;
-/// 首轮状态快照长度（给 LLM 更完整的任务结构信息）。
-pub(crate) const FIRST_TURN_STATE_SNAPSHOT_CHARS: usize = 3800;
+// STATE_VIEW 暂时禁用（破坏 prompt cache 前缀匹配），常量保留备用。
+// pub(crate) const STATE_SNAPSHOT_CHARS: usize = 3000;
+// pub(crate) const FIRST_TURN_STATE_SNAPSHOT_CHARS: usize = 3800;
 
 // ─── Functions ───────────────────────────────────────────────────────────────
 

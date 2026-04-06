@@ -126,6 +126,10 @@ impl AgentRuntime for AgentLoop {
         // 阶段追踪：探索 → 产出
         // 仅在"上一轮 reach max"后重置计数，否则沿用历史推断（支持连续任务续跑）。
         let should_reset_iterations = take_reset_marker(&mut messages);
+
+        // 生成本轮唯一 turn_id，所有新增消息都打上此标记，
+        // save_turn 据此精确筛选本轮消息。
+        let turn_id = format!("t_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f"));
         let (
             mut in_exploration,
             mut exploration_iterations,
@@ -228,7 +232,7 @@ impl AgentRuntime for AgentLoop {
             let protected_prefix_len = cache_scope
                 .map(|scope| self.provider.cache_breakpoint_idx(scope))
                 .unwrap_or(0);
-            let mut compressed = compress_tool_results(
+            let compressed = compress_tool_results(
                 &messages,
                 skip_compression,
                 LIGHT_COMPRESS_RECENT_ROUNDS,
@@ -797,6 +801,20 @@ impl AgentRuntime for AgentLoop {
             final_content = Some(max_msg);
         }
 
+        // 给本轮新增的消息打上 _turn_id（用于 save_turn 精确筛选）。
+        // 来自 history 的消息已有 timestamp 字段，不会被误标。
+        // system 消息（nudge 等）不打标——不需要持久化到 history。
+        for msg in messages.iter_mut() {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            if role == "system" {
+                continue;
+            }
+            if msg.contains_key("timestamp") || msg.contains_key("_turn_id") {
+                continue;
+            }
+            msg.insert("_turn_id".into(), json!(turn_id));
+        }
+
         let diagnostics_summary = build_run_diagnostics_summary(&tool_events);
         Ok(RuntimeResult {
             content: final_content,
@@ -810,6 +828,7 @@ impl AgentRuntime for AgentLoop {
             cache_write_tokens: total_cache_write,
             total_prompt_tokens,
             total_completion_tokens,
+            turn_id,
         })
     }
 }

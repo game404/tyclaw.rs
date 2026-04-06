@@ -48,6 +48,8 @@ pub struct DockerSandbox {
     mount_root: String,
     /// 容器内工作目录（如 `/user/work`）。
     work_dir: String,
+    /// workspace key（通常等于 user_id），注入为环境变量供 skill 脚本使用。
+    workspace_key: String,
 }
 
 impl DockerSandbox {
@@ -74,6 +76,8 @@ impl Sandbox for DockerSandbox {
                     "exec",
                     "-e",
                     &format!("TMPDIR={tmpdir}"),
+                    "-e",
+                    &format!("TYCLAW_SENDER_STAFF_ID={}", self.workspace_key),
                     "-w",
                     &self.work_dir,
                     &self.container_id,
@@ -727,6 +731,7 @@ impl SandboxPool for DockerPool {
                     container_name: entry.container_name.clone(),
                     mount_root: user_mount_root(&self.config.work_dir),
                     work_dir: self.config.work_dir.clone(),
+                    workspace_key: workspace_key.clone(),
                 }));
             }
             // 容器已不存在，清除缓存，走重建流程
@@ -740,6 +745,7 @@ impl SandboxPool for DockerPool {
         let (cid, name) = self.create_workspace_container(&workspace_key).await?;
 
         let mut containers = self.containers.lock().await;
+        let ws_key = workspace_key.clone();
         containers.insert(
             workspace_key,
             WorkspaceContainer {
@@ -753,6 +759,7 @@ impl SandboxPool for DockerPool {
             container_name: name,
             mount_root: user_mount_root(&self.config.work_dir),
             work_dir: self.config.work_dir.clone(),
+            workspace_key: ws_key,
         }))
     }
 

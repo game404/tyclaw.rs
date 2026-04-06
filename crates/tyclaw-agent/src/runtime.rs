@@ -95,6 +95,9 @@ pub struct RuntimeResult {
     pub total_prompt_tokens: u64,
     /// 累计 completion tokens
     pub total_completion_tokens: u64,
+    /// 本轮唯一标识。agent_loop 给所有新增消息打上此 `_turn_id`，
+    /// save_turn 据此精确筛选本轮消息，不受前缀压缩/标记消费的影响。
+    pub turn_id: String,
 }
 
 /// 进度回调函数类型。
