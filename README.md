@@ -7,9 +7,11 @@
 
 ## Demo
 
-![Demo Screenshot](demo/demo.png)
+下面是我实际使用的一些例子，通过钉钉聊天，做了分析广告视频，计算LTV等复杂任务，并且沉淀了可以复用的SKILL，如果再组合上企业内部系统的调用，可以极大提升工作效率...
 
 ![Demo](demo/demo.gif)
+
+![Demo Screenshot](demo/demo.png)
 
 ## 技术特点
 
