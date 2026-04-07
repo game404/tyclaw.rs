@@ -189,6 +189,7 @@ impl ChatbotHandler for DingTalkBot {
         } else {
             question
         };
+        let question_for_header: String = question_full.chars().take(50).collect();
 
         let msg = InboundMessage {
             content: question_full,
@@ -222,8 +223,26 @@ impl ChatbotHandler for DingTalkBot {
                     reply_text.push_str("\n\n...（内容过长已截断）");
                 }
 
+                // 拼接头尾小字：用户问题 + 处理时长 + token 用量
+                let question_preview = &question_for_header;
+                let duration_secs = response.duration_seconds.round() as u64;
+                let header = if message.is_private() {
+                    format!("<font size=2 color=#888888>您的问题：{question_preview}</font>")
+                } else {
+                    format!("<font size=2 color=#888888>{nick} 的问题：{question_preview}</font>")
+                };
+                let total_tokens = response.prompt_tokens + response.completion_tokens;
+                let footer = if total_tokens > 0 {
+                    format!(
+                        "<font size=2 color=#888888>🦀 {duration_secs}秒，{total_tokens} tokens</font>"
+                    )
+                } else {
+                    format!("<font size=2 color=#888888>🦀 {duration_secs}秒</font>")
+                };
+                let formatted = format!("{header}\n\n{reply_text}\n\n{footer}");
+
                 let sent =
-                    handler::reply_markdown(&self.http_client, "执行结果", &reply_text, &message)
+                    handler::reply_markdown(&self.http_client, "执行结果", &formatted, &message)
                         .await;
 
                 if !sent {

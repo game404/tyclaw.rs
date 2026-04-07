@@ -782,7 +782,7 @@ impl AgentRuntime for AgentLoop {
                 // 如果 content 为空（某些模型偶发），用工具记录构建兜底总结。
                 final_content = Some(clean.unwrap_or_else(|| {
                     if tools_used.is_empty() {
-                        "Processing completed with no response.".to_string()
+                        "处理完成，未生成回复内容。".to_string()
                     } else {
                         format!("Task completed. Tools used: {}", tools_used.join(", "))
                     }

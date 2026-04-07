@@ -111,6 +111,17 @@ pub trait LLMProvider: Send + Sync {
 
             // 如果不是错误响应，直接返回成功结果
             if response.finish_reason != "error" {
+                // 检测空回复（某些上游偶发返回 finish_reason=stop 但无内容）
+                let is_empty = response.content.as_ref().map_or(true, |c| c.is_empty())
+                    && response.tool_calls.is_empty();
+                if is_empty && attempt < RETRY_DELAYS.len() - 1 {
+                    warn!(
+                        attempt = attempt + 1,
+                        "LLM returned empty response (no content, no tool_calls), retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAYS[attempt])).await;
+                    continue;
+                }
                 return response;
             }
             // 如果不是临时性错误，不再重试

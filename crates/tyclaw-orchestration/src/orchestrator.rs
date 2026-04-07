@@ -407,6 +407,8 @@ impl Orchestrator {
                 text: String::new(),
                 tools_used: vec![],
                 duration_seconds: start.elapsed().as_secs_f64(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
                 output_files: Vec::new(),
             });
         }
@@ -474,6 +476,8 @@ impl Orchestrator {
                     text: question,
                     tools_used: result.tools_used,
                     duration_seconds: start.elapsed().as_secs_f64(),
+                    prompt_tokens: result.total_prompt_tokens,
+                    completion_tokens: result.total_completion_tokens,
                     output_files: Vec::new(),
                 });
             }
@@ -481,7 +485,7 @@ impl Orchestrator {
             let final_content = helpers::strip_internal_markers(
                 &result
                     .content
-                    .unwrap_or_else(|| "Processing completed with no response.".into()),
+                    .unwrap_or_else(|| "处理完成，未生成回复内容。".into()),
             );
             let tools_used = result.tools_used;
             let duration = start.elapsed().as_secs_f64();
@@ -503,6 +507,8 @@ impl Orchestrator {
                 text: final_content,
                 tools_used,
                 duration_seconds: duration,
+                prompt_tokens: result.total_prompt_tokens,
+                completion_tokens: result.total_completion_tokens,
                 output_files,
             });
         }
@@ -553,6 +559,8 @@ impl Orchestrator {
                     text: "当前会话暂无可保存内容。".into(),
                     tools_used: Vec::new(),
                     duration_seconds: start.elapsed().as_secs_f64(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
                     output_files: Vec::new(),
                 });
             }
@@ -578,6 +586,8 @@ impl Orchestrator {
                         ),
                         tools_used: Vec::new(),
                         duration_seconds: start.elapsed().as_secs_f64(),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
                         output_files: Vec::new(),
                     });
                 }
@@ -586,6 +596,8 @@ impl Orchestrator {
                         text: format!("保存会话失败：{e}"),
                         tools_used: Vec::new(),
                         duration_seconds: start.elapsed().as_secs_f64(),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
                         output_files: Vec::new(),
                     });
                 }
@@ -615,6 +627,8 @@ impl Orchestrator {
                 text: "New session started.".into(),
                 tools_used: Vec::new(),
                 duration_seconds: start.elapsed().as_secs_f64(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
                 output_files: Vec::new(),
             });
         }
@@ -1000,6 +1014,8 @@ impl Orchestrator {
                 text: question,
                 tools_used: result.tools_used,
                 duration_seconds: start.elapsed().as_secs_f64(),
+                prompt_tokens: result.total_prompt_tokens,
+                completion_tokens: result.total_completion_tokens,
                 output_files: Vec::new(),
             });
         }
@@ -1007,7 +1023,7 @@ impl Orchestrator {
         let final_content = helpers::strip_internal_markers(
             &result
                 .content
-                .unwrap_or_else(|| "Processing completed with no response.".into()),
+                .unwrap_or_else(|| "处理完成，未生成回复内容。".into()),
         );
 
         let tools_used = result.tools_used;
@@ -1102,6 +1118,8 @@ impl Orchestrator {
             text: final_content,
             tools_used,
             duration_seconds: duration,
+            prompt_tokens: result.total_prompt_tokens,
+            completion_tokens: result.total_completion_tokens,
             output_files,
         })
     }

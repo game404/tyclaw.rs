@@ -136,6 +136,10 @@ pub struct AgentResponse {
     pub text: String,
     pub tools_used: Vec<String>,
     pub duration_seconds: f64,
+    /// 累计 prompt tokens
+    pub prompt_tokens: u64,
+    /// 累计 completion tokens
+    pub completion_tokens: u64,
     /// Agent 期望发送给用户的文件路径列表。
     /// 由 `send_file` 工具写入，上层（如 DingTalk bot）负责实际发送。
     pub output_files: Vec<String>,
