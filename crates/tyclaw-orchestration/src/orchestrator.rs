@@ -478,9 +478,11 @@ impl Orchestrator {
                 });
             }
 
-            let final_content = result
-                .content
-                .unwrap_or_else(|| "Processing completed with no response.".into());
+            let final_content = helpers::strip_internal_markers(
+                &result
+                    .content
+                    .unwrap_or_else(|| "Processing completed with no response.".into()),
+            );
             let tools_used = result.tools_used;
             let duration = start.elapsed().as_secs_f64();
 
@@ -1002,9 +1004,11 @@ impl Orchestrator {
             });
         }
 
-        let final_content = result
-            .content
-            .unwrap_or_else(|| "Processing completed with no response.".into());
+        let final_content = helpers::strip_internal_markers(
+            &result
+                .content
+                .unwrap_or_else(|| "Processing completed with no response.".into()),
+        );
 
         let tools_used = result.tools_used;
         let duration = start.elapsed().as_secs_f64();
@@ -1046,14 +1050,31 @@ impl Orchestrator {
                 skills_used,
                 final_response: Some(final_content.chars().take(500).collect()),
                 total_duration: Some(duration),
-                token_usage: None,
+                token_usage: Some(serde_json::json!({
+                    "prompt_tokens": result.total_prompt_tokens,
+                    "completion_tokens": result.total_completion_tokens,
+                    "cache_hit_tokens": result.cache_hit_tokens,
+                    "cache_write_tokens": result.cache_write_tokens,
+                })),
             });
+            let cache_rate = if result.cache_hit_tokens + result.cache_write_tokens > 0 {
+                (result.cache_hit_tokens as f64
+                    / (result.cache_hit_tokens + result.cache_write_tokens) as f64
+                    * 100.0) as u64
+            } else {
+                0
+            };
             info!(
                 target: "audit",
                 workspace_key = %workspace_key,
                 user_id = user_id,
                 tools = %tools_used.join(","),
                 duration_seconds = duration,
+                prompt_tokens = result.total_prompt_tokens,
+                completion_tokens = result.total_completion_tokens,
+                cache_hit = result.cache_hit_tokens,
+                cache_write = result.cache_write_tokens,
+                cache_rate = cache_rate,
                 "Audit entry recorded",
             );
         }

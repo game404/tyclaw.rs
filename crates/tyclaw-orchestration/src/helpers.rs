@@ -271,3 +271,12 @@ fn parent_dir_name(path: &str) -> Option<String> {
     }
     None
 }
+
+/// 去除发给用户前的内部标记（`[[TYCLAW_*]]` 系列）。
+pub(crate) fn strip_internal_markers(text: &str) -> String {
+    text.replace("[[TYCLAW_COMPACT_ASSISTANT]]", "")
+        .replace("[[TYCLAW_COMPACT_SYSTEM]]", "")
+        .replace("[[TYCLAW_MAX_REACHED_RESET_NEXT_RUN]]", "")
+        .trim()
+        .to_string()
+}

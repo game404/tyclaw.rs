@@ -98,11 +98,23 @@ impl DingTalkStreamClient {
         let (write, mut read) = ws_stream.split();
         let write = Arc::new(Mutex::new(write));
 
+        // 心跳：每 60s 发 ping（与钉钉服务端心跳频率一致，避免过于频繁被判为异常）。
+        // 如果 5 分钟没收到任何消息（含 pong），判定连接僵死。
+        let last_activity = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
+        let last_activity_ping = last_activity.clone();
         let write_ping = write.clone();
         let ping_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
+                let elapsed = last_activity_ping.lock().await.elapsed();
+                if elapsed > std::time::Duration::from_secs(300) {
+                    warn!(
+                        elapsed_secs = elapsed.as_secs(),
+                        "DingTalk Stream: no activity for 5min, connection likely dead"
+                    );
+                    break;
+                }
                 let mut w = write_ping.lock().await;
                 if w.send(WsMessage::Ping(vec![].into())).await.is_err() {
                     break;
@@ -110,25 +122,43 @@ impl DingTalkStreamClient {
             }
         });
 
-        while let Some(msg_result) = read.next().await {
-            match msg_result {
-                Ok(WsMessage::Text(text)) => match serde_json::from_str::<StreamFrame>(&text) {
-                    Ok(frame) => self.handle_frame(&frame, &write).await,
-                    Err(e) => warn!(error = %e, "Failed to parse stream frame"),
-                },
-                Ok(WsMessage::Ping(data)) => {
-                    let mut w = write.lock().await;
-                    let _ = w.send(WsMessage::Pong(data)).await;
-                }
-                Ok(WsMessage::Close(reason)) => {
-                    warn!(reason = ?reason, "DingTalk Stream: WebSocket closed by server");
+        loop {
+            // 10 分钟 read 超时：兜底，防止 read.next() 永远阻塞
+            let read_result = tokio::time::timeout(
+                std::time::Duration::from_secs(600),
+                read.next(),
+            ).await;
+
+            match read_result {
+                Err(_) => {
+                    warn!("DingTalk Stream: read timeout (600s), forcing reconnect");
                     break;
                 }
-                Err(e) => {
-                    error!(error = %e, "DingTalk Stream: WebSocket error");
-                    break;
+                Ok(None) => break, // stream ended
+                Ok(Some(msg_result)) => {
+                    // 更新最后活动时间
+                    *last_activity.lock().await = tokio::time::Instant::now();
+
+                    match msg_result {
+                        Ok(WsMessage::Text(text)) => match serde_json::from_str::<StreamFrame>(&text) {
+                            Ok(frame) => self.handle_frame(&frame, &write).await,
+                            Err(e) => warn!(error = %e, "Failed to parse stream frame"),
+                        },
+                        Ok(WsMessage::Ping(data)) => {
+                            let mut w = write.lock().await;
+                            let _ = w.send(WsMessage::Pong(data)).await;
+                        }
+                        Ok(WsMessage::Close(reason)) => {
+                            warn!(reason = ?reason, "DingTalk Stream: WebSocket closed by server");
+                            break;
+                        }
+                        Err(e) => {
+                            error!(error = %e, "DingTalk Stream: WebSocket error");
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
-                _ => {}
             }
         }
 
