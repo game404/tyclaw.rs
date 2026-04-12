@@ -313,17 +313,11 @@ impl ChatbotHandler for DingTalkBot {
                         Err(e) => error!(error = %e, "DingTalk: failed to get token for file send"),
                     }
                 }
-                // 撤回所有表情气泡（初始 + 心跳）
+                // 撤回"收到"表情气泡
                 if emotion_attached {
                     if let Ok(token) = self.token_manager.get_token().await {
                         handler::emotion_recall(
                             &self.http_client, &token, &self.robot_code, &message, "🦀收到...",
-                        ).await;
-                        handler::emotion_recall(
-                            &self.http_client, &token, &self.robot_code, &message, "🦀努力中...",
-                        ).await;
-                        handler::emotion_recall(
-                            &self.http_client, &token, &self.robot_code, &message, "🦀加油干...",
                         ).await;
                     }
                 }

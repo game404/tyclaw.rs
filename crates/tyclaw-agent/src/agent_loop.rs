@@ -233,15 +233,9 @@ impl AgentRuntime for AgentLoop {
 
             // CLI 进度：打印当前轮次
             if let Some(cb) = on_progress {
-                if total_iterations == 1 {
-                    // 第1轮：撤收到 → 贴努力中
-                    cb("[heartbeat:switch]🦀收到...|🦀努力中...").await;
-                } else if total_iterations % 2 == 0 {
-                    // 偶数轮：撤努力中 → 贴加油干
-                    cb("[heartbeat:switch]🦀努力中...|🦀加油干...").await;
-                } else {
-                    // 奇数轮：撤加油干 → 贴努力中
-                    cb("[heartbeat:switch]🦀加油干...|🦀努力中...").await;
+                // 超长任务提醒：超过 30 轮时发一次文本通知（约 5 分钟+）
+                if total_iterations == 30 {
+                    cb("[heartbeat]🦀 仍在处理中，请耐心等待...").await;
                 }
                 cb(&format!(
                     "[轮次 {total_iterations}] 阶段={phase} 第{phase_iter}轮"

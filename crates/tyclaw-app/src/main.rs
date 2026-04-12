@@ -552,20 +552,9 @@ async fn run_outbound_dispatcher(
                     OutboundEvent::Error { message, .. } => {
                         eprintln!("\n\x1b[31m[DT:{chat_id}] Error: {message}\x1b[0m\n");
                     }
-                    OutboundEvent::Progress { message, emotion_context, .. } => {
-                        // 心跳 emotion：[heartbeat:switch]旧标签|新标签 — 撤旧贴新
-                        if let Some(pair) = message.strip_prefix("[heartbeat:switch]") {
-                            if let Some((ref msg_id, ref conv_id)) = emotion_context {
-                                if let Some((old, new)) = pair.split_once('|') {
-                                    if let Ok(token) = sender.token_manager.get_token().await {
-                                        use tyclaw_channel::dingtalk::message::ChatbotMessage;
-                                        let fake_msg = ChatbotMessage::with_ids(msg_id, conv_id);
-                                        handler::emotion_recall(&sender.http_client, &token, &sender.robot_code, &fake_msg, old).await;
-                                        handler::emotion_reply(&sender.http_client, &token, &sender.robot_code, &fake_msg, new).await;
-                                    }
-                                }
-                            }
-                        } else if let Some(text) = message.strip_prefix("[heartbeat]") {
+                    OutboundEvent::Progress { message, .. } => {
+                        // 超长任务文本提醒（仅在超过 30 轮时触发一次）
+                        if let Some(text) = message.strip_prefix("[heartbeat]") {
                             let (conversation_id, user_id) = if chat_id.contains(':') {
                                 let parts: Vec<&str> = chat_id.splitn(2, ':').collect();
                                 (parts[0], parts[1])

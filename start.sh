@@ -81,7 +81,7 @@ if [ "$CLEAN" = true ]; then
     }
     CLI_WS="$(workspace_path "cli_user")"
     mkdir -p "$CLI_WS/work/attachments"
-    cp demo/*.xlsx demo/*.mp4 demo/*.txt "$CLI_WS/work/attachments/" 2>/dev/null
+    cp demo/*.xlsx demo/*.mp4 demo/*.txt demo/*.md "$CLI_WS/work/attachments/" 2>/dev/null
     echo "[ok] demo 数据已复制到 cli_user"
 
     echo "=== Clean done ==="
