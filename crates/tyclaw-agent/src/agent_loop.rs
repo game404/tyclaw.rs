@@ -519,6 +519,11 @@ impl AgentRuntime for AgentLoop {
                     break;
                 }
 
+                // 让出执行权，确保 progress channel 中排队的 Thinking/content 事件
+                // 有机会被 dispatcher 消费并打印，避免 tool 执行（尤其是 dispatch_subtasks）
+                // 的同步 stderr 输出抢先于 main 的异步 progress 输出。
+                tokio::task::yield_now().await;
+
                 // 探索阶段硬封：nudge 3条耗尽后仍在探索，直接拦截所有 exec
                 let explore_exec_hard_blocked =
                     in_exploration && exploration_iterations >= explore_max + 3;

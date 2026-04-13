@@ -8,7 +8,6 @@
 //! > Decision: 保留现有 Orchestrator 作为节点执行单元。
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -306,8 +305,7 @@ impl NodeExecutor {
 
     /// 强制 flush 的日志输出（绕过 tracing non_blocking 缓冲）。
     fn log(msg: &str) {
-        let _ = writeln!(std::io::stderr(), "{}", msg);
-        let _ = std::io::stderr().flush();
+        info!("{}", msg);
     }
 
     fn resolve_provider(&self, model: &str) -> Arc<dyn LLMProvider> {

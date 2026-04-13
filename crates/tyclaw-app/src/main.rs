@@ -578,8 +578,6 @@ async fn run_outbound_dispatcher(
                         println!("\x1b[2m[DT:{chat_id}] [Thinking] {content}\x1b[0m");
                     }
                 }
-                print!("You> ");
-                let _ = std::io::stdout().flush();
                 continue;
             }
         }
