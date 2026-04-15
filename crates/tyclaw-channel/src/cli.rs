@@ -224,7 +224,7 @@ fn draw_fixed_top(width: u16) {
         }
     }
     // Tips（第 7 行）
-    eprint!("\x1b[{TIPS_LINE};1H\x1b[K\x1b[2m  type 'exit' to quit · '/new' new session · ↑↓ history · Ctrl+R search\x1b[0m");
+    eprint!("\x1b[{TIPS_LINE};1H\x1b[K  🦀 type \x1b[32m'exit'\x1b[0m to quit · \x1b[32m'/new'\x1b[0m new session · \x1b[32m↑↓\x1b[0m history · \x1b[32mCtrl+R\x1b[0m search");
     // 分隔线（第 9 行）
     eprint!("\x1b[{SEP_LINE};1H\x1b[K\x1b[2m{}\x1b[0m", "─".repeat(width as usize));
 }

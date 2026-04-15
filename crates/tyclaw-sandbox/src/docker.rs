@@ -31,7 +31,7 @@ impl Default for DockerConfig {
     fn default() -> Self {
         Self {
             image: "tyclaw-sandbox:latest".into(),
-            memory: "512m".into(),
+            memory: "1g".into(),
             cpus: "1".into(),
             network: "bridge".into(),
             work_dir: "/workspace".into(),
@@ -671,7 +671,9 @@ impl DockerPool {
                 "--network",
                 &self.config.network,
                 "--pids-limit",
-                "128",
+                "512",
+                "--shm-size",
+                "256m",
                 "-e",
                 &tmpdir_env,
                 "-v",

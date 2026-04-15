@@ -50,8 +50,21 @@ RUN pip install --no-cache-dir \
     "scenedetect[opencv]" \
     yt-dlp
 
+# 浏览器自动化环境（Xvfb + Chromium + Playwright）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    xvfb \
+    xauth \
+    fonts-noto-cjk \
+    && pip install --no-cache-dir playwright playwright-stealth \
+    && playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV DISPLAY=:99
+
 # 工作目录
 WORKDIR /work
 
-# 容器池模式：sleep infinity 等待 docker exec
-CMD ["sleep", "infinity"]
+# 启动 Xvfb 虚拟屏幕 + sleep infinity 等待 docker exec
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]

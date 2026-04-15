@@ -1405,6 +1405,16 @@ fn ensure_tool_call_pairs(messages: Vec<Value>) -> Vec<Value> {
             }
         }
     }
+
+    // Anthropic 要求消息必须以 user 或 tool 结尾，不能以 assistant 结尾
+    if let Some(last) = output.last() {
+        let last_role = last.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if last_role == "assistant" {
+            warn!("Messages end with assistant, appending empty user message to satisfy Anthropic API");
+            output.push(json!({"role": "user", "content": "continue"}));
+        }
+    }
+
     output
 }
 

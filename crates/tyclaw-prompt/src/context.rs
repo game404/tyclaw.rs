@@ -679,10 +679,16 @@ Your workspace is at: {ws}"#
                 let after_tag = &remaining[start + 8..]; // skip "[[IMAGE:"
                 if let Some(end) = after_tag.find("]]") {
                     let data_uri = &after_tag[..end];
-                    image_blocks.push(json!({
-                        "type": "image_url",
-                        "image_url": {"url": data_uri}
-                    }));
+                    // 真正的图片 base64 至少几百字符，跳过文档中的示例文字
+                    if data_uri.len() > 100 && data_uri.starts_with("data:image/") {
+                        image_blocks.push(json!({
+                            "type": "image_url",
+                            "image_url": {"url": data_uri}
+                        }));
+                    } else {
+                        // 不是真的图片数据，当普通文本保留
+                        text_parts.push(format!("[[IMAGE:{data_uri}]]"));
+                    }
                     remaining = &after_tag[end + 2..];
                 } else {
                     remaining = "";

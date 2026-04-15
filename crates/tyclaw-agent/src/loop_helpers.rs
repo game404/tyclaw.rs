@@ -119,7 +119,7 @@ pub(crate) const READ_FILE_TOOL_MAX_CHARS: usize = 96 * 1024;
 pub(crate) const EXPLORE_MAX_RATIO_PERCENT: usize = 30;
 /// 探索阶段绝对上限轮次。无论 max_iterations 多大，探索不超过此值。
 /// 适度放宽探索硬上限，避免复杂输入在早期被过快打断。
-pub(crate) const EXPLORE_ABSOLUTE_CAP: usize = 10;
+pub(crate) const EXPLORE_ABSOLUTE_CAP: usize = 30;
 
 /// 工具结果衰减阈值：最近 N 条工具消息保留完整内容。
 pub(crate) const TOOL_RESULT_FRESH_COUNT: usize = 8;

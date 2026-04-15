@@ -93,7 +93,7 @@ fi
 # =========================================================================
 if [ "$BUILD_DOCKER" = true ]; then
     echo "=== Build sandbox Docker image ==="
-    docker build --no-cache -t tyclaw-sandbox "$SCRIPT_DIR/docker/sandbox"
+    docker build -t tyclaw-sandbox "$SCRIPT_DIR/docker/sandbox"
     echo "[ok] sandbox 镜像已重建"
 
     # 回收使用旧镜像的容器
