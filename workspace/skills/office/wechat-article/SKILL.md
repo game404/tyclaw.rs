@@ -11,7 +11,7 @@ triggers:
   - 设置公众号凭证
   - 公众号凭证
   - 绑定公众号
-tool: skills/wechat-article/tool.py
+tool: skills/office/wechat-article/tool.py
 default: false
 credentials:
   key: wechat
@@ -28,25 +28,25 @@ credentials:
 
 ## 工具用法
 
-`skills/wechat-article/tool.py`
+`skills/office/wechat-article/tool.py`
 
 ### 常用命令
 
 ```bash
 # 检查登录状态
-python3 skills/wechat-article/tool.py status
+python3 skills/office/wechat-article/tool.py status
 
 # 搜索公众号
-python3 skills/wechat-article/tool.py search --query "公众号名称"
+python3 skills/office/wechat-article/tool.py search --query "公众号名称"
 
 # 获取文章列表（需先搜索获取 fakeid）
-python3 skills/wechat-article/tool.py list --fakeid MjM5OTc2ODUxMw== --count 10
+python3 skills/office/wechat-article/tool.py list --fakeid MjM5OTc2ODUxMw== --count 10
 
 # 获取文章全文
-python3 skills/wechat-article/tool.py read --url "https://mp.weixin.qq.com/s/xxxxx"
+python3 skills/office/wechat-article/tool.py read --url "https://mp.weixin.qq.com/s/xxxxx"
 
 # 在公众号内搜索关键词
-python3 skills/wechat-article/tool.py list --fakeid MjM5OTc2ODUxMw== --keyword "关键词"
+python3 skills/office/wechat-article/tool.py list --fakeid MjM5OTc2ODUxMw== --keyword "关键词"
 ```
 
 ### 参数速查

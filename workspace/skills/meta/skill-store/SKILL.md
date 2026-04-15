@@ -19,7 +19,7 @@ triggers:
   - 搜索功能
   - 探索Skill
 default: true
-tool: skills/skill-store/tool.py
+tool: skills/meta/skill-store/tool.py
 ---
 # Skill 商店
 
@@ -27,12 +27,12 @@ tool: skills/skill-store/tool.py
 
 ## 工具用法
 
-`skills/skill-store/tool.py`（从 TyClaw 项目根目录运行）
+`skills/meta/skill-store/tool.py`（从 TyClaw 项目根目录运行）
 
 ### 浏览 Skill 目录
 
 ```bash
-python3 skills/skill-store/tool.py list
+python3 skills/meta/skill-store/tool.py list
 ```
 
 展示完整 Skill 目录，分为：我的 Skill、已安装、可安装（系统 + 共享），附带安装数和使用次数统计。共享 Skill 按安装数从高到低排序。
@@ -40,7 +40,7 @@ python3 skills/skill-store/tool.py list
 ### 搜索 Skill
 
 ```bash
-python3 skills/skill-store/tool.py list --keyword <关键词>
+python3 skills/meta/skill-store/tool.py list --keyword <关键词>
 ```
 
 在所有 Skill（名称、描述、作者）中搜索匹配的关键词。
@@ -48,7 +48,7 @@ python3 skills/skill-store/tool.py list --keyword <关键词>
 ### 安装 Skill
 
 ```bash
-python3 skills/skill-store/tool.py install <skill_key>
+python3 skills/meta/skill-store/tool.py install <skill_key>
 ```
 
 - 系统 Skill 的 key 如 `ga-query`、`td-query`
@@ -57,7 +57,7 @@ python3 skills/skill-store/tool.py install <skill_key>
 ### 卸载 Skill
 
 ```bash
-python3 skills/skill-store/tool.py uninstall <skill_key>
+python3 skills/meta/skill-store/tool.py uninstall <skill_key>
 ```
 
 默认 Skill（`default: true`）无法卸载。

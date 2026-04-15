@@ -8,7 +8,7 @@ triggers:
   - 处理视频
   - 视频截帧
   - 视频场景
-tool: skills/video-analyzer/tool.py
+tool: skills/ops/video-analyzer/tool.py
 default: false
 ---
 # 视频处理
@@ -19,19 +19,19 @@ default: false
 
 ```bash
 # 处理本地视频文件
-python skills/video-analyzer/tool.py /path/to/video.mp4
+python skills/ops/video-analyzer/tool.py /path/to/video.mp4
 
 # 处理 URL（YouTube/Bilibili/抖音）
-python skills/video-analyzer/tool.py "https://www.bilibili.com/video/BVxxxxx"
+python skills/ops/video-analyzer/tool.py "https://www.bilibili.com/video/BVxxxxx"
 
 # 调整场景灵敏度（越小越敏感，默认 27.0）
-python skills/video-analyzer/tool.py video.mp4 --threshold 20
+python skills/ops/video-analyzer/tool.py video.mp4 --threshold 20
 
 # 限制最大场景数（默认 30，超出自动降低灵敏度）
-python skills/video-analyzer/tool.py video.mp4 --max-scenes 15
+python skills/ops/video-analyzer/tool.py video.mp4 --max-scenes 15
 
 # 调整帧图宽度（默认 960px，0 = 原始分辨率）
-python skills/video-analyzer/tool.py video.mp4 --frame-width 720
+python skills/ops/video-analyzer/tool.py video.mp4 --frame-width 720
 ```
 
 ### 参数

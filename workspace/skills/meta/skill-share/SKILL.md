@@ -9,7 +9,7 @@ triggers:
   - 我的分享
   - 我分享了
 default: true
-tool: skills/skill-share/tool.py
+tool: skills/meta/skill-share/tool.py
 ---
 # Skill 分享
 
@@ -19,22 +19,22 @@ tool: skills/skill-share/tool.py
 
 ## 工具用法
 
-`skills/skill-share/tool.py`（从 TyClaw 项目根目录运行）
+`skills/meta/skill-share/tool.py`（从 TyClaw 项目根目录运行）
 
 ### 分享 Skill
 
 ```bash
 # 分享给指定用户（支持用户名）
-python3 skills/skill-share/tool.py share --skill <skill_name> --to-user <用户名或staff_id>
+python3 skills/meta/skill-share/tool.py share --skill <skill_name> --to-user <用户名或staff_id>
 
 # 分享给自己的部门
-python3 skills/skill-share/tool.py share --skill <skill_name> --to-department
+python3 skills/meta/skill-share/tool.py share --skill <skill_name> --to-department
 
 # 分享给指定部门（按部门名称，支持模糊匹配）
-python3 skills/skill-share/tool.py share --skill <skill_name> --to-department <部门名>
+python3 skills/meta/skill-share/tool.py share --skill <skill_name> --to-department <部门名>
 
 # 分享给全公司
-python3 skills/skill-share/tool.py share --skill <skill_name> --to-all
+python3 skills/meta/skill-share/tool.py share --skill <skill_name> --to-all
 ```
 
 `skill_name` 是用户 `_personal/skills/` 下的目录名。
@@ -42,7 +42,7 @@ python3 skills/skill-share/tool.py share --skill <skill_name> --to-all
 ### 查看我分享的 Skill
 
 ```bash
-python3 skills/skill-share/tool.py my-shares
+python3 skills/meta/skill-share/tool.py my-shares
 ```
 
 展示自己发布的 Skill 列表及安装者信息。
@@ -50,17 +50,17 @@ python3 skills/skill-share/tool.py my-shares
 ### 取消分享
 
 ```bash
-python3 skills/skill-share/tool.py unshare <skill_name>
+python3 skills/meta/skill-share/tool.py unshare <skill_name>
 ```
 
 ### 修改可见范围
 
 ```bash
-python3 skills/skill-share/tool.py update-visibility <skill_name> --add-user <用户名>
-python3 skills/skill-share/tool.py update-visibility <skill_name> --remove-user <用户名>
-python3 skills/skill-share/tool.py update-visibility <skill_name> --add-dept [部门名]
-python3 skills/skill-share/tool.py update-visibility <skill_name> --remove-dept [部门名]
-python3 skills/skill-share/tool.py update-visibility <skill_name> --to-all
+python3 skills/meta/skill-share/tool.py update-visibility <skill_name> --add-user <用户名>
+python3 skills/meta/skill-share/tool.py update-visibility <skill_name> --remove-user <用户名>
+python3 skills/meta/skill-share/tool.py update-visibility <skill_name> --add-dept [部门名]
+python3 skills/meta/skill-share/tool.py update-visibility <skill_name> --remove-dept [部门名]
+python3 skills/meta/skill-share/tool.py update-visibility <skill_name> --to-all
 ```
 
 ## 交互规则
