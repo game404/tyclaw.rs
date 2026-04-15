@@ -332,6 +332,16 @@ impl Orchestrator {
         self.timer_service.as_ref()
     }
 
+    /// 获取活跃任务列表（监控用）。
+    pub fn active_tasks(&self) -> &Arc<parking_lot::Mutex<HashMap<String, ActiveTask>>> {
+        &self.active_tasks
+    }
+
+    /// 获取持久化层引用（审计、技能等，监控用）。
+    pub fn persistence(&self) -> &PersistenceLayer {
+        &self.persistence
+    }
+
     /// 覆盖 works 目录路径（对应 --works-dir 命令行参数）。
     pub fn set_works_dir(&mut self, path: std::path::PathBuf) {
         self.persistence.workspace_mgr.set_works_dir(&path);

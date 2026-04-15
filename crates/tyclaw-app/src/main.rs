@@ -6,6 +6,8 @@
 //!
 //! 配置优先级（从高到低）：命令行参数 > 环境变量 > config.yaml > 默认值
 
+mod monitor;
+
 use clap::Parser;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -427,6 +429,9 @@ async fn run_cli(config: RunConfig) {
 
     let orchestrator = Arc::new(orchestrator);
 
+    // 监控 HTTP 服务
+    monitor::spawn_monitor(Arc::clone(&orchestrator), 9394);
+
     // 启动 workspace 超时回收后台任务
     if idle_timeout_secs > 0 {
         orchestrator.spawn_reaper(idle_timeout_secs, 60);
@@ -674,6 +679,9 @@ async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig) {
     timer_svc.start().await;
 
     let orchestrator = Arc::new(orchestrator);
+
+    // 监控 HTTP 服务
+    monitor::spawn_monitor(Arc::clone(&orchestrator), 9394);
 
     // 启动 workspace 超时回收后台任务
     if idle_timeout_secs > 0 {

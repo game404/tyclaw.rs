@@ -7,7 +7,7 @@ use crate::session_manager::SessionManager;
 use crate::skill_manager::SkillManager;
 
 /// 有状态的持久化服务聚合，Orchestrator 独占使用。
-pub(crate) struct PersistenceLayer {
+pub struct PersistenceLayer {
     pub workspace_mgr: WorkspaceManager,
     pub audit: AuditLog,
     pub case_store: CaseStore,
