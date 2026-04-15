@@ -175,10 +175,10 @@ impl NodeExecutor {
                     return;
                 }
                 let (_, content) = parse_thinking_prefix(&msg);
-                // 青色竖线 + 缩进，让 sub 输出在视觉上缩进于 main 之下
-                // 多行内容每行都加前缀，保持对齐
                 for line in content.lines() {
-                    eprintln!("\x1b[36m  │\x1b[0m \x1b[2m\x1b[36m[{}]\x1b[0m \x1b[2m{}\x1b[0m", node_id, line);
+                    crate::term::scroll_print(
+                        &format!("\x1b[2m  │ \x1b[36m[{}]\x1b[0m \x1b[2m{}\x1b[0m", node_id, line)
+                    );
                 }
             })
         });

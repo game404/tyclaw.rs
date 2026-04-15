@@ -17,7 +17,7 @@
 //! 14. 自动提取案例记录（若本次使用了工具）
 
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -29,7 +29,6 @@ use tyclaw_control::AuditEntry;
 use tyclaw_memory::{extract_case, CaseRetriever};
 use tyclaw_prompt::{strip_non_task_user_message, ContextBuilder, PromptInputs, SkillContent};
 use tyclaw_provider::LLMProvider;
-use tyclaw_tools::ToolDefinitionProvider;
 use tyclaw_types::TyclawError;
 
 use crate::app_context::AppContext;
@@ -220,7 +219,6 @@ pub struct Orchestrator {
     pub(crate) context: ContextBuilder,
     /// 有状态的持久化服务（会话/审计/案例/技能/合并/限流/工作区管理）
     pub(crate) persistence: PersistenceLayer,
-    pub(crate) tool_defs_registry: Arc<dyn ToolDefinitionProvider>,
     pub(crate) pending_files: Arc<tyclaw_tools::PendingFileStore>,
     pub(crate) pending_ask_user:
         parking_lot::Mutex<HashMap<String, (String, Vec<HashMap<String, Value>>)>>,
@@ -838,10 +836,9 @@ impl Orchestrator {
         };
         let user_message = user_message.as_str();
 
-        // 5. 合并前检查
-        if self.app.features.enable_memory {
-            self.run_consolidation(&workspace_key).await;
-        }
+        // 5. 合并前检查（已移除）
+        // 每轮结束时会 archive + clear，所以新请求开始时历史已经是空的，
+        // 无需再做 consolidation。上下文全靠 MEMORY.md 提供。
 
         // 6. 收集技能和能力
         // 所有 Skill 的摘要注入 context，LLM 自己决定是否读取完整 SKILL.md。
@@ -1212,9 +1209,59 @@ impl Orchestrator {
             self.save_turn(&workspace_key, &result.messages, &result.turn_id);
         }
 
-        // 11. 合并后检查
+        // 11. 按需整理记忆
+        info!("Step 11 reached, enable_memory={}", self.app.features.enable_memory);
         if self.app.features.enable_memory {
-            self.run_consolidation(&workspace_key).await;
+            let session = self.persistence.sessions.get_or_create_clone(&workspace_key);
+            let msg_count = session.messages.len();
+            let unconsolidated_count = msg_count - session.last_consolidated;
+
+            // 仅按 token 量触发：超过上下文窗口 50% 时整理
+            let unconsolidated_tokens: usize = session.messages[session.last_consolidated..]
+                .iter()
+                .map(|m| tyclaw_types::tokens::estimate_message_tokens(m))
+                .sum();
+            let threshold = self.app.context_window_tokens / 2;
+            let should_consolidate = unconsolidated_tokens > threshold;
+
+            info!(
+                msg_count,
+                unconsolidated_count,
+                should_consolidate,
+                "Step 11: consolidation check"
+            );
+
+            if should_consolidate {
+                // 告诉用户在整理记忆
+                if let Some(cb) = on_progress {
+                    cb(&format!("[整理记忆中... ({unconsolidated_count} 条消息)]")).await;
+                }
+
+                let mem_dir = self.persistence.workspace_mgr.memory_dir(&workspace_key);
+                let consolidator = tyclaw_memory::MemoryConsolidator::new(
+                    &mem_dir,
+                    self.app.context_window_tokens,
+                );
+                consolidator
+                    .archive_unconsolidated(
+                        &session.messages,
+                        session.last_consolidated,
+                        self.provider.as_ref(),
+                        &self.app.model,
+                    )
+                    .await;
+
+                // 清空历史
+                let mut session = self.persistence.sessions.get_or_create_clone(&workspace_key);
+                session.clear();
+                self.persistence.sessions.save(&session).ok();
+                self.persistence.sessions.invalidate(&workspace_key);
+
+                if let Some(cb) = on_progress {
+                    cb("[记忆整理完成，历史已清空]").await;
+                }
+                info!("Step 11: consolidation done, session cleared");
+            }
         }
 
         // 12. 记录速率
@@ -1306,41 +1353,6 @@ impl Orchestrator {
         })
     }
 
-    /// 运行 token 预算合并检查。
-    async fn run_consolidation(&self, workspace_key: &str) {
-        let session = self.persistence.sessions.get_or_create_clone(workspace_key);
-        let messages = session.messages.clone();
-        let last_consolidated = session.last_consolidated;
-
-        let mem_dir = self.persistence.workspace_mgr.memory_dir(workspace_key);
-        let ctx_window = self.app.context_window_tokens;
-        let consolidator = tyclaw_memory::MemoryConsolidator::new(&mem_dir, ctx_window);
-
-        let context_ref = &self.context;
-        let tools_ref = &self.tool_defs_registry;
-
-        let new_lc = consolidator
-            .maybe_consolidate_by_tokens(
-                &messages,
-                last_consolidated,
-                &|history, msg| {
-                    let inputs = tyclaw_prompt::PromptInputs::default();
-                    let planned = context_ref.plan_prompt_context(&inputs);
-                    context_ref.assemble_messages(&planned, history, msg)
-                },
-                &|| tools_ref.get_definitions(),
-                self.provider.as_ref(),
-                &self.app.model,
-            )
-            .await;
-
-        if new_lc != last_consolidated {
-            let mut session = self.persistence.sessions.get_or_create_clone(workspace_key);
-            session.last_consolidated = new_lc;
-            self.persistence.sessions.save(&session).ok();
-        }
-    }
-
     /// 保存新轮次消息���会话（截断大的工具结果）。
     ///
     /// 通过 `_reset_iterations_next_run` 标记定位本轮新消息的起始位置，
@@ -1360,6 +1372,21 @@ impl Orchestrator {
         use serde_json::Value;
 
         let mut entries = Vec::new();
+        // 收集 session 历史中已有的 tool_call id，检测 LLM 跨轮次复用 id
+        let session = self.persistence.sessions.get_or_create_clone(workspace_key);
+        let mut seen_call_ids: HashSet<String> = HashSet::new();
+        for m in &session.messages {
+            if let Some(Value::Array(tcs)) = m.get("tool_calls") {
+                for tc in tcs {
+                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                        seen_call_ids.insert(id.to_string());
+                    }
+                }
+            }
+            if let Some(id) = m.get("tool_call_id").and_then(|v| v.as_str()) {
+                seen_call_ids.insert(id.to_string());
+            }
+        }
 
         for m in messages.iter() {
             // 只保存带有匹配 _turn_id 的消息（agent_loop 本轮新增的）
@@ -1371,6 +1398,28 @@ impl Orchestrator {
             let mut entry = m.clone();
             // 移除内部标记字段，不写入 history
             entry.remove("_turn_id");
+
+            // 对与历史冲突的 tool_call id 添加后缀，避免 Anthropic 400
+            if let Some(Value::Array(tcs)) = entry.get_mut("tool_calls") {
+                for tc in tcs.iter_mut() {
+                    if let Some(Value::String(id)) = tc.get_mut("id") {
+                        if !seen_call_ids.insert(id.clone()) {
+                            // id 已存在于历史中，加后缀
+                            let new_id = format!("{}_{:04x}", id, entries.len());
+                            warn!(old_id = %id, new_id = %new_id, "Deduplicating tool_call id on save");
+                            *id = new_id.clone();
+                            seen_call_ids.insert(new_id);
+                        }
+                    }
+                }
+            }
+            if let Some(Value::String(tcid)) = entry.get_mut("tool_call_id") {
+                if !seen_call_ids.insert(tcid.clone()) {
+                    let new_id = format!("{}_{:04x}", tcid, entries.len());
+                    *tcid = new_id.clone();
+                    seen_call_ids.insert(new_id);
+                }
+            }
 
             let role = entry
                 .get("role")

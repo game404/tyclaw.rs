@@ -44,7 +44,7 @@ struct DingTalkConfig {
     gateway_url: Option<String>,
 }
 
-fn print_effective_config(
+fn format_effective_config(
     config_path: &Path,
     mode: &str,
     workspace: &Path,
@@ -58,95 +58,48 @@ fn print_effective_config(
     dingtalk: &DingTalkConfig,
     workspaces: &HashMap<String, WorkspaceConfig>,
     subtasks: &SubtasksConfig,
-) {
-    println!("\n=== TyClaw.rs Effective Config ===");
-    println!("mode: {mode}");
-    println!("workspace: {}", workspace.display());
-    println!("config_file: {}", config_path.display());
-    println!("llm.model: {model}");
-    println!("llm.api_base: {api_base}");
-    println!("llm.api_key: {}", mask_secret(api_key));
-    println!("llm.max_iterations: {max_iterations}");
-    println!(
-        "llm.context_window_tokens: {}",
-        context_window_tokens
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "<default>".into())
-    );
-    println!("llm.snapshot: {snapshot}");
-    println!(
-        "logging.level: {}",
-        if logging.level.trim().is_empty() {
-            "info"
-        } else {
-            &logging.level
-        }
-    );
-    println!(
-        "logging.file: {}",
-        logging
-            .file
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<workspace>/logs/tyclaw.log".into())
-    );
-    println!("workspaces.count: {}", workspaces.len());
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    macro_rules! p {
+        ($($arg:tt)*) => { lines.push(format!($($arg)*)) };
+    }
+
+    p!("=== TyClaw.rs Effective Config ===");
+    p!("mode: {mode}");
+    p!("workspace: {}", workspace.display());
+    p!("config_file: {}", config_path.display());
+    p!("llm.model: {model}");
+    p!("llm.api_base: {api_base}");
+    p!("llm.api_key: {}", mask_secret(api_key));
+    p!("llm.max_iterations: {max_iterations}");
+    p!("llm.context_window_tokens: {}", context_window_tokens.map(|v| v.to_string()).unwrap_or_else(|| "<default>".into()));
+    p!("llm.snapshot: {snapshot}");
+    p!("logging.level: {}", if logging.level.trim().is_empty() { "info" } else { &logging.level });
+    p!("logging.file: {}", logging.file.as_ref().map(|pp| pp.display().to_string()).unwrap_or_else(|| "<workspace>/logs/tyclaw.log".into()));
+    p!("workspaces.count: {}", workspaces.len());
     if !workspaces.is_empty() {
         let mut ids: Vec<&String> = workspaces.keys().collect();
         ids.sort();
-        println!(
-            "workspaces.ids: {}",
-            ids.iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        p!("workspaces.ids: {}", ids.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
     }
     if mode == "dingtalk" {
-        println!(
-            "dingtalk.client_id: {}",
-            dingtalk
-                .client_id
-                .as_deref()
-                .map(mask_secret)
-                .unwrap_or_else(|| "<empty>".into())
-        );
-        println!(
-            "dingtalk.client_secret: {}",
-            dingtalk
-                .client_secret
-                .as_deref()
-                .map(mask_secret)
-                .unwrap_or_else(|| "<empty>".into())
-        );
-        println!(
-            "dingtalk.gateway_url: {}",
-            dingtalk
-                .gateway_url
-                .as_deref()
-                .unwrap_or("<none, direct stream>")
-        );
+        p!("dingtalk.client_id: {}", dingtalk.client_id.as_deref().map(mask_secret).unwrap_or_else(|| "<empty>".into()));
+        p!("dingtalk.client_secret: {}", dingtalk.client_secret.as_deref().map(mask_secret).unwrap_or_else(|| "<empty>".into()));
+        p!("dingtalk.gateway_url: {}", dingtalk.gateway_url.as_deref().unwrap_or("<none, direct stream>"));
     }
-    println!("subtasks.enabled: {}", subtasks.enabled);
+    p!("subtasks.enabled: {}", subtasks.enabled);
     if subtasks.enabled {
-        println!(
-            "subtasks.planner_model: {}",
-            subtasks.planner_model.as_deref().unwrap_or("<default>")
-        );
-        println!("subtasks.max_concurrency: {}", subtasks.max_concurrency);
-        println!("subtasks.failure_policy: {:?}", subtasks.failure_policy);
-        println!("subtasks.routing_rules: {}", subtasks.routing_rules.len());
-        println!("subtasks.providers: {}", subtasks.providers.len());
+        p!("subtasks.planner_model: {}", subtasks.planner_model.as_deref().unwrap_or("<default>"));
+        p!("subtasks.max_concurrency: {}", subtasks.max_concurrency);
+        p!("subtasks.failure_policy: {:?}", subtasks.failure_policy);
+        p!("subtasks.routing_rules: {}", subtasks.routing_rules.len());
+        p!("subtasks.providers: {}", subtasks.providers.len());
         for (name, pcfg) in &subtasks.providers {
-            println!(
-                "  {}: endpoint={}, model={}",
-                name,
-                pcfg.endpoint,
-                pcfg.model.as_deref().unwrap_or(name)
-            );
+            p!("  {}: endpoint={}, model={}", name, pcfg.endpoint, pcfg.model.as_deref().unwrap_or(name));
         }
     }
-    println!("===============================\n");
+    p!("===============================");
+    lines
 }
 
 /// 初始化日志：统一写入文件，避免 CLI 交互与日志混杂。
@@ -319,7 +272,7 @@ async fn main() {
     let context_window = args.context_window_tokens.or(cfg.llm.context_window_tokens);
     let snapshot = cfg.llm.snapshot;
 
-    print_effective_config(
+    let config_lines = format_effective_config(
         &config_path,
         mode,
         &workspace_root,
@@ -373,6 +326,7 @@ async fn main() {
         web_search_config: cfg.web_search,
         control_config: cfg.control,
         workspace_config: cfg.workspace,
+        startup_lines: config_lines,
     };
 
     if args.dingtalk {
@@ -420,6 +374,8 @@ struct RunConfig {
     web_search_config: tyclaw_tools::WebSearchConfig,
     control_config: tyclaw_orchestration::ControlConfig,
     workspace_config: tyclaw_orchestration::WorkspaceRuntimeConfig,
+    /// 启动时的配置摘要（在 CLI 滚动区显示）
+    startup_lines: Vec<String>,
 }
 
 impl RunConfig {
@@ -449,6 +405,7 @@ impl RunConfig {
 /// 以 CLI 模式运行。
 async fn run_cli(config: RunConfig) {
     let idle_timeout_secs = config.workspace_config.idle_timeout_secs;
+    let startup_lines = config.startup_lines.clone();
     let (timer_svc, timer_rx) = create_timer_service(&config.workspace);
 
     let mut orchestrator = config.build_orchestrator(timer_svc.clone());
@@ -479,14 +436,15 @@ async fn run_cli(config: RunConfig) {
 
     spawn_timer_consumer(timer_rx, bus_handle.clone());
 
-    let dispatcher_handle = tokio::spawn(run_outbound_dispatcher(outbound_rx, None));
-    let bus_handle_task = tokio::spawn(bus.run());
+    let _dispatcher_handle = tokio::spawn(run_outbound_dispatcher(outbound_rx, None));
+    let _bus_handle_task = tokio::spawn(bus.run());
 
-    let cli = CliChannel::new("cli_user", "default");
+    let cli = CliChannel::new("cli_user", "default")
+        .with_startup_lines(startup_lines);
     cli.run(bus_handle, timer_svc.as_ref()).await;
 
-    drop(dispatcher_handle);
-    drop(bus_handle_task);
+    _dispatcher_handle.abort();
+    _bus_handle_task.abort();
     timer_svc.stop();
 }
 
@@ -502,7 +460,6 @@ async fn run_outbound_dispatcher(
     mut outbound_rx: tokio::sync::mpsc::Receiver<OutboundEvent>,
     dt_sender: Option<DingTalkSender>,
 ) {
-    use std::io::Write;
     use tyclaw_channel::dingtalk::handler;
 
     while let Some(event) = outbound_rx.recv().await {
@@ -582,59 +539,49 @@ async fn run_outbound_dispatcher(
             }
         }
 
-        // CLI 通道：轮次信息白色，其余灰色
+        // CLI 通道：通过 cli_print 输出到滚动区域
+        // 配色：只有 You> 和 TyClaw.rs> 的正文用亮白色，其余全部灰暗
+        use tyclaw_channel::cli::cli_print;
         match &event {
             OutboundEvent::Progress { message, .. } => {
                 if message.starts_with("[Thinking]") {
                     let content = message.strip_prefix("[Thinking]\n").unwrap_or(message);
-                    println!("\x1b[2m\x1b[35m◆ {content}\x1b[0m");
-                } else if message.contains("[sandbox]") || message.contains("[已创建任务") {
-                    // sandbox 容器操作：绿色
-                    println!("\x1b[32m{message}\x1b[0m");
-                } else if message.contains("[轮次") || message.contains("[Token]") {
-                    // 轮次和 Token 统计：白色（默认色）
-                    println!("{message}");
+                    cli_print(&format!("\x1b[2m◆ {content}\x1b[0m"));
                 } else if message.starts_with("[dispatch]") {
-                    // dispatch 开始/结束：黄色 + 分隔线
-                    println!("\x1b[33m─── {message} ───\x1b[0m");
+                    cli_print(&format!("\x1b[2m─── {message} ───\x1b[0m"));
                 } else if message.starts_with('[') {
-                    // 已有前缀的系统消息（[scheduler] 等）：灰色原样输出
-                    println!("\x1b[2m{message}\x1b[0m");
+                    // 系统消息：轮次、Token、sandbox、scheduler 等
+                    cli_print(&format!("\x1b[2m{message}\x1b[0m"));
                 } else {
-                    // 主 LLM 的 content 输出：正常亮度，加 ▌ 前缀标识主线程
-                    println!("\x1b[37m▌\x1b[0m {message}");
+                    // 主 LLM content：灰色前缀 + 灰色文本
+                    cli_print(&format!("\x1b[2m▌ {message}\x1b[0m"));
                 }
             }
             OutboundEvent::Thinking { content, .. } => {
-                println!("\x1b[2m[Thinking] {content}\x1b[0m");
+                cli_print(&format!("\x1b[2m◆ {content}\x1b[0m"));
             }
             OutboundEvent::Reply { response, .. } => {
-                println!("\nTyClaw.rs> {}\n", response.text);
+                // TyClaw.rs> 亮白色 —— 唯一醒目的输出
+                cli_print(&format!(
+                    "\x1b[1;37mTyClaw.rs>\x1b[0m \x1b[1;37m{}\x1b[0m",
+                    response.text
+                ));
                 if !response.tools_used.is_empty() {
-                    println!(
-                        "\x1b[2m(tools: {} | {:.1}s)\x1b[0m\n",
+                    cli_print(&format!(
+                        "\x1b[2m(tools: {} | {:.1}s)\x1b[0m",
                         response.tools_used.join(", "),
                         response.duration_seconds
-                    );
+                    ));
                 }
                 if !response.output_files.is_empty() {
-                    println!("\x1b[33m[输出文件]\x1b[0m");
+                    cli_print("\x1b[2m[输出文件]\x1b[0m");
                     for f in &response.output_files {
-                        println!("  → {f}");
+                        cli_print(&format!("\x1b[2m  → {f}\x1b[0m"));
                     }
-                    println!();
-                }
-                if !is_dt {
-                    print!("You> ");
-                    let _ = std::io::stdout().flush();
                 }
             }
             OutboundEvent::Error { message, .. } => {
-                eprintln!("\x1b[31mError: {message}\x1b[0m");
-                if !is_dt {
-                    print!("You> ");
-                    let _ = std::io::stdout().flush();
-                }
+                cli_print(&format!("\x1b[2;31mError: {message}\x1b[0m"));
             }
         }
     }
@@ -697,6 +644,7 @@ async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig) {
         std::process::exit(1);
     });
 
+    let startup_lines = config.startup_lines.clone();
     let (timer_svc, timer_rx) = create_timer_service(&config.workspace);
     let mut orchestrator = config.build_orchestrator(timer_svc.clone());
 
@@ -735,7 +683,7 @@ async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig) {
     let (bus, bus_handle, outbound_rx) = MessageBus::new(Arc::clone(&orchestrator), 64, 256);
 
     spawn_timer_consumer(timer_rx, bus_handle.clone());
-    tokio::spawn(bus.run());
+    let bus_task = tokio::spawn(bus.run());
 
     // Outbound dispatcher：CLI 打印到 stdout，钉钉通过 API 发出
     let dt_sender = DingTalkSender {
@@ -743,7 +691,7 @@ async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig) {
         token_manager: token_manager.clone(),
         robot_code: client_id.clone(),
     };
-    tokio::spawn(run_outbound_dispatcher(outbound_rx, Some(dt_sender)));
+    let dispatcher_task = tokio::spawn(run_outbound_dispatcher(outbound_rx, Some(dt_sender)));
 
     // 启动消息接收（后台运行）
     let bot = DingTalkBot::new(
@@ -776,14 +724,19 @@ async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig) {
     // 有终端时启动 CLI REPL（前台），否则只跑 DingTalk + Timer（后台服务模式）
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         info!("CLI REPL starting (hybrid mode)...");
-        let cli = CliChannel::new("cli_user", "default");
+        let cli = CliChannel::new("cli_user", "default")
+            .with_startup_lines(startup_lines);
         cli.run(bus_handle, timer_svc.as_ref()).await;
         timer_svc.stop();
+        bus_task.abort();
+        dispatcher_task.abort();
     } else {
         info!("No terminal detected, running as background service (DingTalk + Timer only)");
         // 等待 Ctrl+C 信号退出
         tokio::signal::ctrl_c().await.ok();
         info!("Received SIGINT, shutting down...");
         timer_svc.stop();
+        bus_task.abort();
+        dispatcher_task.abort();
     }
 }

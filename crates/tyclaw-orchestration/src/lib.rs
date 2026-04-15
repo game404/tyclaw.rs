@@ -41,6 +41,9 @@ pub(crate) mod history;
 /// 编排器辅助函数（技能路由、案例优化、预算计算）
 pub(crate) mod helpers;
 
+/// 终端输出工具（ANSI 滚动区域内打印）
+pub mod term;
+
 // 重新导出核心类型
 pub use app_context::AppContext;
 pub use builder::OrchestratorBuilder;

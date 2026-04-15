@@ -4,6 +4,15 @@
 
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use tiktoken_rs::CoreBPE;
+
+/// 全局缓存的 tiktoken BPE 编码器（加载一次，之后复用）。
+fn bpe() -> &'static CoreBPE {
+    static BPE: OnceLock<CoreBPE> = OnceLock::new();
+    BPE.get_or_init(|| tiktoken_rs::cl100k_base().expect("Failed to load tiktoken cl100k_base"))
+}
 
 /// 估算消息列表的 prompt token 数量。
 ///
@@ -103,10 +112,7 @@ pub fn estimate_message_tokens(message: &HashMap<String, Value>) -> usize {
         return 1;
     }
 
-    match tiktoken_rs::cl100k_base() {
-        Ok(bpe) => std::cmp::max(1, bpe.encode_with_special_tokens(&payload).len()),
-        Err(_) => std::cmp::max(1, payload.len() / 4),
-    }
+    std::cmp::max(1, bpe().encode_with_special_tokens(&payload).len())
 }
 
 /// 估算 prompt token 数量（tiktoken 方式）。

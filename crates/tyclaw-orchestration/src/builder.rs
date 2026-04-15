@@ -10,7 +10,7 @@ use tyclaw_control::{AuditLog, ExecutionGate, RateLimiter, WorkspaceConfig, Work
 use tyclaw_memory::CaseStore;
 use tyclaw_prompt::ContextBuilder;
 use tyclaw_provider::LLMProvider;
-use tyclaw_tools::{ToolDefinitionProvider, ToolRuntime};
+use tyclaw_tools::ToolRuntime;
 use tyclaw_tools::{
     timer::TimerService, ApplyPatchTool, AskUserTool, CopyFileTool, DeleteFileTool, EditFileTool,
     ExecTool, GlobTool, GrepSearchTool, ListDirTool, MkdirTool, MoveFileTool, PendingFileStore,
@@ -36,7 +36,6 @@ pub struct OrchestratorBuilder {
     pub(crate) write_snapshot: bool,
     pub(crate) workspaces_config: Option<HashMap<String, WorkspaceConfig>>,
     pub(crate) tools_for_loop: Option<ToolRegistry>,
-    pub(crate) tool_defs_registry: Option<ToolRegistry>,
     pub(crate) features: OrchestratorFeatures,
     pub(crate) subtasks_config: Option<crate::subtasks::SubtasksConfig>,
     pub(crate) timer_service: Option<Arc<TimerService>>,
@@ -57,7 +56,6 @@ impl OrchestratorBuilder {
             write_snapshot: false,
             workspaces_config: None,
             tools_for_loop: None,
-            tool_defs_registry: None,
             features: OrchestratorFeatures::default(),
             subtasks_config: None,
             timer_service: None,
@@ -131,33 +129,9 @@ impl OrchestratorBuilder {
         self
     }
 
-    /// 注入一份共享工具注册表，默认同时作为 runtime 和 definitions 的来源。
+    /// 注入工具注册表，同时作为 runtime 和 definitions 的来源。
     pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
         self.tools_for_loop = Some(tools);
-        self.tool_defs_registry = None;
-        self
-    }
-
-    /// 注入一份单独的 definitions registry。
-    ///
-    /// 正常情况下优先使用 `with_tools()` 让 runtime 和 definitions 共享同一份来源。
-    /// 只有嵌入式场景确实需要“模型可见工具面”与“运行时可执行工具面”分离时，才单独调用此方法。
-    pub fn with_tool_definitions(mut self, tools: ToolRegistry) -> Self {
-        self.tool_defs_registry = Some(tools);
-        self
-    }
-
-    /// 注入两份独立 registry（高级 override）。
-    ///
-    /// 这会显式绕过默认的共享 tool surface 路径。仅适用于 SDK 嵌入等少数高级场景；
-    /// 正常应用代码优先使用 `with_tools()`，避免 runtime / definitions 再次漂移。
-    pub fn with_tool_registries(
-        mut self,
-        runtime_tools: ToolRegistry,
-        definition_tools: ToolRegistry,
-    ) -> Self {
-        self.tools_for_loop = Some(runtime_tools);
-        self.tool_defs_registry = Some(definition_tools);
         self
     }
 
@@ -216,7 +190,6 @@ impl OrchestratorBuilder {
             write_snapshot,
             workspaces_config,
             tools_for_loop,
-            tool_defs_registry,
             features,
             subtasks_config,
             timer_service,
@@ -307,16 +280,6 @@ impl OrchestratorBuilder {
         attach_runtime_executor(&mut runtime_registry, features.enable_rbac);
         let runtime_registry = Arc::new(runtime_registry);
 
-        let tool_defs_registry: Arc<dyn ToolDefinitionProvider> =
-            if let Some(definition_seed) = tool_defs_registry {
-                Arc::new(build_tool_surface_registry(
-                    definition_seed,
-                    &surface_config,
-                ))
-            } else {
-                runtime_registry.clone()
-            };
-
         let runtime_tools: Arc<dyn ToolRuntime> = runtime_registry.clone();
 
         let runtime = AgentLoop::new(
@@ -332,7 +295,6 @@ impl OrchestratorBuilder {
             runtime: Box::new(runtime),
             context,
             persistence,
-            tool_defs_registry,
             pending_files,
             pending_ask_user: parking_lot::Mutex::new(HashMap::new()),
             timer_service,
@@ -453,69 +415,3 @@ fn register_orchestration_tools(
     info!("Web tools registered (provider={})", ws_config.provider);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use async_trait::async_trait;
-    use tyclaw_provider::{ChatRequest, GenerationSettings, LLMResponse};
-
-    struct DummyProvider;
-
-    #[async_trait]
-    impl LLMProvider for DummyProvider {
-        async fn chat(
-            &self,
-            _request: ChatRequest,
-        ) -> Result<LLMResponse, tyclaw_types::TyclawError> {
-            Ok(LLMResponse::error("not used in builder tests"))
-        }
-
-        fn default_model(&self) -> &str {
-            "dummy-model"
-        }
-
-        fn generation_settings(&self) -> GenerationSettings {
-            GenerationSettings::default()
-        }
-    }
-
-    fn make_builder() -> OrchestratorBuilder {
-        OrchestratorBuilder::new(Arc::new(DummyProvider), PathBuf::from("."))
-    }
-
-    #[test]
-    fn test_with_tools_clears_definition_override() {
-        let mut definitions = ToolRegistry::new();
-        definitions.register(Box::new(AskUserTool::new()));
-
-        let mut shared = ToolRegistry::new();
-        shared.register(Box::new(AskUserTool::new()));
-
-        let builder = make_builder()
-            .with_tool_definitions(definitions)
-            .with_tools(shared);
-
-        assert!(builder.tools_for_loop.is_some());
-        assert!(
-            builder.tool_defs_registry.is_none(),
-            "with_tools should restore the default shared tool surface path"
-        );
-    }
-
-    #[test]
-    fn test_with_tool_registries_keeps_explicit_override() {
-        let mut runtime = ToolRegistry::new();
-        runtime.register(Box::new(AskUserTool::new()));
-
-        let mut definitions = ToolRegistry::new();
-        definitions.register(Box::new(ReadFileTool::new(None)));
-
-        let builder = make_builder().with_tool_registries(runtime, definitions);
-
-        assert!(builder.tools_for_loop.is_some());
-        assert!(
-            builder.tool_defs_registry.is_some(),
-            "explicit dual-registry override should remain available for advanced callers"
-        );
-    }
-}

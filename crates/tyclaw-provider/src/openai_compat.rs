@@ -1341,8 +1341,12 @@ fn ensure_tool_call_pairs(messages: Vec<Value>) -> Vec<Value> {
                 if !all_call_ids.contains(tcid) {
                     continue; // orphan result, skip
                 }
-                // 跳过重复 id 的 tool result（只保留第一次出现的配对）
-                if duplicate_call_ids.contains(tcid) && !emitted_call_ids.insert(tcid.to_string()) {
+                // 每个 tool_call_id 只允许一个 tool_result（跳过重复的）
+                if !emitted_call_ids.insert(tcid.to_string()) {
+                    warn!(
+                        tool_call_id = tcid,
+                        "Skipping duplicate tool_result (id already paired)"
+                    );
                     continue;
                 }
             }
