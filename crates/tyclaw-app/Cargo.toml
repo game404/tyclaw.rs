@@ -23,4 +23,6 @@ tyclaw-tools = { workspace = true }
 tyclaw-sandbox = { path = "../tyclaw-sandbox" }
 rustyline = "17.0.2"
 reqwest = { workspace = true }
+base64 = { workspace = true }
+tyclaw-control = { workspace = true }
 time = { version = "0.3", features = ["local-offset", "macros", "formatting"] }

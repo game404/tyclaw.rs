@@ -35,6 +35,70 @@ use tyclaw_provider::OpenAICompatProvider;
 struct AppConfig {
     #[serde(default)]
     dingtalk: DingTalkConfig,
+    #[serde(default)]
+    monitor: MonitorConfig,
+}
+
+/// 监控 HTTP 服务配置。
+#[derive(Debug, Clone, Deserialize)]
+struct MonitorConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_monitor_bind")]
+    bind: String,
+    #[serde(default = "default_monitor_port")]
+    port: u16,
+    #[serde(default)]
+    basic_auth: Option<BasicAuthConfig>,
+}
+
+impl Default for MonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bind: default_monitor_bind(),
+            port: default_monitor_port(),
+            basic_auth: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BasicAuthConfig {
+    user: String,
+    password: String,
+}
+
+fn default_true() -> bool { true }
+fn default_monitor_bind() -> String { "127.0.0.1".into() }
+fn default_monitor_port() -> u16 { 9394 }
+
+/// 将配置转为 `MonitorOptions`；非 loopback 且无 basic_auth 时返回 `None`（拒绝裸奔）。
+fn resolve_monitor_options(cfg: &MonitorConfig) -> Option<monitor::MonitorOptions> {
+    if !cfg.enabled {
+        tracing::info!("Monitor disabled by config");
+        return None;
+    }
+    let is_loopback = cfg.bind.trim() == "127.0.0.1" || cfg.bind.trim() == "::1" || cfg.bind.trim() == "localhost";
+    let basic = cfg.basic_auth.as_ref().and_then(|ba| {
+        if ba.user.is_empty() || ba.password.is_empty() {
+            None
+        } else {
+            Some((ba.user.clone(), ba.password.clone()))
+        }
+    });
+    if !is_loopback && basic.is_none() {
+        tracing::error!(
+            bind = %cfg.bind,
+            "Monitor refused to start: non-loopback bind requires basic_auth"
+        );
+        return None;
+    }
+    Some(monitor::MonitorOptions {
+        bind: cfg.bind.clone(),
+        port: cfg.port,
+        basic_auth: basic,
+    })
 }
 
 /// 钉钉配置。
@@ -63,6 +127,7 @@ fn format_effective_config(
     dingtalk: &DingTalkConfig,
     workspaces: &HashMap<String, WorkspaceConfig>,
     subtasks: &SubtasksConfig,
+    monitor: &MonitorConfig,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     macro_rules! p {
@@ -103,6 +168,10 @@ fn format_effective_config(
             p!("  {}: endpoint={}, model={}", name, pcfg.endpoint, pcfg.model.as_deref().unwrap_or(name));
         }
     }
+    p!("monitor.enabled: {}", monitor.enabled);
+    p!("monitor.bind: {}", monitor.bind);
+    p!("monitor.port: {}", monitor.port);
+    p!("monitor.basic_auth: {}", if monitor.basic_auth.is_some() { "configured" } else { "<none>" });
     p!("===============================");
     lines
 }
@@ -291,6 +360,7 @@ async fn main() {
         &app_cfg.dingtalk,
         &cfg.workspaces,
         &cfg.subtasks,
+        &app_cfg.monitor,
     );
 
     info!(
@@ -335,9 +405,9 @@ async fn main() {
     };
 
     if args.dingtalk {
-        run_hybrid(run_config, app_cfg.dingtalk).await;
+        run_hybrid(run_config, app_cfg.dingtalk, app_cfg.monitor).await;
     } else {
-        run_cli(run_config).await;
+        run_cli(run_config, app_cfg.monitor).await;
     }
 }
 
@@ -408,7 +478,7 @@ impl RunConfig {
 }
 
 /// 以 CLI 模式运行。
-async fn run_cli(config: RunConfig) {
+async fn run_cli(config: RunConfig, monitor_cfg: MonitorConfig) {
     let idle_timeout_secs = config.workspace_config.idle_timeout_secs;
     let startup_lines = config.startup_lines.clone();
     let (timer_svc, timer_rx) = create_timer_service(&config.workspace);
@@ -433,7 +503,7 @@ async fn run_cli(config: RunConfig) {
     let orchestrator = Arc::new(orchestrator);
 
     // 监控 HTTP 服务
-    monitor::spawn_monitor(Arc::clone(&orchestrator), 9394);
+    monitor::spawn_monitor(Arc::clone(&orchestrator), resolve_monitor_options(&monitor_cfg));
 
     // 启动 workspace 超时回收后台任务
     if idle_timeout_secs > 0 {
@@ -670,7 +740,7 @@ fn spawn_timer_consumer(
 /// 共享同一个 Orchestrator 和 MessageBus。
 /// DingTalk 消息通过 Stream 收发，CLI 消息通过 stdin/stdout。
 /// CLI 退出时整个进程退出。
-async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig) {
+async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig, monitor_cfg: MonitorConfig) {
     let idle_timeout_secs = config.workspace_config.idle_timeout_secs;
     let DingTalkConfig {
         client_id,
@@ -726,7 +796,7 @@ async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig) {
     let orchestrator = Arc::new(orchestrator);
 
     // 监控 HTTP 服务
-    monitor::spawn_monitor(Arc::clone(&orchestrator), 9394);
+    monitor::spawn_monitor(Arc::clone(&orchestrator), resolve_monitor_options(&monitor_cfg));
 
     // 启动 workspace 超时回收后台任务
     if idle_timeout_secs > 0 {
