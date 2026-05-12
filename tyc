@@ -124,7 +124,40 @@ do_clean() {
 
 do_build_docker() {
     echo "=== Build sandbox Docker image ==="
-    docker build -t tyclaw-sandbox "$SCRIPT_DIR/docker/sandbox"
+
+    # 探测镜像源：优先环境变量，否则自动检测清华源可达性
+    if [ -z "$PIP_INDEX_URL" ]; then
+        if curl -s --max-time 3 https://pypi.tuna.tsinghua.edu.cn/simple >/dev/null 2>&1; then
+            APT_MIRROR="mirrors.tuna.tsinghua.edu.cn"
+            PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
+            PIP_TRUSTED_HOST="pypi.tuna.tsinghua.edu.cn"
+            RUSTUP_DIST_SERVER="https://mirrors.tuna.tsinghua.edu.cn/rustup"
+            RUSTUP_UPDATE_ROOT="https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup"
+            echo "[mirror] 使用清华镜像源 (apt + pip + rustup)"
+        else
+            APT_MIRROR="deb.debian.org"
+            PIP_INDEX_URL="https://pypi.org/simple"
+            PIP_TRUSTED_HOST="pypi.org"
+            RUSTUP_DIST_SERVER="https://static.rust-lang.org"
+            RUSTUP_UPDATE_ROOT="https://static.rust-lang.org/rustup"
+            echo "[mirror] 使用官方源 (apt + pip + rustup)"
+        fi
+    else
+        APT_MIRROR="${APT_MIRROR:-deb.debian.org}"
+        PIP_TRUSTED_HOST=$(echo "$PIP_INDEX_URL" | sed 's|https\?://||;s|/.*||')
+        RUSTUP_DIST_SERVER="${RUSTUP_DIST_SERVER:-https://static.rust-lang.org}"
+        RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT:-https://static.rust-lang.org/rustup}"
+        echo "[mirror] 使用自定义源: apt=$APT_MIRROR pip=$PIP_INDEX_URL rustup=$RUSTUP_DIST_SERVER"
+    fi
+
+    docker build \
+        --build-arg APT_MIRROR="$APT_MIRROR" \
+        --build-arg PIP_INDEX_URL="$PIP_INDEX_URL" \
+        --build-arg PIP_TRUSTED_HOST="$PIP_TRUSTED_HOST" \
+        --build-arg RUSTUP_DIST_SERVER="$RUSTUP_DIST_SERVER" \
+        --build-arg RUSTUP_UPDATE_ROOT="$RUSTUP_UPDATE_ROOT" \
+        -t tyclaw-sandbox \
+        "$SCRIPT_DIR/docker/sandbox"
     echo "[ok] sandbox 镜像已重建"
 
     OLD_CONTAINERS=$(docker ps -a --filter "name=tyclaw-" --format "{{.Names}}" 2>/dev/null)

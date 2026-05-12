@@ -1,5 +1,14 @@
 FROM python:3.11-slim
 
+ARG APT_MIRROR=deb.debian.org
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG PIP_TRUSTED_HOST=pypi.org
+ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
+ARG RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
+
+# 替换 apt 源（支持国内镜像加速）
+RUN sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources
+
 # 安装系统工具 + 开发环境 + OpenCV 运行时依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -35,22 +44,19 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV CARGO_HOME=/usr/local/cargo
 ENV PATH="/usr/local/cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
-    && rustup component add clippy rustfmt \
+RUN RUSTUP_DIST_SERVER="$RUSTUP_DIST_SERVER" \
+    RUSTUP_UPDATE_ROOT="$RUSTUP_UPDATE_ROOT" \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
+    && RUSTUP_DIST_SERVER="$RUSTUP_DIST_SERVER" rustup component add clippy rustfmt \
     && chmod -R a+rX /usr/local/cargo /usr/local/rustup
 
-# Python 常用包
+# Python 依赖（通过 requirements.txt 管理，便于扩展）
+COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir \
-    pandas \
-    numpy \
-    openpyxl \
-    requests \
-    opencv-python-headless \
-    av \
-    pytesseract \
-    faster-whisper \
-    "scenedetect[opencv]" \
-    yt-dlp
+    -i "$PIP_INDEX_URL" \
+    --trusted-host "$PIP_TRUSTED_HOST" \
+    -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
 
 # 浏览器自动化环境（Xvfb + Chromium + Playwright）
 ENV PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/ms-playwright
@@ -58,7 +64,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
     xauth \
     fonts-noto-cjk \
-    && pip install --no-cache-dir playwright playwright-stealth \
     && playwright install --with-deps chromium \
     && chmod -R a+rX /usr/local/share/ms-playwright \
     && rm -rf /var/lib/apt/lists/*

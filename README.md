@@ -183,8 +183,14 @@ dingtalk-gateway      钉钉消息网关（独立部署，会话亲和分发）
 ### 2. 构建 Docker 沙箱镜像
 
 ```bash
-docker build -t tyclaw-sandbox:latest docker/sandbox/
+# 自动检测网络环境，国内走清华镜像源（apt + pip），国外走官方源
+./tyc build-docker
+
+# 手动指定镜像源（可选）
+APT_MIRROR=mirrors.aliyun.com PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple ./tyc build-docker
 ```
+
+Python 依赖通过 `docker/sandbox/requirements.txt` 管理，新增包只需编辑该文件后重新构建。
 
 镜像基于 `python:3.11-slim`，预装以下工具和库：
 
