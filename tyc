@@ -217,11 +217,11 @@ case "$COMMAND" in
     deploy)
         # 生产部署：release 二进制，后台运行
         EXTRA_ARGS="--dingtalk"
-        for arg in "$@"; do
-            case "$arg" in
-                --works-dir) shift; DEPLOY_WORKS_DIR="$1" ;;
-                --works-dir=*) DEPLOY_WORKS_DIR="${arg#*=}" ;;
-                *) EXTRA_ARGS="$EXTRA_ARGS $arg" ;;
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --works-dir) DEPLOY_WORKS_DIR="$2"; shift 2 ;;
+                --works-dir=*) DEPLOY_WORKS_DIR="${1#*=}"; shift ;;
+                *) EXTRA_ARGS="$EXTRA_ARGS $1"; shift ;;
             esac
         done
 
