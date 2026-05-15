@@ -515,7 +515,7 @@ fn generate_workspace_context(
     // workspace 私有 skills：在 sandbox 模式下位于 /user/skills，host 模式下通过 workspace_key 定位
     // sub-agent 通过 sandbox 挂载自动看到当前 workspace 的 skills 目录
     if let Some(sandbox) = tyclaw_sandbox::current_sandbox() {
-        let ws_key = sandbox.id().strip_prefix("tyclaw-").unwrap_or(sandbox.id());
+        let ws_key = sandbox.workspace_key();
         let ws_skills = tyclaw_control::workspace_path(workspace, ws_key).join("skills");
         if ws_skills.is_dir() {
             ctx.push_str("## Workspace Skills\n");

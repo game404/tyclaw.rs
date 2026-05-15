@@ -616,6 +616,50 @@ async fn run_outbound_dispatcher(
                                 &response.text,
                             )
                             .await;
+
+                            // Timer/异步路径：发送 send_file 队列中的附件
+                            for file_path in &response.output_files {
+                                let is_image = handler::is_image_file(file_path);
+                                let media_type = if is_image { "image" } else { "file" };
+                                match handler::upload_media(
+                                    &sender.http_client,
+                                    &token,
+                                    &sender.robot_code,
+                                    file_path,
+                                    media_type,
+                                )
+                                .await
+                                {
+                                    Ok(media_id) => {
+                                        let result = if is_image {
+                                            handler::send_image_by_channel(
+                                                &sender.http_client, &token, &sender.robot_code,
+                                                &channel, user_id, conversation_id, &media_id,
+                                            ).await
+                                        } else {
+                                            let fname = std::path::Path::new(file_path)
+                                                .file_name()
+                                                .and_then(|n| n.to_str())
+                                                .unwrap_or("file");
+                                            let ext = std::path::Path::new(file_path)
+                                                .extension()
+                                                .and_then(|e| e.to_str())
+                                                .unwrap_or("file");
+                                            handler::send_file_by_channel(
+                                                &sender.http_client, &token, &sender.robot_code,
+                                                &channel, user_id, conversation_id, &media_id,
+                                                fname, ext,
+                                            ).await
+                                        };
+                                        if let Err(e) = result {
+                                            tracing::error!(file = %file_path, error = %e, "Dispatcher: file send failed");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(file = %file_path, error = %e, "Dispatcher: {media_type} upload failed");
+                                    }
+                                }
+                            }
                         }
                         // 同时在 CLI 滚动区打印（方便调试）
                         cli_print(&format!("\x1b[2m[DT:{chat_id}]\x1b[0m \x1b[1;37m{}\x1b[0m", response.text));

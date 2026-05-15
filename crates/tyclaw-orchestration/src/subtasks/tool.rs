@@ -379,9 +379,7 @@ impl Tool for DispatchSubtasksTool {
         );
         let dispatch_rel = std::path::PathBuf::from("dispatches").join(&dispatch_instance);
         let dispatch_dir = if let Some(sandbox) = tyclaw_sandbox::current_sandbox() {
-            // sandbox 容器名 = "tyclaw-{workspace_key}"
-            // host 路径 = works/{bucket}/{workspace_key}/work/dispatches/...
-            let workspace_key = sandbox.id().strip_prefix("tyclaw-").unwrap_or(sandbox.id());
+            let workspace_key = sandbox.workspace_key();
             tyclaw_control::workspace_path(&self.app.workspace, workspace_key)
                 .join("work")
                 .join(&dispatch_rel)

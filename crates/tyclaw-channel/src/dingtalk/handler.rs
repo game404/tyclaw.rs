@@ -685,6 +685,123 @@ pub async fn reply_image(
     Ok(())
 }
 
+/// 通过主动消息 API 发送文件（不依赖 ChatbotMessage，用于 timer 等异步场景）。
+pub async fn send_file_by_channel(
+    client: &Client,
+    token: &str,
+    robot_code: &str,
+    channel: &str,
+    user_id: &str,
+    conversation_id: &str,
+    media_id: &str,
+    file_name: &str,
+    file_type: &str,
+) -> Result<(), String> {
+    let msg_param = json!({
+        "mediaId": media_id,
+        "fileName": file_name,
+        "fileType": file_type,
+    })
+    .to_string();
+
+    let (url, payload) = if channel.contains("private") {
+        (
+            "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
+            json!({
+                "robotCode": robot_code,
+                "userIds": [user_id],
+                "msgKey": "sampleFile",
+                "msgParam": msg_param,
+            }),
+        )
+    } else {
+        (
+            "https://api.dingtalk.com/v1.0/robot/groupMessages/send",
+            json!({
+                "robotCode": robot_code,
+                "openConversationId": conversation_id,
+                "msgKey": "sampleFile",
+                "msgParam": msg_param,
+            }),
+        )
+    };
+
+    let resp = post_json_with_retry(
+        client,
+        url,
+        &[("x-acs-dingtalk-access-token", token)],
+        &payload,
+        10,
+        3,
+        "send_file_by_channel",
+    )
+    .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("send_file_by_channel failed: {status} {body}"));
+    }
+
+    info!(file = %file_name, "File sent successfully via channel");
+    Ok(())
+}
+
+/// 通过主动消息 API 发送图片（不依赖 ChatbotMessage，用于 timer 等异步场景）。
+pub async fn send_image_by_channel(
+    client: &Client,
+    token: &str,
+    robot_code: &str,
+    channel: &str,
+    user_id: &str,
+    conversation_id: &str,
+    media_id: &str,
+) -> Result<(), String> {
+    let msg_param = json!({ "photoURL": media_id }).to_string();
+
+    let (url, payload) = if channel.contains("private") {
+        (
+            "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
+            json!({
+                "robotCode": robot_code,
+                "userIds": [user_id],
+                "msgKey": "sampleImageMsg",
+                "msgParam": msg_param,
+            }),
+        )
+    } else {
+        (
+            "https://api.dingtalk.com/v1.0/robot/groupMessages/send",
+            json!({
+                "robotCode": robot_code,
+                "openConversationId": conversation_id,
+                "msgKey": "sampleImageMsg",
+                "msgParam": msg_param,
+            }),
+        )
+    };
+
+    let resp = post_json_with_retry(
+        client,
+        url,
+        &[("x-acs-dingtalk-access-token", token)],
+        &payload,
+        10,
+        3,
+        "send_image_by_channel",
+    )
+    .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("send_image_by_channel failed: {status} {body}"));
+    }
+
+    info!("Image sent successfully via channel");
+    Ok(())
+}
+
 /// 根据文件扩展名判断是否为图片文件。
 pub fn is_image_file(path: &str) -> bool {
     const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];

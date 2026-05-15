@@ -12,7 +12,7 @@ pub mod docker;
 pub mod noop;
 pub mod types;
 
-pub use docker::{DockerConfig, DockerPool, DockerSandbox};
+pub use docker::{sanitize_container_name, DockerConfig, DockerPool, DockerSandbox};
 pub use noop::{NoopPool, NoopSandbox};
 pub use types::*;
 
