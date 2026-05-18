@@ -75,6 +75,12 @@ ENV DISPLAY=:99
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
+ENV OMP_NUM_THREADS=1
+ENV OPENBLAS_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
+ENV NUMEXPR_MAX_THREADS=1
+ENV POLARS_MAX_THREADS=2
+
 # 预创建非 root 用户（--user 传入的 UID 若恰好为 1000 可直接命中；
 # 其他 UID 由 entrypoint.sh 动态注入 /etc/passwd）
 RUN groupadd -g 1000 tyclaw \

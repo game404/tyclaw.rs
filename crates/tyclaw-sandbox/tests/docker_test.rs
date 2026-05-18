@@ -204,6 +204,10 @@ async fn test_docker_host_isolation() {
 async fn test_docker_file_ownership() {
     let config = DockerConfig::default();
     assert!(config.run_as_host_user, "run_as_host_user should default to true");
+    assert_eq!(config.memory, "2g", "memory should default to 2g");
+    assert_eq!(config.memory_swap, "2g", "memory_swap should equal memory (swap disabled)");
+    assert_eq!(config.cpus, "2", "cpus should default to 2");
+    assert_eq!(config.shm_size, "512m", "shm_size should default to 512m");
 
     let users_dir = temp_users_dir();
     let pool = DockerPool::new(config, users_dir.clone())

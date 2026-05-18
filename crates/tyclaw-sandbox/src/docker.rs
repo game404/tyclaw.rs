@@ -40,9 +40,14 @@ pub fn sanitize_container_name(workspace_key: &str) -> String {
 pub struct DockerConfig {
     pub image: String,
     pub memory: String,
+    /// 容器 memory+swap 上限。等于 `memory` 时禁用 swap，避免超限后静默
+    /// 进 swap 导致吞吐骤降。
+    pub memory_swap: String,
     pub cpus: String,
     pub network: String,
     pub work_dir: String,
+    /// `/dev/shm` 大小。Chromium 在 shm 不足时会崩溃，需 ≥512m。
+    pub shm_size: String,
     /// 以宿主机用户的 UID:GID 运行容器，使 volume mount 创建的文件
     /// 归属宿主机用户，reaper 可正常清理。
     pub run_as_host_user: bool,
@@ -52,10 +57,12 @@ impl Default for DockerConfig {
     fn default() -> Self {
         Self {
             image: "tyclaw-sandbox:latest".into(),
-            memory: "1g".into(),
-            cpus: "1".into(),
+            memory: "2g".into(),
+            memory_swap: "2g".into(),
+            cpus: "2".into(),
             network: "bridge".into(),
             work_dir: "/workspace".into(),
+            shm_size: "512m".into(),
             run_as_host_user: true,
         }
     }
@@ -719,6 +726,7 @@ impl DockerPool {
         let tmpdir_env = format!("TMPDIR={}/work/tmp", self.config.work_dir);
         let tz_env = format!("TZ={}", detect_host_timezone());
         let home_env = format!("HOME={}", self.config.work_dir);
+        let pip_cache_env = format!("PIP_CACHE_DIR={}/work/.cache/pip", self.config.work_dir);
 
         let mut run_args = vec![
             "run".to_string(),
@@ -729,6 +737,8 @@ impl DockerPool {
             "unless-stopped".into(),
             "--memory".into(),
             self.config.memory.clone(),
+            "--memory-swap".into(),
+            self.config.memory_swap.clone(),
             "--cpus".into(),
             self.config.cpus.clone(),
             "--network".into(),
@@ -736,13 +746,15 @@ impl DockerPool {
             "--pids-limit".into(),
             "512".into(),
             "--shm-size".into(),
-            "256m".into(),
+            self.config.shm_size.clone(),
             "-e".into(),
             tmpdir_env,
             "-e".into(),
             tz_env,
             "-e".into(),
             home_env,
+            "-e".into(),
+            pip_cache_env,
         ];
 
         if self.config.run_as_host_user {
