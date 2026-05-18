@@ -590,13 +590,23 @@ struct WorkspaceContainer {
     container_name: String,
 }
 
-/// 计算 workspace 路径（与 tyclaw_control::workspace_path 一致）。
+/// 计算 workspace 路径——直接复用 [`tyclaw_control::workspace_path`]，
+/// 保证「Docker 挂载路径 ≡ persistence 路径」，避免算法漂移。
 fn workspace_path(root: &Path, workspace_key: &str) -> PathBuf {
-    use md5::{Digest, Md5};
-    let hash = Md5::digest(workspace_key.as_bytes());
-    root.join("works")
-        .join(format!("{:02x}", hash[0]))
-        .join(workspace_key)
+    tyclaw_control::workspace_path(root, workspace_key)
+}
+
+/// 生成 Docker `--mount type=bind` spec 字符串。
+///
+/// 使用 `--mount` 而非 `-v` 的核心动机：`-v host:dst[:mode]` 在 Unix 上对
+/// **host 路径中的 `:`** 解析不可靠，曾导致 `invalid mode: /workspace`。
+/// `--mount` 用「逗号分隔键值」语法，对 path 中的 `:` 完全免疫。
+///
+/// 注意：若 `source` 路径含 **逗号**（极少见于正常路径），Docker 的 `--mount`
+/// 仍可能误解析。本项目场景下 host 路径不含逗号；如有需要可在此处扩展转义。
+fn bind_mount(source: &Path, target: &str, readonly: bool) -> String {
+    let ro = if readonly { ",readonly" } else { "" };
+    format!("type=bind,source={},target={}{}", source.display(), target, ro)
 }
 
 impl DockerPool {
@@ -661,25 +671,40 @@ impl DockerPool {
         let ws_root_abs = std::fs::canonicalize(&ws_root).unwrap_or_else(|_| ws_root.clone());
 
         let mount_root = user_mount_root(&self.config.work_dir);
-        let mount_arg = format!("{}:{}", ws_root_abs.display(), mount_root);
 
-        // 全局 skills 目录只读挂载到容器内 /workspace/skills
+        // 全局 skills 目录只读挂载到容器内 {mount_root}/skills
         let global_skills = self.root.join("skills");
         let global_skills_abs = std::fs::canonicalize(&global_skills)
             .unwrap_or_else(|_| global_skills.clone());
-        let global_skills_mount = format!("{}:{}/skills:ro", global_skills_abs.display(), mount_root);
 
-        // 全局 tools 目录只读挂载到容器内 /workspace/tools
+        // 全局 tools 目录只读挂载到容器内 {mount_root}/tools
         let global_tools = self.root.join("tools");
         let global_tools_abs = std::fs::canonicalize(&global_tools)
             .unwrap_or_else(|_| global_tools.clone());
-        let global_tools_mount = format!("{}:{}/tools:ro", global_tools_abs.display(), mount_root);
 
         // defaults.py 挂载到容器根目录（tools/ 下的脚本通过 from defaults import 引用）
         let defaults_py = self.root.join("defaults.py");
         let defaults_py_abs = std::fs::canonicalize(&defaults_py)
             .unwrap_or_else(|_| defaults_py.clone());
-        let defaults_mount = format!("{}:{}/defaults.py:ro", defaults_py_abs.display(), mount_root);
+
+        // 用 `--mount type=bind` 而非 `-v`，避免 host 路径含 `:` 时被 Docker
+        // 拆分器误判（曾导致 `invalid mode: /workspace`）。
+        let mount_arg = bind_mount(&ws_root_abs, &mount_root, false);
+        let global_skills_mount = bind_mount(
+            &global_skills_abs,
+            &format!("{}/skills", mount_root),
+            true,
+        );
+        let global_tools_mount = bind_mount(
+            &global_tools_abs,
+            &format!("{}/tools", mount_root),
+            true,
+        );
+        let defaults_mount = bind_mount(
+            &defaults_py_abs,
+            &format!("{}/defaults.py", mount_root),
+            true,
+        );
 
         info!(
             workspace_key = %workspace_key,
@@ -732,19 +757,23 @@ impl DockerPool {
         // 挂载主机 /etc/localtime 使容器时区与主机一致（文件存在时才挂载）
         if Path::new("/etc/localtime").exists() {
             run_args.extend([
-                "-v".to_string(),
-                "/etc/localtime:/etc/localtime:ro".into(),
+                "--mount".to_string(),
+                bind_mount(
+                    Path::new("/etc/localtime"),
+                    "/etc/localtime",
+                    true,
+                ),
             ]);
         }
 
         run_args.extend([
-            "-v".to_string(),
+            "--mount".to_string(),
             mount_arg,
-            "-v".into(),
+            "--mount".into(),
             global_skills_mount,
-            "-v".into(),
+            "--mount".into(),
             global_tools_mount,
-            "-v".into(),
+            "--mount".into(),
             defaults_mount,
             "-w".into(),
             self.config.work_dir.clone(),
@@ -780,16 +809,13 @@ impl DockerPool {
 impl SandboxPool for DockerPool {
     async fn acquire(
         &self,
-        task_workspace: &PathBuf,
+        workspace_key: &str,
+        _task_workspace: &PathBuf,
         _data_mounts: &[PathMount],
     ) -> Result<Arc<dyn Sandbox>, TyclawError> {
-        // task_workspace = works/{bucket}/{workspace_key}/work
-        // 提取 workspace_key：向上两级取目录名
-        let workspace_key = task_workspace
-            .parent()                        // works/{bucket}/{workspace_key}
-            .and_then(|p| p.file_name())     // {workspace_key}
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_else(|| "default".into());
+        // 语义 workspace_key 由调用方显式传入；不再从 task_workspace 反推目录名，
+        // 避免「目录名清洗后 md5(语义key) ≠ md5(leaf)」导致挂载/缓存漂移。
+        let workspace_key = workspace_key.to_string();
 
         let containers = self.containers.lock().await;
 

@@ -209,6 +209,10 @@ fn build_stats_json(orch: &Orchestrator) -> String {
 }
 
 fn build_works_stats(orch: &Orchestrator) -> serde_json::Value {
+    // 注意：`list_workspace_keys()` 返回的是 **磁盘 leaf**（含 `/ \ : + =` 字符已被
+    // `filesystem_workspace_leaf` 替换为 `_`），不再等于原始钉钉 conversation_id。
+    // 下面的 classify 函数对 `_` 容忍：含 `:` / `cid` 前缀的判定不受清洗影响；
+    // 历史/手工目录可能出现「全 `_` 的 Base64 衍生 leaf」，会被归为 other。
     let keys = orch.persistence().workspace_mgr.list_workspace_keys();
     let total = keys.len();
     let strategy = orch.persistence().workspace_mgr.key_strategy();
@@ -246,8 +250,10 @@ fn build_works_stats(orch: &Orchestrator) -> serde_json::Value {
 }
 
 fn classify_conversation_workspace_key(key: &str) -> &'static str {
+    // 注意：参数 `key` 实际是 **磁盘 leaf**——`/ \ : + =` 已被替换为 `_`。
+    // 旧数据（迁移前）可能仍含原始 `:`；新数据只能凭 `cid` 前缀与下划线模式识别。
     if key.contains(':') {
-        return "群聊";
+        return "群聊"; // 迁移前的历史目录
     }
     if key.len() >= 3 && key[..3].eq_ignore_ascii_case("cid") {
         return "群聊";
@@ -257,6 +263,11 @@ fn classify_conversation_workspace_key(key: &str) -> &'static str {
     }
     if key == "cli_user" || key.starts_with("cli") {
         return "cli";
+    }
+    // 清洗后的群聊 chat_id（如 `_GmQ___021142012334576144`）通常以 `_` 起始且含
+    // 多段下划线 + 末段数字，作为弱启发归到「群聊」。
+    if key.starts_with('_') && key.matches('_').count() >= 2 {
+        return "群聊";
     }
     "other"
 }

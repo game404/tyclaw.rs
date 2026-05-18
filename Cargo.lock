@@ -3019,11 +3019,11 @@ name = "tyclaw-sandbox"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "md-5",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "tyclaw-control",
  "tyclaw-tool-abi",
  "tyclaw-types",
 ]
@@ -3048,7 +3048,6 @@ dependencies = [
  "croner",
  "futures-util",
  "glob",
- "md-5",
  "parking_lot",
  "readability",
  "regex",
@@ -3060,6 +3059,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tyclaw-control",
  "tyclaw-tool-abi",
  "tyclaw-types",
  "url",

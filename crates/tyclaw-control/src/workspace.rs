@@ -186,21 +186,51 @@ impl WorkspaceKeyStrategy {
 // ─── Workspace 路径解析 ──────────────────────────────────────────────────────
 
 /// 计算分桶目录名：md5(key) 的第一个字节，格式化为 2 位十六进制。
-fn bucket_name(workspace_key: &str) -> String {
+///
+/// 注意：bucket 始终基于 **原始语义 key** 计算（字节不变），不参与字符清洗。
+/// 这是迁移脚本能用 `md5(候选语义key)[0:2] == bucket` 校验「这一对嵌套目录
+/// 确实是同一个 key 被 `PathBuf::join` 拆开」的关键不变量。
+pub fn bucket_name(workspace_key: &str) -> String {
     let hash = Md5::digest(workspace_key.as_bytes());
     format!("{:02x}", hash[0])
 }
 
-/// 计算 workspace 的物理目录路径：`{works_base}/{bucket}/{key}`
+/// 把语义 `workspace_key` 清洗为「单层」磁盘叶子目录名。
+///
+/// 钉钉的 `conversation_id` / `chat_id` 来自 Base64 字符集（`A-Za-z0-9+/=`）外加
+/// `:` 分隔符，这些字符在落到本地文件系统/Docker CLI 时会撞上两套不同的解析器：
+///
+/// - `/`、`\`：`PathBuf::join` 会把它当路径分隔符，导致 `works/{bucket}/{a}/{b}/`
+///   三层嵌套（线 A）。
+/// - `:`：`docker run -v host:dst[:mode]` 把它当字段分隔符，把 `/workspace` 误当
+///   mode，报 `invalid mode: /workspace`（线 B；与 `--mount type=bind` 互为防御）。
+/// - `+`、`=`：Linux 合法，但 shell/补全/审计/URL 编码场景下持续产生坑（线 C）。
+///
+/// 统一替换为 `_`。**`bucket_name` 不参与清洗**，仍按原始语义 key 计算，保证既有
+/// 分桶语义稳定、迁移脚本可校验。
+pub fn filesystem_workspace_leaf(workspace_key: &str) -> String {
+    workspace_key
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '+' | '=' => '_',
+            other => other,
+        })
+        .collect()
+}
+
+/// 计算 workspace 的物理目录路径：`{works_base}/{bucket}/{leaf}`
+///
+/// - `bucket` 用原始 `workspace_key` 计算（保持语义稳定）。
+/// - `leaf` 经过 [`filesystem_workspace_leaf`] 清洗（消除路径/挂载分隔符歧义）。
 ///
 /// `works_base` 默认为 `{root}/works`，可通过 --works-dir 覆盖。
 pub fn workspace_path_in(works_base: &Path, workspace_key: &str) -> PathBuf {
     works_base
         .join(bucket_name(workspace_key))
-        .join(workspace_key)
+        .join(filesystem_workspace_leaf(workspace_key))
 }
 
-/// 计算 workspace 的物理目录路径：`{root}/works/{bucket}/{key}`（默认 works 目录）
+/// 计算 workspace 的物理目录路径：`{root}/works/{bucket}/{leaf}`（默认 works 目录）
 pub fn workspace_path(root: &Path, workspace_key: &str) -> PathBuf {
     workspace_path_in(&root.join("works"), workspace_key)
 }
@@ -477,7 +507,12 @@ impl WorkspaceManager {
 
     // ── 扫描 ──
 
-    /// 列出所有已存在的 workspace key（扫描 works 目录下所有分桶）。
+    /// 列出所有已存在的 workspace 磁盘叶子目录名（扫描 works 目录下所有分桶）。
+    ///
+    /// **注意**：返回值是 [`filesystem_workspace_leaf`] 清洗后的 **磁盘 leaf**，
+    /// 不再等于原始语义 `workspace_key`——若 key 中含 `/ \ : + =`，已被替换为 `_`。
+    /// 该方法当前仅用于 [`monitor.rs`](../../tyclaw-app/src/monitor.rs) 的统计展示，
+    /// 不应用于回填语义 key（无可靠数据源）。
     pub fn list_workspace_keys(&self) -> Vec<String> {
         let works_dir = &self.works_dir;
         let Ok(buckets) = std::fs::read_dir(&works_dir) else {
@@ -544,6 +579,90 @@ mod tests {
             path,
             PathBuf::from(format!("/data/works/{}/0307663902380", bucket))
         );
+    }
+
+    #[test]
+    fn test_filesystem_workspace_leaf_clean_key_unchanged() {
+        // 纯数字、字母、._- 等合法字符保持原样
+        assert_eq!(filesystem_workspace_leaf("staff123"), "staff123");
+        assert_eq!(
+            filesystem_workspace_leaf("0860305717-1997430117"),
+            "0860305717-1997430117"
+        );
+        assert_eq!(filesystem_workspace_leaf("cli_user"), "cli_user");
+    }
+
+    #[test]
+    fn test_filesystem_workspace_leaf_sanitizes_all_target_chars() {
+        // 5 个目标字符都被替换为 `_`
+        assert_eq!(filesystem_workspace_leaf("a/b"), "a_b");
+        assert_eq!(filesystem_workspace_leaf("a\\b"), "a_b");
+        assert_eq!(filesystem_workspace_leaf("a:b"), "a_b");
+        assert_eq!(filesystem_workspace_leaf("a+b"), "a_b");
+        assert_eq!(filesystem_workspace_leaf("a=b"), "a_b");
+    }
+
+    #[test]
+    fn test_filesystem_workspace_leaf_real_dingtalk_keys() {
+        // 与计划中举例一致
+        assert_eq!(
+            filesystem_workspace_leaf("ciduPmDIyP0rqFo0DBK4/+GmQ==:0860305717-1997430117"),
+            "ciduPmDIyP0rqFo0DBK4__GmQ___0860305717-1997430117"
+        );
+        assert_eq!(
+            filesystem_workspace_leaf("+GmQ==:021142012334576144"),
+            "_GmQ___021142012334576144"
+        );
+    }
+
+    #[test]
+    fn test_workspace_path_with_slash_key_no_nesting() {
+        // 线 A：含 `/` 的 key 不再被 `PathBuf::join` 拆成两层
+        let root = Path::new("/data");
+        let key = "ciduPmDIyP0rqFo0DBK4/+GmQ==:0860305717-1997430117";
+        let path = workspace_path(root, key);
+        let bucket = bucket_name(key);
+        // 校验结构：恰好三段（works / bucket / leaf），不应有第四段
+        let suffix = path.strip_prefix("/data").unwrap();
+        let components: Vec<_> = suffix.components().collect();
+        assert_eq!(components.len(), 3, "expected works/bucket/leaf, got {path:?}");
+        assert_eq!(
+            path,
+            PathBuf::from(format!(
+                "/data/works/{}/ciduPmDIyP0rqFo0DBK4__GmQ___0860305717-1997430117",
+                bucket
+            ))
+        );
+    }
+
+    #[test]
+    fn test_workspace_path_with_colon_key_no_nesting() {
+        // 线 B：含 `:` 的 key 不再含 `:`，避免 `-v` 解析歧义
+        let root = Path::new("/data");
+        let key = "+GmQ==:021142012334576144";
+        let path = workspace_path(root, key);
+        let leaf = path.file_name().unwrap().to_string_lossy();
+        assert!(!leaf.contains(':'), "leaf must not contain ':' got {leaf}");
+        assert!(!leaf.contains('+'), "leaf must not contain '+' got {leaf}");
+        assert!(!leaf.contains('='), "leaf must not contain '=' got {leaf}");
+    }
+
+    #[test]
+    fn test_bucket_name_uses_raw_key_not_leaf() {
+        // bucket 必须用原始 key 计算（迁移脚本依赖此不变量做校验）
+        let raw = "a/b";
+        let sanitized = "a_b";
+        // raw 与 sanitized 是不同字节流，md5 不同，bucket 也几乎必然不同
+        assert_eq!(bucket_name(raw), bucket_name(raw));
+        // 这里不强断言「bucket(raw) != bucket(sanitized)」（md5 第一字节有 1/256 概率相同），
+        // 但要确保 `workspace_path` 用的是 bucket(raw) 而不是 bucket(sanitized)：
+        let path = workspace_path(Path::new("/data"), raw);
+        let expected_bucket = bucket_name(raw);
+        assert!(path
+            .to_string_lossy()
+            .contains(&format!("/works/{}/", expected_bucket)));
+        // 而 leaf 部分用 sanitized
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), sanitized);
     }
 
     #[test]
@@ -629,12 +748,15 @@ mod tests {
         let mgr = WorkspaceManager::new(tmp.path(), WorkspaceKeyStrategy::UserId, None);
         mgr.ensure_workspace("testuser");
         let ws = mgr.workspace_dir("testuser");
-        assert!(ws.join("memory").is_dir());
-        assert!(ws.join("skills").is_dir());
-        assert!(ws.join("cases").is_dir());
-        assert!(ws.join("work").join("tmp").is_dir());
-        assert!(ws.join("work").join("attachments").is_dir());
-        assert!(ws.join("work").join("dispatches").is_dir());
+        let paths = mgr.path_config();
+        // 路径名通过 PathConfig 默认值动态读取，避免硬编码（默认 skills_dir
+        // 为 `_personal/skills`，不是字面 `skills`）。
+        assert!(ws.join(&paths.memory_dir).is_dir());
+        assert!(ws.join(&paths.skills_dir).is_dir());
+        assert!(ws.join(&paths.cases_dir).is_dir());
+        assert!(ws.join(&paths.tmp_dir).is_dir());
+        assert!(ws.join(&paths.attachments_dir).is_dir());
+        assert!(ws.join(&paths.dispatches_dir).is_dir());
     }
 
     #[test]

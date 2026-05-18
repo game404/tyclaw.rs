@@ -671,7 +671,7 @@ impl Orchestrator {
             std::sync::Arc<dyn tyclaw_sandbox::Sandbox>,
             std::path::PathBuf,
         )> = if let Some(pool) = &self.sandbox_pool {
-            match pool.acquire(&user_workspace, &[]).await {
+            match pool.acquire(&ctx.workspace_key, &user_workspace, &[]).await {
                 Ok(sb) => {
                     info!(sandbox = %sb.id(), user = %ctx.user_id, "Acquired sandbox");
                     if let Some(cb) = ctx.on_progress {

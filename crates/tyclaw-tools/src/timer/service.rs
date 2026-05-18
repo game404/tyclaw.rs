@@ -11,16 +11,12 @@ use uuid::Uuid;
 
 use tyclaw_types::TyclawError;
 
-use md5::{Digest, Md5};
-
 use super::types::*;
 
-/// 计算 workspace 路径（与 tyclaw_control::workspace_path 一致）。
+/// 计算 workspace 路径——直接复用 [`tyclaw_control::workspace_path`]，
+/// 避免与 control / sandbox 之间算法漂移。
 fn workspace_path(root: &Path, workspace_key: &str) -> PathBuf {
-    let hash = Md5::digest(workspace_key.as_bytes());
-    root.join("works")
-        .join(format!("{:02x}", hash[0]))
-        .join(workspace_key)
+    tyclaw_control::workspace_path(root, workspace_key)
 }
 
 fn now_ms() -> i64 {

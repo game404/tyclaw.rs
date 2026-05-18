@@ -338,6 +338,7 @@ impl NoopPool {
 impl SandboxPool for NoopPool {
     async fn acquire(
         &self,
+        _workspace_key: &str,
         task_workspace: &PathBuf,
         _data_mounts: &[PathMount],
     ) -> Result<std::sync::Arc<dyn Sandbox>, TyclawError> {

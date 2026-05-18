@@ -146,8 +146,18 @@ pub trait Sandbox: Send + Sync {
 /// 沙箱池 —— 管理沙箱实例的 acquire/release 生命周期。
 #[async_trait]
 pub trait SandboxPool: Send + Sync {
+    /// 获取沙箱实例。
+    ///
+    /// - `workspace_key`：**语义 key**（来自钉钉 conversation_id / chat_id /
+    ///   staff_id，未经任何清洗），用于计算 bucket、缓存复用、容器命名。
+    /// - `task_workspace`：宿主机上的 work 目录绝对路径（已由
+    ///   [`tyclaw_control::workspace_path`] 经 `filesystem_workspace_leaf` 清洗）。
+    ///
+    /// 显式传入 `workspace_key` 是为了避免「从 `task_workspace` 反推 key」时
+    /// 因目录名清洗导致 `md5(语义key)` 与 `md5(leaf)` 不一致、容器挂载到错路径。
     async fn acquire(
         &self,
+        workspace_key: &str,
         task_workspace: &PathBuf,
         data_mounts: &[PathMount],
     ) -> Result<Arc<dyn Sandbox>, TyclawError>;
