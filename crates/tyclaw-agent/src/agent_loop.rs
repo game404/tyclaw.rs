@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use tyclaw_provider::{parse_reasoning, LLMProvider};
@@ -215,6 +216,8 @@ impl AgentRuntime for AgentLoop {
         }
 
         let mut status = RuntimeStatus::Complete;
+        let mut last_heartbeat_time = Instant::now();
+        const HEARTBEAT_INTERVAL_SECS: u64 = 90;
 
         loop {
             // 检查是否有运行期间注入的用户消息
@@ -294,14 +297,25 @@ impl AgentRuntime for AgentLoop {
                 break;
             }
 
-            // CLI 进度：打印当前轮次
+            // CLI 进度：打印当前轮次 + 分级心跳
             if let Some(cb) = on_progress {
-                // 超长任务提醒：超过 30 轮时发一次文本通知（约 5 分钟+）
-                if total_iterations == 30 {
-                    cb(ProgressEvent::Heartbeat(
-                        "[heartbeat]🦀 仍在处理中，请耐心等待...".into(),
+                let heartbeat_msg = match total_iterations {
+                    10 => Some("[heartbeat]🦀 正在分析处理中..."),
+                    20 => Some("[heartbeat]🦀 仍在努力处理中，请耐心等待..."),
+                    n if n > 20 && n % 20 == 0 => None, // 用动态消息，下面单独处理
+                    _ => None,
+                };
+                let heartbeat_msg = if total_iterations > 20 && total_iterations % 20 == 0 {
+                    Some(format!(
+                        "[heartbeat]🦀 复杂任务仍在处理中（已执行 {} 轮）...",
+                        total_iterations
                     ))
-                    .await;
+                } else {
+                    heartbeat_msg.map(String::from)
+                };
+                if let Some(msg) = heartbeat_msg {
+                    cb(ProgressEvent::Heartbeat(msg)).await;
+                    last_heartbeat_time = Instant::now();
                 }
                 cb(ProgressEvent::Status(format!(
                     "[轮次 {total_iterations}] 阶段={phase} 第{phase_iter}轮"
@@ -621,6 +635,19 @@ impl AgentRuntime for AgentLoop {
                     }
                     final_content = Some(CANCELLED_REPLY.into());
                     break;
+                }
+
+                // 时间兜底心跳：工具执行完毕后，若距上次心跳超过阈值则自动发送。
+                // 与轮次心跳共享 last_heartbeat_time，避免短时间内重复触发。
+                if let Some(cb) = on_progress {
+                    if last_heartbeat_time.elapsed().as_secs() >= HEARTBEAT_INTERVAL_SECS {
+                        cb(ProgressEvent::Heartbeat(format!(
+                            "[heartbeat]🦀 仍在处理中，请耐心等待...（已执行 {} 轮）",
+                            total_iterations
+                        )))
+                        .await;
+                        last_heartbeat_time = Instant::now();
+                    }
                 }
 
                 let progressed = round_outcome.progressed;
