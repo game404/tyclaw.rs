@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 tyclaw-types = { workspace = true }
 tyclaw-tool-abi = { workspace = true }
+tyclaw-control = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
@@ -22,7 +23,6 @@ glob = "0.3"
 urlencoding = { workspace = true }
 croner = "2"
 chrono-tz = "0.10"
-md-5 = { workspace = true }
 base64 = { workspace = true }
 scraper = "0.22"
 readability = "0.3.0"

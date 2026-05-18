@@ -11,6 +11,10 @@ if ! getent group "$(id -g)" > /dev/null 2>&1; then
     echo "tyclaw:x:$(id -g):" >> /etc/group
 fi
 
+# pip cache 落到 bind mount，跨容器重建可复用
+mkdir -p /workspace/.cache/pip
+export PIP_CACHE_DIR=/workspace/.cache/pip
+
 # 启动虚拟屏幕（后台，静默）
 Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset > /dev/null 2>&1 &
 

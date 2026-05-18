@@ -32,5 +32,6 @@ pub use rate_limiter::RateLimiter;
 pub use rbac::RBACManager;
 pub use workspace::{
     PathConfig, RequestIdentity, Workspace, WorkspaceConfig, WorkspaceKeyStrategy,
-    WorkspaceManager, workspace_path, workspace_path_in,
+    WorkspaceManager, bucket_name, filesystem_workspace_leaf, workspace_path,
+    workspace_path_in,
 };

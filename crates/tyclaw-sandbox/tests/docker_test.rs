@@ -42,7 +42,10 @@ async fn test_docker_exec() {
         .expect("Pool creation failed");
     let ws = user_workspace(&users_dir, "test_exec");
 
-    let sandbox = pool.acquire(&ws, &[]).await.expect("Acquire failed");
+    let sandbox = pool
+        .acquire("test_exec", &ws, &[])
+        .await
+        .expect("Acquire failed");
     let result = sandbox
         .exec("echo hello", Duration::from_secs(10))
         .await
@@ -65,7 +68,10 @@ async fn test_docker_python() {
         .expect("Pool creation failed");
     let ws = user_workspace(&users_dir, "test_python");
 
-    let sandbox = pool.acquire(&ws, &[]).await.expect("Acquire failed");
+    let sandbox = pool
+        .acquire("test_python", &ws, &[])
+        .await
+        .expect("Acquire failed");
     let result = sandbox
         .exec(
             "python3 -c 'import pandas; print(pandas.__version__)'",
@@ -91,7 +97,10 @@ async fn test_docker_write_read() {
         .expect("Pool creation failed");
     let ws = user_workspace(&users_dir, "test_writerw");
 
-    let sandbox = pool.acquire(&ws, &[]).await.expect("Acquire failed");
+    let sandbox = pool
+        .acquire("test_writerw", &ws, &[])
+        .await
+        .expect("Acquire failed");
 
     // 写文件
     sandbox
@@ -132,7 +141,10 @@ async fn test_docker_list_dir() {
         .expect("Pool creation failed");
     let ws = user_workspace(&users_dir, "test_listdir");
 
-    let sandbox = pool.acquire(&ws, &[]).await.expect("Acquire failed");
+    let sandbox = pool
+        .acquire("test_listdir", &ws, &[])
+        .await
+        .expect("Acquire failed");
 
     sandbox.write_file("a.txt", b"aaa").await.unwrap();
     sandbox.write_file("b.txt", b"bbb").await.unwrap();
@@ -160,7 +172,10 @@ async fn test_docker_host_isolation() {
         .expect("Pool creation failed");
     let ws = user_workspace(&users_dir, "test_isolation");
 
-    let sandbox = pool.acquire(&ws, &[]).await.expect("Acquire failed");
+    let sandbox = pool
+        .acquire("test_isolation", &ws, &[])
+        .await
+        .expect("Acquire failed");
 
     // 容器内应该看不到 host 的文件
     let result = sandbox
@@ -189,6 +204,10 @@ async fn test_docker_host_isolation() {
 async fn test_docker_file_ownership() {
     let config = DockerConfig::default();
     assert!(config.run_as_host_user, "run_as_host_user should default to true");
+    assert_eq!(config.memory, "2g", "memory should default to 2g");
+    assert_eq!(config.memory_swap, "2g", "memory_swap should equal memory (swap disabled)");
+    assert_eq!(config.cpus, "2", "cpus should default to 2");
+    assert_eq!(config.shm_size, "512m", "shm_size should default to 512m");
 
     let users_dir = temp_users_dir();
     let pool = DockerPool::new(config, users_dir.clone())
@@ -196,7 +215,10 @@ async fn test_docker_file_ownership() {
         .expect("Pool creation failed");
     let ws = user_workspace(&users_dir, "test_ownership");
 
-    let sandbox = pool.acquire(&ws, &[]).await.expect("Acquire failed");
+    let sandbox = pool
+        .acquire("test_ownership", &ws, &[])
+        .await
+        .expect("Acquire failed");
 
     sandbox
         .write_file("owned.txt", b"host-deletable")
@@ -231,7 +253,10 @@ async fn test_docker_exec_timeout() {
         .expect("Pool creation failed");
     let ws = user_workspace(&users_dir, "test_timeout");
 
-    let sandbox = pool.acquire(&ws, &[]).await.expect("Acquire failed");
+    let sandbox = pool
+        .acquire("test_timeout", &ws, &[])
+        .await
+        .expect("Acquire failed");
 
     let result = sandbox
         .exec("sleep 30", Duration::from_secs(2))
@@ -240,5 +265,63 @@ async fn test_docker_exec_timeout() {
     assert!(result.timed_out, "Should have timed out");
 
     pool.release(sandbox, &ws).await.expect("Release failed");
+    cleanup(&users_dir);
+}
+
+/// 回归测试：曾经触发 `invalid mode: /workspace` 的 workspace_key 现在能正常 acquire+exec。
+///
+/// 关键路径：
+/// 1. `workspace_key` 含 `:` `+` `=`（钉钉 chat_id 真实形态）；
+/// 2. control 把 leaf 清洗为单层不含坏字符的目录名；
+/// 3. sandbox `--mount type=bind` 不再依赖 `-v` 解析；
+/// 4. 容器名 sanitize 后符合 Docker 命名规范。
+///
+/// 若环境不支持创建该 leaf（理论上 Linux/macOS 都行）则 fail，便于发现回归。
+#[tokio::test]
+async fn test_docker_acquire_with_base64_chat_id_key() {
+    // 直接借用 control 的清洗算法，避免脚本/代码漂移
+    let workspace_key = "+GmQ==:test_base64_chat_id";
+    let leaf = tyclaw_control::filesystem_workspace_leaf(workspace_key);
+    assert!(
+        !leaf.contains(':') && !leaf.contains('+') && !leaf.contains('='),
+        "leaf must not contain raw : + = chars, got '{leaf}'"
+    );
+
+    let config = DockerConfig::default();
+    let users_dir = temp_users_dir();
+    let pool = DockerPool::new(config, users_dir.clone())
+        .await
+        .expect("Pool creation failed");
+
+    // 直接走标准路径 —— DockerPool 内部 workspace_path 会用 control 的清洗算法
+    // 落到 {users_dir}/works/{bucket}/{leaf}/work，确保 disk 与挂载一致。
+    let task_workspace = users_dir.clone(); // 占位；acquire 不再据此反推 key
+    let sandbox = pool
+        .acquire(workspace_key, &task_workspace, &[])
+        .await
+        .expect("Acquire failed: 含 + = : 的 workspace_key 应能挂载成功");
+
+    let result = sandbox
+        .exec("echo ok", Duration::from_secs(10))
+        .await
+        .expect("Exec failed");
+    assert_eq!(result.stdout.trim(), "ok");
+    assert_eq!(result.exit_code, 0);
+
+    // 验证容器名也已清洗（不含 Docker 非法字符）
+    let id = sandbox.id();
+    for c in id.chars() {
+        assert!(
+            c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-',
+            "container id should be docker-legal, got '{id}' (bad char '{c}')"
+        );
+    }
+
+    pool.release(sandbox, &task_workspace).await.ok();
+    // 用名称兜底删除（防止 leak）
+    let _ = tokio::process::Command::new("docker")
+        .args(["rm", "-f", &tyclaw_sandbox::sanitize_container_name(workspace_key)])
+        .output()
+        .await;
     cleanup(&users_dir);
 }
