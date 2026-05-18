@@ -17,6 +17,24 @@ use tyclaw_types::TyclawError;
 
 use crate::types::*;
 
+/// 将 workspace_key 转换为 Docker 合法容器名。
+///
+/// Docker 容器名只允许 `[a-zA-Z0-9][a-zA-Z0-9_.-]`，
+/// workspace_key 可能包含 `+`, `=`, `/`, `:` 等字符（来自钉钉 conversation_id）。
+pub fn sanitize_container_name(workspace_key: &str) -> String {
+    let sanitized: String = workspace_key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("tyclaw-{sanitized}")
+}
+
 /// Docker 容器配置。
 #[derive(Debug, Clone)]
 pub struct DockerConfig {
@@ -45,8 +63,10 @@ impl Default for DockerConfig {
 
 /// Docker 沙箱实例：per-user 容器，volume mount 用户 workspace。
 /// 所有操作通过 docker exec 在容器内执行。
+///
+/// 所有 Docker CLI 操作统一使用 container_name（而非 container ID），
+/// 避免容器被重建（同名不同 ID）后出现 stale ID 问题。
 pub struct DockerSandbox {
-    container_id: String,
     container_name: String,
     /// 容器内挂载根目录（如 `/user`，对应整个 `works/{bucket}/{key}`）。
     mount_root: String,
@@ -84,7 +104,7 @@ impl Sandbox for DockerSandbox {
                     &format!("TYCLAW_SENDER_STAFF_ID={}", self.workspace_key),
                     "-w",
                     &self.work_dir,
-                    &self.container_id,
+                    &self.container_name,
                     "sh",
                     "-c",
                     cmd,
@@ -98,7 +118,7 @@ impl Sandbox for DockerSandbox {
                 let _ = Command::new("docker")
                     .args([
                         "exec",
-                        &self.container_id,
+                        &self.container_name,
                         "sh",
                         "-c",
                         "kill -9 -1 2>/dev/null; true",
@@ -131,7 +151,7 @@ impl Sandbox for DockerSandbox {
         let output = Command::new("docker")
             .args([
                 "exec",
-                &self.container_id,
+                &self.container_name,
                 "sh",
                 "-c",
                 "if [ -f \"$1\" ]; then printf 'file\\n'; stat -c %s \"$1\" 2>/dev/null || wc -c < \"$1\"; \
@@ -192,7 +212,7 @@ impl Sandbox for DockerSandbox {
     async fn read_file(&self, path: &str) -> Result<Vec<u8>, TyclawError> {
         let full_path = self.resolve(path);
         let output = Command::new("docker")
-            .args(["exec", &self.container_id, "cat", &full_path])
+            .args(["exec", &self.container_name, "cat", &full_path])
             .output()
             .await
             .map_err(|e| TyclawError::Tool {
@@ -217,7 +237,7 @@ impl Sandbox for DockerSandbox {
             let _ = Command::new("docker")
                 .args([
                     "exec",
-                    &self.container_id,
+                    &self.container_name,
                     "mkdir",
                     "-p",
                     &parent.to_string_lossy(),
@@ -227,7 +247,7 @@ impl Sandbox for DockerSandbox {
         }
         // 通过 stdin pipe 写入
         let mut child = Command::new("docker")
-            .args(["exec", "-i", &self.container_id, "tee", &full_path])
+            .args(["exec", "-i", &self.container_name, "tee", &full_path])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .spawn()
@@ -265,7 +285,7 @@ impl Sandbox for DockerSandbox {
     async fn create_dir(&self, path: &str) -> Result<(), TyclawError> {
         let full_path = self.resolve(path);
         let output = Command::new("docker")
-            .args(["exec", &self.container_id, "mkdir", "-p", &full_path])
+            .args(["exec", &self.container_name, "mkdir", "-p", &full_path])
             .output()
             .await
             .map_err(|e| TyclawError::Tool {
@@ -290,7 +310,7 @@ impl Sandbox for DockerSandbox {
             self.resolve(path)
         };
         let output = Command::new("docker")
-            .args(["exec", &self.container_id, "ls", "-1F", &full_path])
+            .args(["exec", &self.container_name, "ls", "-1F", &full_path])
             .output()
             .await
             .map_err(|e| TyclawError::Tool {
@@ -325,7 +345,7 @@ impl Sandbox for DockerSandbox {
                 "exec",
                 "-w",
                 &self.work_dir,
-                &self.container_id,
+                &self.container_name,
                 "sh",
                 "-c",
                 "cd \"$1\" || exit 1; find . -mindepth 1 -maxdepth \"$2\" \\( -name .git -o -name node_modules -o -name target -o -name __pycache__ -o -name .venv -o -name .tox -o -name dist -o -name build \\) -prune -o -printf '%y\t%P\t%d\n'",
@@ -378,7 +398,7 @@ impl Sandbox for DockerSandbox {
         request: SandboxGrepRequest,
     ) -> Result<SandboxGrepResponse, TyclawError> {
         let mut cmd = Command::new("docker");
-        cmd.args(["exec", "-w", &self.work_dir, &self.container_id, "rg"]);
+        cmd.args(["exec", "-w", &self.work_dir, &self.container_name, "rg"]);
         cmd.args(["--no-heading", "--line-number", "--color", "never"]);
 
         match request.output_mode.as_str() {
@@ -431,7 +451,7 @@ impl Sandbox for DockerSandbox {
                 "exec",
                 "-w",
                 &self.work_dir,
-                &self.container_id,
+                &self.container_name,
                 "bash",
                 "-O",
                 "globstar",
@@ -482,7 +502,7 @@ impl Sandbox for DockerSandbox {
     async fn file_exists(&self, path: &str) -> bool {
         let full_path = self.resolve(path);
         Command::new("docker")
-            .args(["exec", &self.container_id, "test", "-e", &full_path])
+            .args(["exec", &self.container_name, "test", "-e", &full_path])
             .output()
             .await
             .map(|o| o.status.success())
@@ -492,7 +512,7 @@ impl Sandbox for DockerSandbox {
     async fn remove_file(&self, path: &str) -> Result<(), TyclawError> {
         let full_path = self.resolve(path);
         let output = Command::new("docker")
-            .args(["exec", &self.container_id, "rm", "-f", &full_path])
+            .args(["exec", &self.container_name, "rm", "-f", &full_path])
             .output()
             .await
             .map_err(|e| TyclawError::Tool {
@@ -514,7 +534,7 @@ impl Sandbox for DockerSandbox {
         container_path: &str,
         host_path: &PathBuf,
     ) -> Result<(), TyclawError> {
-        let src = format!("{}:{}", self.container_id, self.resolve(container_path));
+        let src = format!("{}:{}", self.container_name, self.resolve(container_path));
         if let Some(parent) = host_path.parent() {
             tokio::fs::create_dir_all(parent).await.ok();
         }
@@ -543,7 +563,14 @@ impl Sandbox for DockerSandbox {
     }
 
     fn id(&self) -> &str {
+        // 返回容器名（sanitized），用于 Docker 操作和日志标识。
+        // 注意：不要用 strip_prefix("tyclaw-") 反推 workspace_key，
+        // 因为容器名经过了字符清理；需要原始 key 时应使用 workspace_key 字段。
         &self.container_name
+    }
+
+    fn workspace_key(&self) -> &str {
+        &self.workspace_key
     }
 }
 
@@ -560,7 +587,6 @@ pub struct DockerPool {
 }
 
 struct WorkspaceContainer {
-    container_id: String,
     container_name: String,
 }
 
@@ -604,8 +630,9 @@ impl DockerPool {
     }
 
     /// 为 workspace 创建容器，volume mount workspace 目录 → /user。
-    async fn create_workspace_container(&self, workspace_key: &str) -> Result<(String, String), TyclawError> {
-        let name = format!("tyclaw-{workspace_key}");
+    /// 返回容器名（所有后续 Docker 操作均使用容器名而非 ID）。
+    async fn create_workspace_container(&self, workspace_key: &str) -> Result<String, TyclawError> {
+        let name = sanitize_container_name(workspace_key);
 
         // 检查是否有同名容器残留
         let inspect = Command::new("docker")
@@ -615,16 +642,8 @@ impl DockerPool {
         if let Ok(output) = inspect {
             let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if status == "true" {
-                let cid_output = Command::new("docker")
-                    .args(["inspect", "--format", "{{.Id}}", &name])
-                    .output()
-                    .await
-                    .map_err(|e| TyclawError::Other(format!("docker inspect failed: {e}")))?;
-                let cid = String::from_utf8_lossy(&cid_output.stdout)
-                    .trim()
-                    .to_string();
                 info!(name = %name, "Reusing existing container for workspace");
-                return Ok((cid, name));
+                return Ok(name);
             } else if output.status.success() {
                 let _ = Command::new("docker")
                     .args(["rm", "-f", &name])
@@ -746,16 +765,14 @@ impl DockerPool {
             return Err(TyclawError::Other(format!("docker run failed: {stderr}")));
         }
 
-        let cid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
         // 确保容器内 work/tmp 目录存在（TMPDIR 指向此处）
         let _ = Command::new("docker")
-            .args(["exec", &cid, "mkdir", "-p", &format!("{}/tmp", self.config.work_dir)])
+            .args(["exec", &name, "mkdir", "-p", &format!("{}/tmp", self.config.work_dir)])
             .output()
             .await;
 
         info!(name = %name, workspace_key = %workspace_key, "Created container for workspace");
-        Ok((cid, name))
+        Ok(name)
     }
 }
 
@@ -788,7 +805,6 @@ impl SandboxPool for DockerPool {
 
             if alive {
                 return Ok(Arc::new(DockerSandbox {
-                    container_id: entry.container_id.clone(),
                     container_name: entry.container_name.clone(),
                     mount_root: user_mount_root(&self.config.work_dir),
                     work_dir: self.config.work_dir.clone(),
@@ -803,20 +819,18 @@ impl SandboxPool for DockerPool {
         // 清除旧缓存条目
         self.containers.lock().await.remove(&workspace_key);
 
-        let (cid, name) = self.create_workspace_container(&workspace_key).await?;
+        let name = self.create_workspace_container(&workspace_key).await?;
 
         let mut containers = self.containers.lock().await;
         let ws_key = workspace_key.clone();
         containers.insert(
             workspace_key,
             WorkspaceContainer {
-                container_id: cid.clone(),
                 container_name: name.clone(),
             },
         );
 
         Ok(Arc::new(DockerSandbox {
-            container_id: cid,
             container_name: name,
             mount_root: user_mount_root(&self.config.work_dir),
             work_dir: self.config.work_dir.clone(),
@@ -840,7 +854,7 @@ impl SandboxPool for DockerPool {
             let _ = Command::new("docker")
                 .args([
                     "exec",
-                    &entry.container_id,
+                    &entry.container_name,
                     "sh",
                     "-c",
                     "kill -9 -1 2>/dev/null; true",

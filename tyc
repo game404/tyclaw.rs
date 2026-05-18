@@ -251,7 +251,7 @@ case "$COMMAND" in
             --run-dir "$RUN_DIR" \
             $WORKS_ARGS \
             $EXTRA_ARGS \
-            >> "$LOG_FILE" 2>&1 &
+            >/dev/null 2>&1 &
 
         echo $! > "$PID_FILE"
         echo "TyClaw deployed (pid=$(cat "$PID_FILE"))"

@@ -136,6 +136,11 @@ pub trait Sandbox: Send + Sync {
         -> Result<(), TyclawError>;
     fn workspace_root(&self) -> &str;
     fn id(&self) -> &str;
+    /// 返回原始 workspace_key（用于磁盘路径定位）。
+    /// 默认实现通过 `id()` 的 `tyclaw-` 前缀反推，但容器名经过 sanitize 的实现应覆盖此方法。
+    fn workspace_key(&self) -> &str {
+        self.id().strip_prefix("tyclaw-").unwrap_or(self.id())
+    }
 }
 
 /// 沙箱池 —— 管理沙箱实例的 acquire/release 生命周期。

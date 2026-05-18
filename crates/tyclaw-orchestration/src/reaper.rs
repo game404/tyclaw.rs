@@ -100,7 +100,7 @@ impl Orchestrator {
                     }
 
                     // 4. 销毁 Docker 容器
-                    let container_name = format!("tyclaw-{workspace_key}");
+                    let container_name = tyclaw_sandbox::sanitize_container_name(&workspace_key);
                     let _ = tokio::process::Command::new("docker")
                         .args(["rm", "-f", &container_name])
                         .output()
