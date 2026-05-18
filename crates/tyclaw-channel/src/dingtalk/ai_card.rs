@@ -67,6 +67,8 @@ struct CardState {
     latest_thinking: String,
     /// 当前工具行（"exec: foo"、"read: bar.rs" 等 brief 输出）。
     latest_tool: String,
+    /// 心跳进度提示（如 "🦀 正在分析处理中..."），融入卡片避免独立气泡。
+    latest_heartbeat: String,
     /// 是否已终结——终结后所有 feed 调用都应是 no-op。
     finalized: bool,
 }
@@ -251,6 +253,21 @@ impl CardReplier {
         self.push_streaming(false).await;
     }
 
+    /// 接收心跳进度提示，融入卡片 streaming 展示，任务结束时随 finalize 自然消失。
+    pub async fn feed_heartbeat(&self, text: &str) {
+        {
+            let mut s = self.state.lock();
+            if s.finalized {
+                return;
+            }
+            if text.is_empty() {
+                return;
+            }
+            s.latest_heartbeat = text.to_string();
+        }
+        self.push_streaming(false).await;
+    }
+
     /// 任务完成：关流 + 覆盖 cardData 为最终回复。
     ///
     /// 返回 `Err` 时调用方应 fallback 到纯文本回复，避免用户什么都收不到。
@@ -322,6 +339,10 @@ impl CardReplier {
         if !state.latest_tool.is_empty() {
             out.push_str("\n\n▎🔧 ");
             out.push_str(&state.latest_tool);
+        }
+        if !state.latest_heartbeat.is_empty() {
+            out.push_str("\n\n▎⏱ ");
+            out.push_str(&state.latest_heartbeat);
         }
         out
     }

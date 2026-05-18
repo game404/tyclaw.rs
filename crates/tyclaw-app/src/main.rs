@@ -668,19 +668,22 @@ async fn run_outbound_dispatcher(
                         cli_print(&format!("\x1b[2;31m[DT:{chat_id}] Error: {message}\x1b[0m"));
                     }
                     OutboundEvent::Progress { message, .. } => {
-                        // 超长任务文本提醒（仅在超过 30 轮时触发一次）
                         if let Some(text) = message.strip_prefix("[heartbeat]") {
-                            let (conversation_id, user_id) = if chat_id.contains(':') {
-                                let parts: Vec<&str> = chat_id.splitn(2, ':').collect();
-                                (parts[0], parts[1])
+                            if let Some(c) = &card {
+                                c.feed_heartbeat(text).await;
                             } else {
-                                ("", chat_id.as_str())
-                            };
-                            if let Ok(token) = sender.token_manager.get_token().await {
-                                handler::send_text_by_channel(
-                                    &sender.http_client, &token, &sender.robot_code,
-                                    &channel, user_id, conversation_id, text,
-                                ).await;
+                                let (conversation_id, user_id) = if chat_id.contains(':') {
+                                    let parts: Vec<&str> = chat_id.splitn(2, ':').collect();
+                                    (parts[0], parts[1])
+                                } else {
+                                    ("", chat_id.as_str())
+                                };
+                                if let Ok(token) = sender.token_manager.get_token().await {
+                                    handler::send_text_by_channel(
+                                        &sender.http_client, &token, &sender.robot_code,
+                                        &channel, user_id, conversation_id, text,
+                                    ).await;
+                                }
                             }
                         }
                         cli_print(&format!("\x1b[2m[DT:{chat_id}] {message}\x1b[0m"));
