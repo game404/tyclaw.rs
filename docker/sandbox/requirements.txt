@@ -1,0 +1,12 @@
+pandas
+numpy
+openpyxl
+requests
+opencv-python-headless
+av
+pytesseract
+faster-whisper
+scenedetect[opencv]
+yt-dlp
+playwright
+playwright-stealth
