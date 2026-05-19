@@ -808,7 +808,7 @@ impl DockerPool {
 
         // 确保容器内 work/tmp 目录存在（TMPDIR 指向此处）
         let _ = Command::new("docker")
-            .args(["exec", &name, "mkdir", "-p", &format!("{}/tmp", self.config.work_dir)])
+            .args(["exec", &name, "mkdir", "-p", &format!("{}/work/tmp", self.config.work_dir)])
             .output()
             .await;
 
