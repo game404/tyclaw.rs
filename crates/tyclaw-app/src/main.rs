@@ -606,13 +606,14 @@ async fn run_outbound_dispatcher(
                             ("", chat_id.as_str())
                         };
                         if let Ok(token) = sender.token_manager.get_token().await {
-                            handler::send_text_by_channel(
+                            handler::send_markdown_by_channel(
                                 &sender.http_client,
                                 &token,
                                 &sender.robot_code,
                                 &channel,
                                 user_id,
                                 conversation_id,
+                                "执行结果",
                                 &response.text,
                             )
                             .await;

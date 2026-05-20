@@ -219,6 +219,65 @@ pub async fn send_text_by_channel(
     }
 }
 
+/// 通过主动消息 API 发送 Markdown（不依赖 ChatbotMessage，用于 timer 等异步场景）。
+///
+/// 使用钉钉 `sampleMarkdown` msgKey，支持 Markdown 格式渲染。
+pub async fn send_markdown_by_channel(
+    client: &Client,
+    token: &str,
+    robot_code: &str,
+    channel: &str,
+    user_id: &str,
+    conversation_id: &str,
+    title: &str,
+    text: &str,
+) {
+    let msg_param = json!({"title": title, "text": text}).to_string();
+
+    let (url, payload) = if channel.contains("private") {
+        (
+            "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
+            json!({
+                "robotCode": robot_code,
+                "userIds": [user_id],
+                "msgKey": "sampleMarkdown",
+                "msgParam": msg_param,
+            }),
+        )
+    } else {
+        (
+            "https://api.dingtalk.com/v1.0/robot/groupMessages/send",
+            json!({
+                "robotCode": robot_code,
+                "openConversationId": conversation_id,
+                "msgKey": "sampleMarkdown",
+                "msgParam": msg_param,
+            }),
+        )
+    };
+
+    match client
+        .post(url)
+        .header("x-acs-dingtalk-access-token", token)
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                warn!(status = %status, body = %body, "send_markdown_by_channel failed");
+            } else {
+                info!(channel = %channel, "send_markdown_by_channel sent successfully");
+            }
+        }
+        Err(e) => warn!(error = %e, "send_markdown_by_channel HTTP error"),
+    }
+}
+
 /// 通过 session_webhook 回复文本消息。
 pub async fn reply_text(client: &Client, text: &str, message: &ChatbotMessage) -> bool {
     if message.session_webhook.is_empty() {
