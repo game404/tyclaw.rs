@@ -888,17 +888,40 @@ impl SandboxPool for DockerPool {
             .values()
             .find(|e| e.container_name == sandbox_name)
         {
-            // 杀掉容器内残留进程，但不移除容器（容器常驻复用）
-            let _ = Command::new("docker")
+            // 设备流登录(dws auth login --device)是常驻轮询进程，最长 900s 等用户授权。
+            // 若容器内存在 15 分钟内的登录 marker，跳过本轮 kill，避免误杀轮询进程；
+            // marker 过期或登录完成被删后，下一轮 release 恢复正常清理。
+            let login_pending = Command::new("docker")
                 .args([
                     "exec",
                     &entry.container_name,
                     "sh",
                     "-c",
-                    "kill -9 -1 2>/dev/null; true",
+                    "find /workspace/.dws/.login.lock -mmin -15 2>/dev/null | grep -q .",
                 ])
                 .output()
-                .await;
+                .await
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+            if login_pending {
+                info!(
+                    name = %entry.container_name,
+                    "dws device login in progress, skipping reap kill"
+                );
+            } else {
+                // 杀掉容器内残留进程，但不移除容器（容器常驻复用）
+                let _ = Command::new("docker")
+                    .args([
+                        "exec",
+                        &entry.container_name,
+                        "sh",
+                        "-c",
+                        "kill -9 -1 2>/dev/null; true",
+                    ])
+                    .output()
+                    .await;
+            }
         }
 
         Ok(())

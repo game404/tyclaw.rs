@@ -54,11 +54,55 @@ pub struct Orchestrator {
     /// Per-workspace 消息注入队列：workspace busy 时，新消息注入到运行中的 agent loop。
     pub(crate) injection_queues:
         parking_lot::Mutex<HashMap<String, tyclaw_agent::runtime::InjectionQueue>>,
-    /// Per-workspace 取消令牌：外部（钉钉停止按钮 / 关键字 / SIGINT 等）据此中断
+    /// Per-conversation 取消令牌：外部（钉钉停止按钮 / 关键字 / SIGINT 等）据此中断
     /// 正在运行的 agent loop。handler 开始处理时注册、完成时移除。
+    /// 键为 `conversation_key`（含 workspace_key 前缀），保证群聊停止不会误杀同一
+    /// 用户的私聊任务。
     pub(crate) cancellations: parking_lot::Mutex<
         HashMap<String, tokio_util::sync::CancellationToken>,
     >,
+    /// Per-workspace 当前运行中的会话归属：`workspace_key -> conversation_key`。
+    /// 用于判断新到消息是否与正在运行的 loop 属于同一会话——同会话才注入，
+    /// 不同会话走串行锁排队。
+    pub(crate) active_conversations: parking_lot::Mutex<HashMap<String, String>>,
+    /// Per-workspace 串行锁：同一用户工作区(私聊/群聊共享 history)同一时刻只允许
+    /// 一个会话运行，不同会话在此排队，避免并发写同一份历史造成串扰。
+    pub(crate) run_locks:
+        parking_lot::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// 运行态会话键分隔符——控制字符 `\u{1}`，用户输入不会包含，避免与 channel/chat_id
+/// 内容冲突。
+pub(crate) const CONVERSATION_KEY_SEP: char = '\u{1}';
+
+/// 构造运行态"会话键"。
+///
+/// 形如 `{workspace_key}\u{1}{channel}\u{1}{chat_id}`：
+/// - 前缀 `workspace_key` 让 reaper 能按 workspace 前缀批量清理。
+/// - `channel` + `chat_id` 保证私聊 / 群聊 / 不同群彼此唯一。
+pub(crate) fn conversation_key(workspace_key: &str, channel: &str, chat_id: &str) -> String {
+    format!("{workspace_key}{CONVERSATION_KEY_SEP}{channel}{CONVERSATION_KEY_SEP}{chat_id}")
+}
+
+/// 某 workspace 下所有 conversation_key 的公共前缀（供 reaper 前缀清理）。
+pub(crate) fn conversation_key_prefix(workspace_key: &str) -> String {
+    format!("{workspace_key}{CONVERSATION_KEY_SEP}")
+}
+
+/// RAII guard：持有期间在 `active_conversations` 中标记某 workspace 的当前运行会话，
+/// drop 时自动清除。
+pub(crate) struct ActiveConversationGuard<'a> {
+    orch: &'a Orchestrator,
+    workspace_key: String,
+}
+
+impl Drop for ActiveConversationGuard<'_> {
+    fn drop(&mut self) {
+        self.orch
+            .active_conversations
+            .lock()
+            .remove(&self.workspace_key);
+    }
 }
 
 /// 活跃任务条目
@@ -90,40 +134,78 @@ impl Orchestrator {
         let _ = std::fs::write(self.app.workspace.join(".active_tasks.json"), content);
     }
 
-    /// 注册一个取消令牌，与 `workspace_key` 关联。handler 进入时调用。
+    /// 注册一个取消令牌，与 `conversation_key` 关联。handler 进入时调用。
     ///
-    /// 若同 workspace 已有令牌（典型情况：上一条消息还没跑完新消息又来了），
+    /// 若同会话已有令牌（典型情况：上一条消息还没跑完新消息又来了），
     /// 旧令牌会被覆盖丢弃——其对应的任务会失去被外部 cancel 的能力，
-    /// 但 per-workspace 锁保证不会同时运行两个任务，所以覆盖是安全的。
+    /// 但串行锁保证同一会话不会同时运行两个任务，所以覆盖是安全的。
     pub(crate) fn register_cancellation(
         &self,
-        workspace_key: &str,
+        conversation_key: &str,
     ) -> tokio_util::sync::CancellationToken {
         let token = tokio_util::sync::CancellationToken::new();
         self.cancellations
             .lock()
-            .insert(workspace_key.to_string(), token.clone());
+            .insert(conversation_key.to_string(), token.clone());
         token
     }
 
     /// 任务结束时清理令牌。
-    ///
-    /// per-workspace 锁保证同一时间只有一个任务在跑，所以直接 remove 即可。
-    pub(crate) fn clear_cancellation(&self, workspace_key: &str) {
-        self.cancellations.lock().remove(workspace_key);
+    pub(crate) fn clear_cancellation(&self, conversation_key: &str) {
+        self.cancellations.lock().remove(conversation_key);
     }
 
-    /// 外部入口：中断指定 workspace 正在运行的 agent 任务。
+    /// 外部入口：中断指定会话正在运行的 agent 任务。
     ///
     /// 返回 `true` 表示找到了正在运行的任务并已触发 cancel；`false` 表示当前
-    /// 没有运行中的任务（已结束或未开始）。
-    pub fn cancel(&self, workspace_key: &str) -> bool {
+    /// 没有运行中的任务（已结束、未开始、或还在排队等待运行锁）。
+    pub fn cancel(&self, conversation_key: &str) -> bool {
         let map = self.cancellations.lock();
-        if let Some(token) = map.get(workspace_key) {
+        if let Some(token) = map.get(conversation_key) {
             token.cancel();
             true
         } else {
             false
+        }
+    }
+
+    /// 获取（或创建）某 workspace 的串行运行锁。
+    pub(crate) fn get_run_lock(
+        &self,
+        workspace_key: &str,
+    ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.run_locks.lock();
+        locks
+            .entry(workspace_key.to_string())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// 判断某 workspace 当前运行中的会话是否就是 `conversation_key`。
+    pub(crate) fn active_conversation_matches(
+        &self,
+        workspace_key: &str,
+        conversation_key: &str,
+    ) -> bool {
+        self.active_conversations
+            .lock()
+            .get(workspace_key)
+            .map(|c| c == conversation_key)
+            .unwrap_or(false)
+    }
+
+    /// 标记某 workspace 的当前运行会话，返回在 drop 时自动清除标记的 guard。
+    pub(crate) fn mark_active_conversation(
+        &self,
+        workspace_key: &str,
+        conversation_key: &str,
+    ) -> ActiveConversationGuard<'_> {
+        self.active_conversations
+            .lock()
+            .insert(workspace_key.to_string(), conversation_key.to_string());
+        ActiveConversationGuard {
+            orch: self,
+            workspace_key: workspace_key.to_string(),
         }
     }
 
@@ -146,7 +228,8 @@ impl Orchestrator {
             conversation_id,
         };
         let workspace_key = self.persistence.workspace_mgr.resolve_key(&identity);
-        self.cancel(&workspace_key)
+        let conv_key = conversation_key(&workspace_key, channel, chat_id);
+        self.cancel(&conv_key)
     }
 
     /// 获取或创建指定 workspace 的注入队列。
@@ -250,6 +333,36 @@ impl Orchestrator {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_conversation_key_distinguishes_private_and_group() {
+        // 同一用户(staff)私聊 vs 群聊：workspace_key 相同(user_id 策略)，
+        // 但 conversation_key 必须不同，否则会跨会话注入/串台。
+        let ws = "staff123";
+        let private = conversation_key(ws, "dingtalk_private", "staff123");
+        let group = conversation_key(ws, "dingtalk_group", "cidAAA:staff123");
+        assert_ne!(private, group, "私聊与群聊的会话键必须不同");
+
+        // 不同群之间也必须互相区分。
+        let group_b = conversation_key(ws, "dingtalk_group", "cidBBB:staff123");
+        assert_ne!(group, group_b, "不同群的会话键必须不同");
+    }
+
+    #[test]
+    fn test_conversation_key_prefixed_by_workspace_key() {
+        // reaper 依赖该前缀不变量按 workspace 批量清理 conversation_key 索引的 map。
+        let ws = "staff123";
+        let conv = conversation_key(ws, "dingtalk_group", "cidAAA:staff123");
+        let prefix = conversation_key_prefix(ws);
+        assert!(conv.starts_with(&prefix), "会话键必须以 workspace 前缀开头");
+
+        // 另一个用户的会话键不应命中本 workspace 的前缀。
+        let other = conversation_key("staff999", "dingtalk_private", "staff999");
+        assert!(
+            !other.starts_with(&prefix),
+            "其他用户的会话键不应被本 workspace 前缀匹配"
+        );
+    }
 
     fn msg(role: &str, content: &str) -> HashMap<String, serde_json::Value> {
         let mut m = HashMap::new();
