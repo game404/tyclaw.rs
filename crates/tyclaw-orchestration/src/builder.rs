@@ -302,6 +302,8 @@ impl OrchestratorBuilder {
             sandbox_pool: None, // 由 main.rs 启动时注入
             injection_queues: parking_lot::Mutex::new(HashMap::new()),
             cancellations: parking_lot::Mutex::new(HashMap::new()),
+            active_conversations: parking_lot::Mutex::new(HashMap::new()),
+            run_locks: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 }

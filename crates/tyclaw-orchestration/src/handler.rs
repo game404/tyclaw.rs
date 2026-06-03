@@ -31,6 +31,9 @@ struct HandlerContext<'a> {
     channel: &'a str,
     chat_id: &'a str,
     workspace_key: String,
+    /// 运行态会话键（含 workspace_key 前缀 + channel + chat_id），用于按会话隔离
+    /// 忙碌归属、注入判定、取消令牌、ask_user 暂停状态。
+    conversation_key: String,
     on_progress: Option<&'a OnProgress>,
 }
 
@@ -80,6 +83,8 @@ impl Orchestrator {
             conversation_id: req.conversation_id.as_deref(),
         };
         let workspace_key = self.persistence.workspace_mgr.resolve_key(&identity);
+        let conversation_key =
+            crate::orchestrator::conversation_key(&workspace_key, channel, chat_id);
 
         let ctx = HandlerContext {
             start,
@@ -89,13 +94,24 @@ impl Orchestrator {
             channel,
             chat_id,
             workspace_key: workspace_key.clone(),
+            conversation_key: conversation_key.clone(),
             on_progress,
         };
 
-        // 如果 workspace 正在处理中，将消息注入到运行中的 agent loop，立即返回
-        if self.persistence.sessions.busy_elapsed(&workspace_key).is_some() {
+        // 忙碌且属于同一会话：把消息注入到运行中的 agent loop，立即返回。
+        // 不同会话不在此注入——往下走串行锁排队，避免把回复发到错误的会话。
+        if self.persistence.sessions.busy_elapsed(&workspace_key).is_some()
+            && self.active_conversation_matches(&workspace_key, &conversation_key)
+        {
             return self.handle_busy_workspace(&ctx, user_message, req).await;
         }
+
+        // 串行锁：同一用户工作区（私聊/群聊共享 history）同一时刻只跑一个会话。
+        // 不同会话在此等待当前任务结束，确保不会并发写同一份历史、不会串台。
+        let run_lock = self.get_run_lock(&workspace_key);
+        let _run_guard = run_lock.lock().await;
+        // 标记当前运行会话归属，drop 时自动清除（让后续同会话消息可被注入）。
+        let _active_guard = self.mark_active_conversation(&workspace_key, &conversation_key);
 
         // 确保 workspace 目录结构存在
         self.persistence.workspace_mgr.ensure_workspace(&workspace_key);
@@ -107,7 +123,7 @@ impl Orchestrator {
         let pending_entry = self
             .pending_ask_user
             .lock()
-            .remove(&workspace_key);
+            .remove(&conversation_key);
         if let Some((tool_call_id, mut saved_messages)) = pending_entry {
             // 用户回车没输入内容 → 使用默认行为（让 agent 自行决定）
             let reply = if user_message.trim().is_empty() {
@@ -158,7 +174,7 @@ impl Orchestrator {
                 self.pending_ask_user
                     .lock()
                     .insert(
-                        workspace_key.clone(),
+                        conversation_key.clone(),
                         (pending_tool_call_id.clone(), result.messages),
                     );
                 return Ok(AgentResponse {
@@ -695,9 +711,10 @@ impl Orchestrator {
 
         let cache_scope = format!("session:{}", ctx.workspace_key);
         let injection_queue = self.get_injection_queue(&ctx.workspace_key);
-        // 注册 per-workspace 取消令牌，外部（钉钉停止按钮 / 关键字）据此中断。
+        // 注册 per-conversation 取消令牌，外部（钉钉停止按钮 / 关键字）据此中断。
+        // 按会话键注册，确保群聊停止不会误杀同一用户的私聊任务。
         // task_local 下沉到 agent loop，查 `runtime::is_cancel_requested()` 即可。
-        let cancel_token = self.register_cancellation(&ctx.workspace_key);
+        let cancel_token = self.register_cancellation(&ctx.conversation_key);
 
         let run_future = self.runtime.run(
             initial_messages,
@@ -769,7 +786,7 @@ impl Orchestrator {
                 .await?
         };
         // 任务结束（正常返回、错误、取消）都清理取消令牌。
-        self.clear_cancellation(&ctx.workspace_key);
+        self.clear_cancellation(&ctx.conversation_key);
 
         // 9.05 release sandbox
         if let (Some((sb, ws)), Some(pool)) = (sandbox, &self.sandbox_pool) {
@@ -827,7 +844,7 @@ impl Orchestrator {
             self.pending_ask_user
                 .lock()
                 .insert(
-                    ctx.workspace_key.clone(),
+                    ctx.conversation_key.clone(),
                     (pending_tool_call_id.clone(), result.messages),
                 );
             return Ok(AgentRunResult::EarlyReturn(AgentResponse {

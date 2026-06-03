@@ -110,11 +110,21 @@ impl Orchestrator {
                     let cache_scope = format!("session:{workspace_key}");
                     orch.provider.clear_cache_scope(&cache_scope);
 
-                    // 6. 清理 per-workspace 串行锁
+                    // 6. 清理 per-workspace 注入队列、串行锁、活跃会话标记
                     orch.injection_queues.lock().remove(&workspace_key);
+                    orch.run_locks.lock().remove(&workspace_key);
+                    orch.active_conversations.lock().remove(&workspace_key);
 
-                    // 6b. 清理 pending_ask_user 避免无限制内存增长
-                    orch.pending_ask_user.lock().remove(&workspace_key);
+                    // 6b. 清理本 workspace 下所有会话的 pending_ask_user / 取消令牌
+                    //（这些按 conversation_key 索引，统一以 workspace_key 前缀匹配清理），
+                    //  避免无限制内存增长。
+                    let conv_prefix = crate::orchestrator::conversation_key_prefix(&workspace_key);
+                    orch.pending_ask_user
+                        .lock()
+                        .retain(|k, _| !k.starts_with(&conv_prefix));
+                    orch.cancellations
+                        .lock()
+                        .retain(|k, _| !k.starts_with(&conv_prefix));
 
                     // 7. 写审计日志
                     let session_id = "reaper".to_string();
