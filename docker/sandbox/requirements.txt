@@ -10,3 +10,13 @@ scenedetect[opencv]
 yt-dlp
 playwright
 playwright-stealth
+# finance skills 高复用 PDF/Office 依赖（预装以省去 skill 运行时 pip install）
+pdfplumber
+reportlab
+Pillow
+pypdf
+pikepdf
+lxml
+defusedxml
+# 对象存储客户端（minio-ops / finance-tax-calc）
+minio
