@@ -53,6 +53,15 @@ RUN RUSTUP_DIST_SERVER="$RUSTUP_DIST_SERVER" \
     && RUSTUP_DIST_SERVER="$RUSTUP_DIST_SERVER" rustup component add clippy rustfmt \
     && chmod -R a+rX /usr/local/cargo /usr/local/rustup
 
+# dws (DingTalk Workspace CLI) —— 系统级安装到 /usr/local/bin（默认 PATH，所有容器共享）。
+# DWS_NO_SKILLS=1 跳过 agent skill 安装与非 TTY 交互；认证目录 ~/.dws 在运行时
+# 由 HOME=/workspace 落到用户 workspace，故此处仅装二进制。
+ARG DWS_VERSION=latest
+RUN DWS_INSTALL_DIR=/usr/local/bin DWS_NO_SKILLS=1 DWS_VERSION="$DWS_VERSION" \
+    sh -c 'curl -fsSL https://raw.githubusercontent.com/DingTalk-Real-AI/dingtalk-workspace-cli/main/scripts/install.sh | sh' \
+    && chmod a+rx /usr/local/bin/dws \
+    && /usr/local/bin/dws version
+
 # Python 依赖（通过 requirements.txt 管理，便于扩展）
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir \
