@@ -16,6 +16,7 @@ reportlab
 Pillow
 pypdf
 pikepdf
+PyMuPDF
 lxml
 defusedxml
 # 对象存储客户端（minio-ops / finance-tax-calc）

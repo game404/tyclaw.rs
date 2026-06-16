@@ -35,6 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxrender1 \
     libgl1 \
+    libreoffice-calc \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js 22 LTS + TypeScript
