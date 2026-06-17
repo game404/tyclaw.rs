@@ -109,6 +109,7 @@ impl ChatbotHandler for DingTalkBot {
             sender = %message.sender_staff_id,
             conversation_type = %message.conversation_type,
             conversation_id = %message.conversation_id,
+            chatbot_user_id = %message.chatbot_user_id,
             "DingTalk: received message"
         );
         let nick = if message.sender_nick.is_empty() {
