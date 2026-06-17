@@ -778,6 +778,18 @@ impl DockerPool {
             ]);
         }
 
+        // 挂载主机 /etc/hosts 使容器使用与主机相同的 hosts 解析
+        if Path::new("/etc/hosts").exists() {
+            run_args.extend([
+                "--mount".to_string(),
+                bind_mount(
+                    Path::new("/etc/hosts"),
+                    "/etc/hosts",
+                    true,
+                ),
+            ]);
+        }
+
         run_args.extend([
             "--mount".to_string(),
             mount_arg,
