@@ -145,6 +145,10 @@ pub struct ChatbotMessage {
     /// 机器人代码
     #[serde(default)]
     pub robot_code: String,
+
+    /// 机器人的钉钉用户 ID（chatbotUserId）
+    #[serde(default)]
+    pub chatbot_user_id: String,
 }
 
 /// 文本消息内容。
