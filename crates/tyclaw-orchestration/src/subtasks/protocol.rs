@@ -58,6 +58,9 @@ pub enum NodeStatus {
     Running,
     Success,
     Failed,
+    /// 节点受阻：产出失败兜底语义（如命中污染关键词），不得视为成功。
+    /// 与 `Failed` 同属失败语义。
+    Blocked,
     Skipped,
 }
 

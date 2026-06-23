@@ -51,6 +51,7 @@ impl SubtasksEngine {
             false,
             0,
             Default::default(),
+            Default::default(),
         );
         Self::new_with_context(config, default_provider, default_model, app)
     }
@@ -67,6 +68,7 @@ impl SubtasksEngine {
             default_model.to_string(),
             write_snapshot,
             0,
+            Default::default(),
             Default::default(),
         );
         Self::new_with_context(config, default_provider, default_model, app)

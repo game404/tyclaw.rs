@@ -1527,6 +1527,13 @@ mod tests {
         SandboxGrepResponse, SandboxWalkEntry,
     };
 
+    /// read_file 截断上限必须保持 128_000 字符不变。
+    /// Task 7.5 故意未修改此常量；本测试守护其值，防止回归。
+    #[test]
+    fn max_read_chars_stays_128k() {
+        assert_eq!(MAX_READ_CHARS, 128_000);
+    }
+
     struct TestSandbox {
         root: PathBuf,
         id: String,

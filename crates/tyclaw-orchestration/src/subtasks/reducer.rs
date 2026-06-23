@@ -69,6 +69,11 @@ impl RuleReducer {
                     let err = rec.error.as_deref().unwrap_or("unknown error");
                     failure_notes.push(format!("[{}] failed: {}", rec.node_id, err));
                 }
+                NodeStatus::Blocked => {
+                    partial_failure = true;
+                    let err = rec.error.as_deref().unwrap_or("blocked");
+                    failure_notes.push(format!("[{}] blocked: {}", rec.node_id, err));
+                }
                 NodeStatus::Skipped => {
                     partial_failure = true;
                     failure_notes.push(format!("[{}] skipped", rec.node_id));

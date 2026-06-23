@@ -23,9 +23,45 @@ use tyclaw_tools::ToolRegistry;
 
 use crate::app_context::AppContext;
 use crate::builder::register_core_tools;
+use crate::config::PollutionConfig;
+use crate::pollution_filter::contains_pollution_phrase;
 
 use super::protocol::{ExecutionRecord, NodeStatus, TaskNode};
 use super::routing::RoutingPolicy;
+
+/// 根据输出正文与终止原因校正节点状态（R2.1 / R2.2）。
+///
+/// 决策规则（确定性、与 design.md Property 5 对齐）：
+/// 1. 若**命中 max_iterations** 且正文为空白或含污染关键词 → `Failed`（R2.2）；
+/// 2. 否则若正文（不区分大小写）含污染关键词 → 绝不 `Success`：
+///    `raw == Blocked` 时保留 `Blocked`，否则归为 `Failed`（R2.1）；
+/// 3. 否则原样返回 `raw`。
+///
+/// 规则 1 先于规则 2 判定，确保「撞顶 + 受阻」场景统一收敛为 `Failed`。
+pub(crate) fn reconcile_node_status(
+    raw: NodeStatus,
+    output: &str,
+    hit_max_iter: bool,
+    cfg: &PollutionConfig,
+) -> NodeStatus {
+    let polluted = contains_pollution_phrase(output, cfg);
+
+    // R2.2：命中 max_iterations 且正文空白或含污染词 → Failed。
+    if hit_max_iter && (output.trim().is_empty() || polluted) {
+        return NodeStatus::Failed;
+    }
+
+    // R2.1：正文含污染词 → 绝不 Success（Blocked 保留，其余归 Failed）。
+    if polluted {
+        return if raw == NodeStatus::Blocked {
+            NodeStatus::Blocked
+        } else {
+            NodeStatus::Failed
+        };
+    }
+
+    raw
+}
 
 /// Sub-agent 的默认最大迭代次数。
 /// coding 类任务需要 write → run → debug 多轮循环，需要足够的轮次。
@@ -225,12 +261,22 @@ impl NodeExecutor {
                 let output_text = sanitize_sub_agent_output(&raw_output);
                 let tools_used = runtime_result.tools_used;
 
+                // R2.1/R2.2：校正节点状态——正文含污染关键词绝不判为 Success。
+                // TODO(任务 19.x)：从 PerformanceConfig 注入完整 PollutionConfig；
+                // 暂用默认配置完成关键的污染检测。
+                // TODO：RuntimeResult 暂无 max_iterations 命中标志，hit_max_iter 暂传 false；
+                // 待 agent runtime 暴露终止原因后接入（污染检测为 R2.1 关键路径，已生效）。
+                let pollution_cfg = PollutionConfig::default();
+                let reconciled_status =
+                    reconcile_node_status(NodeStatus::Success, &output_text, false, &pollution_cfg);
+
                 info!(
                     node_id = %node.id,
                     model = %model,
                     duration_ms,
                     tools_used = ?tools_used,
                     output_len = output_text.len(),
+                    status = ?reconciled_status,
                     "Sub-agent completed successfully"
                 );
 
@@ -252,8 +298,8 @@ impl NodeExecutor {
                 let detail_file = dispatch_dir.join(format!("{}.md", node.id));
                 let duration_s = duration_ms as f64 / 1000.0;
                 let detail_content = format!(
-                    "# {} (Success)\n\nModel: {}\nDuration: {:.1}s\nTools: {:?}\n\n---\n\n{}\n",
-                    node.id, model, duration_s, tools_used, output_text
+                    "# {} ({:?})\n\nModel: {}\nDuration: {:.1}s\nTools: {:?}\n\n---\n\n{}\n",
+                    node.id, reconciled_status, model, duration_s, tools_used, output_text
                 );
                 let _ = std::fs::write(&detail_file, &detail_content);
 
@@ -263,7 +309,7 @@ impl NodeExecutor {
                     input_tokens: 0, // AgentLoop 内部消耗，暂无法精确统计
                     output_tokens: 0,
                     duration_ms,
-                    status: NodeStatus::Success,
+                    status: reconciled_status,
                     output: Some(output_text),
                     error: None,
                     retries: 0,
@@ -759,4 +805,139 @@ fn dispatch_container_rel(dispatch_dir: &std::path::Path) -> String {
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| "dispatch".to_string());
     format!("{parent}/{name}")
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn clean_output_preserves_raw_status() {
+        let cfg = PollutionConfig::default();
+        // 正常正文、未撞顶：原样返回 raw。
+        assert_eq!(
+            reconcile_node_status(NodeStatus::Success, "task finished fine", false, &cfg),
+            NodeStatus::Success
+        );
+        assert_eq!(
+            reconcile_node_status(NodeStatus::Blocked, "all good", false, &cfg),
+            NodeStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn polluted_output_never_success() {
+        let cfg = PollutionConfig::default();
+        // 含污染关键词（大小写不敏感）：Success → Failed，绝不 Success。
+        assert_eq!(
+            reconcile_node_status(NodeStatus::Success, "I cannot make progress here", false, &cfg),
+            NodeStatus::Failed
+        );
+        assert_eq!(
+            reconcile_node_status(NodeStatus::Success, "fatal ERROR occurred", false, &cfg),
+            NodeStatus::Failed
+        );
+        // raw==Blocked 且含污染词：保留 Blocked（仍属失败语义，非 Success）。
+        assert_eq!(
+            reconcile_node_status(NodeStatus::Blocked, "task blocked by readonly fs", false, &cfg),
+            NodeStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn hit_max_iter_with_blank_or_polluted_is_failed() {
+        let cfg = PollutionConfig::default();
+        // 撞顶 + 空白正文 → Failed。
+        assert_eq!(
+            reconcile_node_status(NodeStatus::Success, "   \n  ", true, &cfg),
+            NodeStatus::Failed
+        );
+        // 撞顶 + 含污染词 → Failed（即使 raw==Blocked 也归 Failed）。
+        assert_eq!(
+            reconcile_node_status(NodeStatus::Blocked, "error: blocked", true, &cfg),
+            NodeStatus::Failed
+        );
+    }
+
+    #[test]
+    fn hit_max_iter_with_clean_nonblank_output_preserves_raw() {
+        let cfg = PollutionConfig::default();
+        // 撞顶但正文非空且无污染词：不强制 Failed，返回 raw。
+        assert_eq!(
+            reconcile_node_status(NodeStatus::Success, "produced a useful result", true, &cfg),
+            NodeStatus::Success
+        );
+    }
+
+    // ---- 属性测试 ----
+
+    /// 原始 NodeStatus 生成器：覆盖全部 6 个变体。
+    fn node_status_strategy() -> impl Strategy<Value = NodeStatus> {
+        prop_oneof![
+            Just(NodeStatus::Pending),
+            Just(NodeStatus::Running),
+            Just(NodeStatus::Success),
+            Just(NodeStatus::Failed),
+            Just(NodeStatus::Blocked),
+            Just(NodeStatus::Skipped),
+        ]
+    }
+
+    /// 输出正文生成器：混合污染关键词（大小写变体）、近似词、
+    /// 空白/空串与干净文本，覆盖污染检测与撞顶判定的输入空间。
+    fn output_strategy() -> impl Strategy<Value = String> {
+        let token = prop_oneof![
+            Just("error".to_string()),
+            Just("ERROR".to_string()),
+            Just("Error".to_string()),
+            Just("errorless".to_string()), // 近似词：含 error 子串
+            Just("blocked".to_string()),
+            Just("BLOCKED".to_string()),
+            Just("unblocked".to_string()), // 近似词：含 blocked 子串
+            Just("I cannot make progress".to_string()),
+            Just("i CANNOT make PROGRESS".to_string()),
+            Just("produced a useful result".to_string()),
+            Just("all good, finished".to_string()),
+            Just("".to_string()),        // 空串
+            Just("   ".to_string()),     // 纯空白
+            Just(" \n\t ".to_string()),  // 混合空白
+            "[a-zA-Z ]{0,16}",            // 任意干净短文本
+        ];
+        prop::collection::vec(token, 0..5).prop_map(|parts| parts.join(" "))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 100, ..Default::default() })]
+
+        // Feature: execution-performance-optimization, Property 5: 污染/撞顶节点状态绝不判为成功
+        // Validates: Requirements 2.1, 2.2
+        #[test]
+        fn prop_polluted_or_capped_node_never_success(
+            raw in node_status_strategy(),
+            output in output_strategy(),
+            hit_max_iter in any::<bool>(),
+        ) {
+            let cfg = PollutionConfig::default();
+            let result = reconcile_node_status(raw, &output, hit_max_iter, &cfg);
+
+            // 参考 oracle：复用 contains_pollution_phrase 判定污染。
+            let polluted = contains_pollution_phrase(&output, &cfg);
+
+            // R2.1：正文含污染词 → 绝不 Success，且结果 ∈ {Failed, Blocked}。
+            if polluted {
+                prop_assert_ne!(result, NodeStatus::Success);
+                prop_assert!(
+                    result == NodeStatus::Failed || result == NodeStatus::Blocked,
+                    "polluted output must yield Failed or Blocked, got {:?}",
+                    result
+                );
+            }
+
+            // R2.2：撞顶且（正文空白或含污染词）→ Failed。
+            if hit_max_iter && (output.trim().is_empty() || polluted) {
+                prop_assert_eq!(result, NodeStatus::Failed);
+            }
+        }
+    }
 }

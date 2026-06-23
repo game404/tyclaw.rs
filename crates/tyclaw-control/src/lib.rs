@@ -25,7 +25,10 @@ pub mod rate_limiter;
 pub mod config;
 
 // 重新导出核心类型
-pub use audit::{AuditEntry, AuditLog};
+pub use audit::{
+    AuditEntry, AuditLog, FailureAuditEntry, FailureCode, resolve_priority,
+    slow_request_reason_distribution, warn_max_iterations_reset,
+};
 pub use config::ControlConfig;
 pub use gate::{ExecutionGate, Judgment, JudgmentAction};
 pub use rate_limiter::RateLimiter;

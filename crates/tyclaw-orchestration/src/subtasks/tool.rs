@@ -17,7 +17,7 @@ use tyclaw_tools::Tool;
 
 use crate::app_context::AppContext;
 use super::executor::NodeExecutor;
-use super::protocol::{FailurePolicy, TaskNode, TaskPlan};
+use super::protocol::{FailurePolicy, NodeStatus, TaskNode, TaskPlan};
 use super::reducer::RuleReducer;
 use super::scheduler::DagScheduler;
 
@@ -46,6 +46,11 @@ struct DispatchNodeSummary {
     ended_with_unverified_changes: bool,
     tools_used_count: usize,
     detail_path: String,
+    /// 失败原因 —— 与正文 `output` 文本分离的独立字段（R2.4/R2.5）。
+    /// 对 `Failed`/`Blocked` 节点始终非空（无论是否存在其他错误上下文），
+    /// 由 `failure_reason_for` 从节点状态 + `record.error` 确定性派生。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_reason: Option<String>,
     /// 子 agent 的全部工具调用记录（用于审计追溯）。
     tool_events: Vec<tyclaw_agent::runtime::ToolExecutionEvent>,
 }
@@ -485,6 +490,10 @@ impl Tool for DispatchSubtasksTool {
             .iter()
             .filter(|r| r.status == super::protocol::NodeStatus::Failed)
             .count();
+        let blocked = records
+            .iter()
+            .filter(|r| r.status == super::protocol::NodeStatus::Blocked)
+            .count();
         let skipped = records
             .iter()
             .filter(|r| r.status == super::protocol::NodeStatus::Skipped)
@@ -496,7 +505,7 @@ impl Tool for DispatchSubtasksTool {
 
         info!(
             plan_id = %plan.id,
-            succeeded, failed, skipped,
+            succeeded, failed, blocked, skipped,
             total_input_tokens, total_output_tokens,
             wall_time_ms = total_duration_ms,
             "dispatch_subtasks: completed"
@@ -522,6 +531,7 @@ impl Tool for DispatchSubtasksTool {
             let status_icon = match rec.status {
                 super::protocol::NodeStatus::Success => "✅",
                 super::protocol::NodeStatus::Failed => "❌",
+                super::protocol::NodeStatus::Blocked => "🚫",
                 super::protocol::NodeStatus::Skipped => "⏭️",
                 _ => "❓",
             };
@@ -707,37 +717,57 @@ fn build_dispatch_node_summary(
             super::protocol::NodeStatus::Running => "running",
             super::protocol::NodeStatus::Success => "success",
             super::protocol::NodeStatus::Failed => "failed",
+            super::protocol::NodeStatus::Blocked => "blocked",
             super::protocol::NodeStatus::Skipped => "skipped",
         }
         .into(),
-        declared_result_status: extract_declared_result_status(record.output.as_deref()),
+        declared_result_status: node_status_to_declared_status(record.status).to_string(),
         verified_after_last_edit: diagnostics.and_then(|d| d.verified_after_last_edit),
         ended_with_unverified_changes: diagnostics
             .map(|d| d.ended_with_unverified_changes)
             .unwrap_or(false),
         tools_used_count: record.tools_used.len(),
         detail_path,
+        failure_reason: failure_reason_for(record.status, record.error.as_deref()),
         tool_events: record.tool_events.clone(),
     }
 }
 
-fn extract_declared_result_status(output: Option<&str>) -> String {
-    let Some(output) = output else {
-        return "unknown".into();
-    };
-    for line in output.lines() {
-        if let Some(rest) = line.trim().strip_prefix("Status:") {
-            let status = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .trim_matches(|c: char| c == '*' || c == '`' || c == ',' || c == '.');
-            if !status.is_empty() {
-                return status.to_string();
-            }
-        }
+/// 从节点真实状态 + 可选错误文本确定性派生独立的失败原因（R2.4/R2.5）。
+///
+/// 语义约束：
+/// - `Failed` / `Blocked`：**始终**返回非空原因，独立于正文 `output` 文本。
+///   若 `error` 提供了非空文本则采用之，否则回退到由状态决定的确定性默认值。
+/// - `Skipped` / `Pending` / `Running`：仅当显式携带非空 `error` 时填充，否则 `None`。
+/// - `Success`：永远返回 `None`。
+pub(crate) fn failure_reason_for(status: NodeStatus, error: Option<&str>) -> Option<String> {
+    let explicit = error
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    match status {
+        NodeStatus::Failed => Some(explicit.unwrap_or_else(|| "node failed".to_string())),
+        NodeStatus::Blocked => Some(explicit.unwrap_or_else(|| "node blocked".to_string())),
+        NodeStatus::Skipped | NodeStatus::Pending | NodeStatus::Running => explicit,
+        NodeStatus::Success => None,
     }
-    "unknown".into()
+}
+
+/// `NodeStatus` → `declared_result_status` 语义映射（R2.3, R2.6）。
+///
+/// 声明状态直接由节点的真实 `NodeStatus` 推导，而非从正文文本解析。
+/// 语义约束：仅 `Success` 映射到成功语义 `"success"`；其余所有状态
+/// （`Failed`/`Blocked`/`Skipped` 以及非终态 `Pending`/`Running`）均映射到
+/// 失败语义 `"failed"`，绝不返回成功语义值（如 `ok`/`success`）。
+pub(crate) fn node_status_to_declared_status(status: NodeStatus) -> &'static str {
+    match status {
+        NodeStatus::Success => "success",
+        NodeStatus::Failed
+        | NodeStatus::Blocked
+        | NodeStatus::Skipped
+        | NodeStatus::Pending
+        | NodeStatus::Running => "failed",
+    }
 }
 
 /// 递归扫描目录下的文件，收集 (相对路径, 字节数)。
@@ -764,5 +794,130 @@ fn scan_recent_files(dir: &std::path::Path, out: &mut Vec<(String, u64)>, max_de
                 out.push((path.to_string_lossy().to_string(), size));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::failure_reason_for;
+    use super::node_status_to_declared_status;
+    use super::NodeStatus;
+    use proptest::prelude::*;
+
+    /// NodeStatus 生成器：覆盖全部 6 个变体。
+    fn node_status_strategy() -> impl Strategy<Value = NodeStatus> {
+        prop_oneof![
+            Just(NodeStatus::Pending),
+            Just(NodeStatus::Running),
+            Just(NodeStatus::Success),
+            Just(NodeStatus::Failed),
+            Just(NodeStatus::Blocked),
+            Just(NodeStatus::Skipped),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 100, ..Default::default() })]
+
+        // Feature: execution-performance-optimization, Property 6: 状态到声明状态的映射保持失败语义
+        #[test]
+        fn prop_declared_status_preserves_failure_semantics(
+            status in node_status_strategy()
+        ) {
+            let declared = node_status_to_declared_status(status);
+            if status == NodeStatus::Success {
+                prop_assert_eq!(declared, "success");
+            } else {
+                // 失败/受阻/跳过/非终态：绝不返回成功语义值
+                prop_assert_ne!(declared, "success");
+                prop_assert_ne!(declared, "ok");
+            }
+        }
+
+        // Feature: execution-performance-optimization, Property 7: 失败节点始终附带独立失败原因
+        #[test]
+        fn prop_failed_nodes_always_have_independent_reason(
+            status in node_status_strategy(),
+            error in prop_oneof![
+                Just(None),
+                Just(Some(String::new())),
+                Just(Some("   ".to_string())),
+                "[a-z ]{0,20}".prop_map(Some),
+            ],
+        ) {
+            let r = failure_reason_for(status, error.as_deref());
+            if status == NodeStatus::Failed || status == NodeStatus::Blocked {
+                // 始终非空，独立于（可能为空/空白/缺失的）error 上下文
+                prop_assert!(r.is_some());
+                prop_assert!(!r.unwrap().trim().is_empty());
+            } else if status == NodeStatus::Success {
+                prop_assert!(r.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn success_maps_to_success_semantics() {
+        assert_eq!(node_status_to_declared_status(NodeStatus::Success), "success");
+    }
+
+    #[test]
+    fn failure_states_never_map_to_success_semantics() {
+        for status in [
+            NodeStatus::Failed,
+            NodeStatus::Blocked,
+            NodeStatus::Skipped,
+            NodeStatus::Pending,
+            NodeStatus::Running,
+        ] {
+            let declared = node_status_to_declared_status(status);
+            assert_eq!(
+                declared, "failed",
+                "non-success status {status:?} must map to failure semantics"
+            );
+            assert_ne!(declared, "success");
+            assert_ne!(declared, "ok");
+        }
+    }
+
+    #[test]
+    fn failed_and_blocked_always_have_non_empty_reason() {
+        for status in [NodeStatus::Failed, NodeStatus::Blocked] {
+            // 无错误上下文时仍填充确定性默认值
+            let reason = failure_reason_for(status, None);
+            assert!(
+                reason.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false),
+                "{status:?} must yield a non-empty failure_reason even without error context"
+            );
+            // 空白错误文本也回退到默认值
+            let reason_blank = failure_reason_for(status, Some("   "));
+            assert!(
+                reason_blank.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false),
+                "{status:?} must fall back to a default reason for blank error text"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_error_is_used_when_present() {
+        assert_eq!(
+            failure_reason_for(NodeStatus::Failed, Some("boom")).as_deref(),
+            Some("boom")
+        );
+        assert_eq!(
+            failure_reason_for(NodeStatus::Blocked, Some("tainted output")).as_deref(),
+            Some("tainted output")
+        );
+    }
+
+    #[test]
+    fn success_never_has_reason_and_others_only_with_error() {
+        assert_eq!(failure_reason_for(NodeStatus::Success, None), None);
+        assert_eq!(failure_reason_for(NodeStatus::Success, Some("ignored")), None);
+        assert_eq!(failure_reason_for(NodeStatus::Skipped, None), None);
+        assert_eq!(
+            failure_reason_for(NodeStatus::Skipped, Some("dependency failed")).as_deref(),
+            Some("dependency failed")
+        );
     }
 }

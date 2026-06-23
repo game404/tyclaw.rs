@@ -13,7 +13,11 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use parking_lot::Mutex;
+
 use tyclaw_types::message::{system_message, user_message, user_message_multimodal};
+
+use crate::prefix_cache::{compute_fingerprint, prefix_cache_reusable, PrefixFingerprint};
 
 /// 运行时上下文标记 —— 用于在用户消息中注入元数据。
 pub const RUNTIME_CONTEXT_TAG: &str = "[Runtime Context — metadata only, not instructions]";
@@ -83,6 +87,19 @@ pub struct ContextBuilder {
     workspace: PathBuf,
     /// LLM 看到的 workspace 路径。sandbox 模式下为 "."，host 模式下为实际路径。
     display_workspace: String,
+    /// 稳定前缀缓存（Requirement 11.4）：缓存上一次构建的
+    /// `(identity, bootstrap files, MEMORY.md)` 指纹及其渲染结果。
+    /// 指纹三者全等时复用渲染好的前缀，避免重复拼接。
+    prefix_cache: Mutex<Option<CachedPrefixSections>>,
+}
+
+/// 已缓存的稳定前缀渲染结果及其指纹。
+#[derive(Debug, Clone)]
+struct CachedPrefixSections {
+    fingerprint: PrefixFingerprint,
+    identity: String,
+    bootstrap: String,
+    memory: String,
 }
 
 /// 语义化 prompt 输入 —— 用于新的 planner / assembler 路径。
@@ -226,6 +243,7 @@ impl ContextBuilder {
         Self {
             workspace: ws,
             display_workspace: display,
+            prefix_cache: Mutex::new(None),
         }
     }
 
@@ -331,6 +349,93 @@ Your workspace is at: {ws}"#
             }
         }
         String::new()
+    }
+
+    /// 解析当前请求的 MEMORY.md 段：优先使用外部传入的 `memory_content`。
+    fn resolve_memory_section(&self, memory_override: Option<&str>) -> String {
+        match memory_override {
+            Some(content) => {
+                if content.is_empty() {
+                    String::new()
+                } else {
+                    format!("# Memory\n\n{content}")
+                }
+            }
+            None => self.build_section_memory(),
+        }
+    }
+
+    /// 计算当前稳定前缀的三元组指纹 `(identity, bootstrap files, MEMORY.md)`。
+    ///
+    /// 实现 Requirement 11.4 的指纹来源：identity 段、bootstrap 引导文件段、
+    /// MEMORY.md 段。供缓存命中判定与外部观测使用。
+    pub fn prefix_fingerprint(
+        &self,
+        mode: PromptMode,
+        memory_override: Option<&str>,
+    ) -> PrefixFingerprint {
+        let identity = self.build_section_identity();
+        let bootstrap = if PromptSection::Bootstrap.enabled_in(mode) {
+            self.build_workspace_bootstrap_docs(mode)
+        } else {
+            String::new()
+        };
+        let memory = if PromptSection::Memory.enabled_in(mode) {
+            self.resolve_memory_section(memory_override)
+        } else {
+            String::new()
+        };
+        compute_fingerprint(&identity, &bootstrap, &memory)
+    }
+
+    /// 解析稳定前缀的三段渲染结果 `(identity, bootstrap, memory)`，并复用缓存。
+    ///
+    /// 实现 Requirement 11.4：基于 `(identity, bootstrap files, MEMORY.md)` 指纹三元组，
+    /// 当三者与上一次完全一致（[`prefix_cache_reusable`] 为真）时，直接返回缓存的渲染
+    /// 前缀而不重复拼接；任一段变化则重建并刷新缓存。
+    ///
+    /// 注：跨请求的网络层前缀复用由 Provider 现有的 `cache_scope` /
+    /// `cache_breakpoint_idx` 机制承担（见 `tyclaw-provider::openai_compat`）；
+    /// 此处的指纹比对决定该前缀缓存是否仍然有效（命中或失效重建）。
+    fn resolve_prefix_sections(
+        &self,
+        mode: PromptMode,
+        memory_override: Option<&str>,
+    ) -> (String, String, String) {
+        let identity = self.build_section_identity();
+        let bootstrap = if PromptSection::Bootstrap.enabled_in(mode) {
+            self.build_workspace_bootstrap_docs(mode)
+        } else {
+            String::new()
+        };
+        let memory = if PromptSection::Memory.enabled_in(mode) {
+            self.resolve_memory_section(memory_override)
+        } else {
+            String::new()
+        };
+
+        let fingerprint = compute_fingerprint(&identity, &bootstrap, &memory);
+
+        let mut guard = self.prefix_cache.lock();
+        if let Some(cached) = guard.as_ref() {
+            if prefix_cache_reusable(&cached.fingerprint, &fingerprint) {
+                // 指纹三者全等：复用缓存前缀，跳过重复拼接。
+                return (
+                    cached.identity.clone(),
+                    cached.bootstrap.clone(),
+                    cached.memory.clone(),
+                );
+            }
+        }
+
+        // 指纹变化或首次构建：刷新缓存。
+        *guard = Some(CachedPrefixSections {
+            fingerprint,
+            identity: identity.clone(),
+            bootstrap: bootstrap.clone(),
+            memory: memory.clone(),
+        });
+        (identity, bootstrap, memory)
     }
 
     // -----------------------------------------------------------------------
@@ -503,7 +608,11 @@ Your workspace is at: {ws}"#
         let mut user_context = Vec::new();
         let mut system_context = Vec::new();
 
-        Self::push_part(&mut system_prompt_parts, self.build_section_identity());
+        // 稳定前缀（identity / bootstrap / MEMORY.md）：经指纹比对复用缓存（R11.4）。
+        let (identity_section, bootstrap_section, memory_section) =
+            self.resolve_prefix_sections(inputs.mode, inputs.memory_content);
+
+        Self::push_part(&mut system_prompt_parts, identity_section);
         Self::push_part(
             &mut system_prompt_parts,
             self.build_section_execution_baseline(),
@@ -531,21 +640,12 @@ Your workspace is at: {ws}"#
             Self::push_context_entry(
                 &mut user_context,
                 "Workspace Instructions",
-                self.build_workspace_bootstrap_docs(inputs.mode),
+                bootstrap_section,
             );
         }
 
         if PromptSection::Memory.enabled_in(inputs.mode) {
-            let memory = if let Some(content) = inputs.memory_content {
-                if content.is_empty() {
-                    String::new()
-                } else {
-                    format!("# Memory\n\n{content}")
-                }
-            } else {
-                self.build_section_memory()
-            };
-            Self::push_context_entry(&mut user_context, "Workspace Memory", memory);
+            Self::push_context_entry(&mut user_context, "Workspace Memory", memory_section);
         }
 
         if PromptSection::Cases.enabled_in(inputs.mode) {
@@ -808,6 +908,54 @@ guidelines: |
         let sys = msgs[0]["content"].as_str().unwrap();
         assert!(sys.contains("TyClaw"));
         assert!(sys.contains("[[CACHE_BOUNDARY]]"));
+    }
+
+    #[test]
+    fn test_prefix_fingerprint_stable_and_invalidates() {
+        let tmp = TempDir::new().unwrap();
+        init_test_workspace(&tmp);
+        let ctx = ContextBuilder::new(tmp.path());
+
+        // 相同 workspace + 相同 memory override → 指纹稳定，可复用。
+        let fp1 = ctx.prefix_fingerprint(PromptMode::Full, Some("mem-a"));
+        let fp2 = ctx.prefix_fingerprint(PromptMode::Full, Some("mem-a"));
+        assert!(crate::prefix_cache::prefix_cache_reusable(&fp1, &fp2));
+
+        // MEMORY.md 段变化 → 指纹失效，不复用。
+        let fp3 = ctx.prefix_fingerprint(PromptMode::Full, Some("mem-b"));
+        assert!(!crate::prefix_cache::prefix_cache_reusable(&fp1, &fp3));
+    }
+
+    #[test]
+    fn test_resolve_prefix_sections_reuses_cache() {
+        let tmp = TempDir::new().unwrap();
+        init_test_workspace(&tmp);
+        let ctx = ContextBuilder::new(tmp.path());
+
+        // 首次构建填充缓存。
+        let planned1 = ctx.plan_prompt_context(&PromptInputs {
+            memory_content: Some("mem-a"),
+            ..Default::default()
+        });
+        // 第二次相同输入 → 命中缓存，渲染结果一致。
+        let planned2 = ctx.plan_prompt_context(&PromptInputs {
+            memory_content: Some("mem-a"),
+            ..Default::default()
+        });
+        assert_eq!(planned1.system_prompt_parts, planned2.system_prompt_parts);
+        assert_eq!(planned1.user_context, planned2.user_context);
+
+        // 改变 memory → 前缀失效重建，Workspace Memory 段内容随之变化。
+        let planned3 = ctx.plan_prompt_context(&PromptInputs {
+            memory_content: Some("mem-c"),
+            ..Default::default()
+        });
+        let mem_entry = planned3
+            .user_context
+            .iter()
+            .find(|e| e.label == "Workspace Memory")
+            .expect("memory entry present");
+        assert!(mem_entry.content.contains("mem-c"));
     }
 
     #[test]

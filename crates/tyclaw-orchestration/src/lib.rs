@@ -38,6 +38,12 @@ pub mod bus;
 /// 历史消息处理（去重、裁剪、配对修复）
 pub(crate) mod history;
 
+/// 会话历史污染识别与剔除（Pollution Filter）
+pub mod pollution_filter;
+
+/// 空结果任务快速返回（Empty Result Fast Return）
+pub mod empty_result;
+
 /// 编排器辅助函数（技能路由、案例优化、预算计算）
 pub(crate) mod helpers;
 
@@ -57,9 +63,25 @@ pub mod term;
 pub use app_context::AppContext;
 pub use builder::OrchestratorBuilder;
 pub use bus::{BusHandle, InboundMessage, MessageBus, OutboundEvent};
-pub use config::{load_yaml, mask_secret, BaseConfig, LlmConfig, LoggingConfig, WorkspaceRuntimeConfig};
+pub use config::{
+    load_yaml, mask_secret, BaseConfig, ConcurrencyConfig, ConsolidationConfig, EmptyResultConfig,
+    LlmConfig, LoggingConfig, PerformanceConfig, PollutionConfig, SizeLimitConfig, SseConfig,
+    SubtaskTimeoutConfig, TruncationConfig, WorkspaceRuntimeConfig,
+};
+pub use empty_result::{
+    is_empty_result, plan_empty_result, run_query_pipeline, EmptyResultDecision, PipelineOutcome,
+    NO_MATCHING_DATA_MESSAGE,
+};
 pub use orchestrator::Orchestrator;
-pub use session_manager::{Session, SessionManager};
+pub use pollution_filter::{
+    build_pollution_audit, contains_pollution_phrase, filter_pollution, filter_pollution_audited,
+    is_pollution_candidate, PollutionAuditRecord, PollutionFilterResult,
+    POLLUTION_PLACEHOLDER_MARKER,
+};
+pub use session_manager::{
+    build_size_limit_audit, Session, SessionManager, SizeLimitAction, SizeLimitActionKind,
+    SizeLimitAuditRecord, SizeLimitTrigger,
+};
 pub use skill_manager::SkillManager;
 pub use tyclaw_agent::runtime::{parse_thinking_prefix, OnProgress, ProgressEvent};
 pub use tyclaw_control::ControlConfig;

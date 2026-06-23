@@ -32,6 +32,18 @@ pub mod timer;
 /// Web 工具 —— web_search 搜索 + web_fetch 内容抓取
 pub mod web;
 
+/// 步骤级 TTL 缓存 —— 长链路 Skill 可缓存中间结果的复用
+pub mod step_cache;
+
+/// 分段返回排序 —— 长链路任务「文本先于附件」的稳定分区
+pub mod segment;
+
+/// 沙盒环境约束预检 —— 写前可写性 / 配置可达性预检，per-turn 短路重复探查
+pub mod precheck;
+
+/// 工具输出截断限制配置 —— exec / grep_search 头尾双段截断的可配置上限
+pub mod truncation;
+
 // 重新导出核心类型
 pub use base::{RiskLevel, Tool};
 pub use executor::{
@@ -45,6 +57,15 @@ pub use filesystem::{
 pub use interaction::AskUserTool;
 pub use registry::ToolRegistry;
 pub use shell::ExecTool;
+pub use step_cache::{CachedValue, StepCache};
+pub use truncation::{
+    current_truncation_limits, init_truncation_limits, TruncationLimits, DEFAULT_TAIL_RATIO,
+    DEFAULT_TRUNCATE_CHARS, TRUNCATE_FLOOR_CHARS,
+};
+pub use segment::{order_segments, take_completed, Attachment, AttachmentKind, ResultSegment};
+pub use precheck::{
+    config_missing_error, readonly_error, PrecheckState, CONFIG_MISSING_PREFIX, READONLY_PREFIX,
+};
 pub use timer::TimerTool;
 pub use tyclaw_tool_abi::{
     AllowAllGate, GatePolicy, PathMount, Sandbox, SandboxDirEntry, SandboxExecResult, SandboxPool,

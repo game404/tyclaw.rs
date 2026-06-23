@@ -6,9 +6,113 @@
 //!
 //! SKILL.md 格式：YAML frontmatter + Markdown 正文
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use parking_lot::Mutex;
 use tracing::info;
+
+// ============================================================================
+// Skill 路径稳定解析（R8.5 / Property 25）
+//
+// 定时触发的 Skill 在目录重组（父目录变动）后仍需被稳定定位。核心做法：
+// 用 Skill 的「稳定标识」（SKILL.md 所在目录名，即技能目录的 basename）而非
+// 硬编码绝对路径来匹配；并支持别名映射与 glob 模式匹配。
+//
+// 这些函数均为纯函数（不触碰文件系统），便于属性测试（task 11.4）驱动。
+// ============================================================================
+
+/// 提取一个路径的「Skill 稳定标识」——即技能目录的最后一段名称。
+///
+/// - 若 `path` 指向 `SKILL.md` 文件，则取其父目录名。
+/// - 否则取该路径本身的最后一段名称（视为技能目录）。
+///
+/// 该标识独立于父目录位置：`a/b/ga-query` 与 `x/skills/data/ga-query`
+/// 的标识均为 `ga-query`，因此路径变动时标识不变。
+pub fn skill_identity(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy().to_string();
+    if name.eq_ignore_ascii_case("SKILL.md") {
+        path.parent()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().to_string())
+    } else {
+        Some(name)
+    }
+}
+
+/// 为某 Skill 名构造稳定 glob 模式，匹配任意父目录下的该技能目录或其 SKILL.md。
+///
+/// 返回的模式形如 `**/{skill}` —— 用于 `skill_path_matches_glob` 做路径匹配。
+pub fn stable_skill_glob(skill_name: &str) -> String {
+    format!("**/{}", skill_name)
+}
+
+/// 用 glob 模式匹配某路径是否命中目标技能（纯函数）。
+///
+/// 同时尝试匹配「技能目录路径」（`**/skill`）与「SKILL.md 路径」
+/// （`**/skill/SKILL.md`）以及无父目录的裸名（`skill`），使路径变动仍命中。
+pub fn skill_path_matches_glob(pattern: &str, path: &Path) -> bool {
+    // 直接用给定 pattern 匹配
+    if glob_matches(pattern, path) {
+        return true;
+    }
+    // 衍生：pattern/SKILL.md 也视为命中（候选可能指向 SKILL.md 文件）
+    let with_md = format!("{}/SKILL.md", pattern.trim_end_matches('/'));
+    if glob_matches(&with_md, path) {
+        return true;
+    }
+    // 衍生：去掉前导 `**/`，匹配无父目录的裸技能名
+    if let Some(bare) = pattern.strip_prefix("**/") {
+        if glob_matches(bare, path) || glob_matches(&format!("{}/SKILL.md", bare), path) {
+            return true;
+        }
+    }
+    false
+}
+
+fn glob_matches(pattern: &str, path: &Path) -> bool {
+    match glob::Pattern::new(pattern) {
+        Ok(p) => p.matches_path(path),
+        Err(_) => false,
+    }
+}
+
+/// 在候选路径集合中稳定解析目标 Skill，返回命中的候选路径。
+///
+/// 解析顺序（路径变动/目录重组后仍命中）：
+/// 1. 别名归一：若 `name_or_alias` 命中 `aliases`，替换为其规范技能名。
+/// 2. 稳定标识匹配：候选的 [`skill_identity`] 与规范名不区分大小写相等即命中。
+/// 3. glob 兜底：以 `**/{规范名}` 模式匹配候选路径（含其 SKILL.md 变体）。
+///
+/// 返回首个命中的候选路径（保持候选切片中的顺序）。无命中返回 `None`。
+pub fn resolve_skill_path(
+    name_or_alias: &str,
+    candidates: &[PathBuf],
+    aliases: &HashMap<String, String>,
+) -> Option<PathBuf> {
+    let canonical = aliases
+        .get(name_or_alias)
+        .cloned()
+        .unwrap_or_else(|| name_or_alias.to_string());
+
+    // 1) 稳定标识匹配（与父目录位置无关）
+    for cand in candidates {
+        if let Some(id) = skill_identity(cand) {
+            if id.eq_ignore_ascii_case(&canonical) {
+                return Some(cand.clone());
+            }
+        }
+    }
+
+    // 2) glob 兜底
+    let pattern = stable_skill_glob(&canonical);
+    for cand in candidates {
+        if skill_path_matches_glob(&pattern, cand) {
+            return Some(cand.clone());
+        }
+    }
+
+    None
+}
 
 /// 技能元数据。
 #[derive(Debug, Clone)]
@@ -535,5 +639,148 @@ mod tests {
         let tp = s.tool_path().unwrap();
         let expected = skill_dir.join("tool.py").to_string_lossy().to_string();
         assert_eq!(tp, expected, "tool_path should resolve relative to skill_dir");
+    }
+
+    // ---- Skill 路径稳定解析（R8.5 / Property 25）单元测试 ----
+
+    #[test]
+    fn test_skill_identity_from_dir_and_md() {
+        assert_eq!(
+            skill_identity(&PathBuf::from("a/b/skills/data/ga-query")).as_deref(),
+            Some("ga-query")
+        );
+        assert_eq!(
+            skill_identity(&PathBuf::from("x/y/ga-query/SKILL.md")).as_deref(),
+            Some("ga-query")
+        );
+        // 大小写保留，但 SKILL.md 识别不区分大小写
+        assert_eq!(
+            skill_identity(&PathBuf::from("p/ga-query/skill.md")).as_deref(),
+            Some("ga-query")
+        );
+    }
+
+    #[test]
+    fn test_resolve_hits_after_path_change() {
+        // 同一技能在目录重组前后的两个路径变体
+        let old = PathBuf::from("workspace/skills/data/daily-report");
+        let new = PathBuf::from("workspace/skills/scheduled/reports/daily-report");
+        let aliases = HashMap::new();
+
+        // 旧路径集合命中
+        assert_eq!(
+            resolve_skill_path("daily-report", &[old.clone()], &aliases),
+            Some(old.clone())
+        );
+        // 目录重组后（仅 new 存在）仍命中
+        assert_eq!(
+            resolve_skill_path("daily-report", &[new.clone()], &aliases),
+            Some(new)
+        );
+    }
+
+    #[test]
+    fn test_resolve_via_alias() {
+        let mut aliases = HashMap::new();
+        aliases.insert("report".to_string(), "daily-report".to_string());
+        let cand = PathBuf::from("a/b/daily-report");
+        assert_eq!(
+            resolve_skill_path("report", &[cand.clone()], &aliases),
+            Some(cand)
+        );
+    }
+
+    #[test]
+    fn test_resolve_skill_md_candidate() {
+        let cand = PathBuf::from("deep/nested/dir/daily-report/SKILL.md");
+        let aliases = HashMap::new();
+        assert_eq!(
+            resolve_skill_path("daily-report", &[cand.clone()], &aliases),
+            Some(cand)
+        );
+    }
+
+    #[test]
+    fn test_resolve_no_match() {
+        let aliases = HashMap::new();
+        let cand = PathBuf::from("a/b/other-skill");
+        assert_eq!(resolve_skill_path("daily-report", &[cand], &aliases), None);
+    }
+
+    #[test]
+    fn test_glob_matches_variants() {
+        let pat = stable_skill_glob("daily-report");
+        assert_eq!(pat, "**/daily-report");
+        assert!(skill_path_matches_glob(
+            &pat,
+            &PathBuf::from("a/b/c/daily-report")
+        ));
+        assert!(skill_path_matches_glob(
+            &pat,
+            &PathBuf::from("a/b/daily-report/SKILL.md")
+        ));
+        // 裸技能名（无父目录）仍命中
+        assert!(skill_path_matches_glob(&pat, &PathBuf::from("daily-report")));
+        assert!(!skill_path_matches_glob(
+            &pat,
+            &PathBuf::from("a/b/other-report")
+        ));
+    }
+}
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 100, ..Default::default() })]
+
+        // Feature: execution-performance-optimization, Property 25: Skill 路径稳定解析命中变体
+        // Validates: Requirements 8.5
+        #[test]
+        fn prop_skill_path_resolution_hits_variant(
+            // 技能名：与 prefix 段使用不同字符集（含 `-`），避免歧义；非空。
+            name in "[a-z][a-z0-9-]{0,15}",
+            // 随机父目录前缀：0..5 段，每段 1..8 个 [a-z0-9_]。
+            prefix in proptest::collection::vec("[a-z0-9_]{1,8}", 0..5),
+            // 候选是否以 /SKILL.md 结尾（指向 SKILL.md 文件而非技能目录）。
+            ends_with_md in any::<bool>(),
+        ) {
+            // 构造候选路径变体：prefix 段 + name (+ /SKILL.md)
+            let mut parts: Vec<String> = prefix.clone();
+            parts.push(name.clone());
+            if ends_with_md {
+                parts.push("SKILL.md".to_string());
+            }
+            let candidate = PathBuf::from(parts.join("/"));
+
+            // 候选的稳定标识应（不区分大小写）等于技能名，独立于父目录变动。
+            let identity = skill_identity(&candidate);
+            prop_assert!(
+                identity.as_deref().map(|s| s.eq_ignore_ascii_case(&name)).unwrap_or(false),
+                "skill_identity({:?}) = {:?}, expected case-insensitive match with {:?}",
+                candidate, identity, name
+            );
+
+            // 无别名：按技能名解析应命中该路径变体。
+            let empty: HashMap<String, String> = HashMap::new();
+            prop_assert_eq!(
+                resolve_skill_path(&name, &[candidate.clone()], &empty),
+                Some(candidate.clone()),
+                "resolve by name failed for variant {:?}",
+                candidate
+            );
+
+            // 别名变体：别名 alias_x -> name，按别名解析应命中同一规范技能候选。
+            let mut aliases: HashMap<String, String> = HashMap::new();
+            aliases.insert("alias_x".to_string(), name.clone());
+            prop_assert_eq!(
+                resolve_skill_path("alias_x", &[candidate.clone()], &aliases),
+                Some(candidate.clone()),
+                "resolve by alias failed for variant {:?}",
+                candidate
+            );
+        }
     }
 }

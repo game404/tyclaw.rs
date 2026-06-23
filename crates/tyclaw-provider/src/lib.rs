@@ -10,6 +10,9 @@ pub mod types;
 /// Provider trait 模块 —— 定义 LLM 调用接口和自动重试逻辑
 pub mod provider;
 
+/// 并发控制器 —— 全局 + 单用户两级并发闸门与排队超时（R6）
+pub mod concurrency;
+
 /// OpenAI 兼容 HTTP 实现 —— 支持 OpenAI、Anthropic（通过代理）、Azure 等
 pub mod openai_compat;
 
@@ -17,7 +20,16 @@ pub mod openai_compat;
 pub mod reasoning;
 
 // 重新导出核心类型
-pub use openai_compat::OpenAICompatProvider;
-pub use provider::{LLMProvider, init_concurrency};
+pub use concurrency::{
+    acquire_permit, controller, init_concurrency_controller, ConcurrencyConfig,
+    ConcurrencyController, ConcurrencyError, LimitKind, Permit,
+};
+pub use openai_compat::{
+    current_sse_config, effective_chunk_timeout, init_sse_config, OpenAICompatProvider, SseConfig,
+};
+pub use provider::{
+    build_retry_later_message, init_concurrency, retry_exhausted_response, LLMProvider,
+    CURRENT_USER_ID, RETRY_LATER_MESSAGE,
+};
 pub use reasoning::{parse_reasoning, ParsedReasoning, ReasoningBlock};
 pub use types::{ChatRequest, GenerationSettings, LLMResponse, ThinkingConfig, ToolCallRequest};

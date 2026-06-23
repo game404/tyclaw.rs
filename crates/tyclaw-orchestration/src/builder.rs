@@ -43,6 +43,7 @@ pub struct OrchestratorBuilder {
     pub(crate) control_config: Option<tyclaw_control::ControlConfig>,
     pub(crate) workspace_key_strategy: tyclaw_control::WorkspaceKeyStrategy,
     pub(crate) path_config: tyclaw_control::PathConfig,
+    pub(crate) performance: Option<crate::config::PerformanceConfig>,
 }
 
 impl OrchestratorBuilder {
@@ -63,6 +64,7 @@ impl OrchestratorBuilder {
             control_config: None,
             workspace_key_strategy: tyclaw_control::WorkspaceKeyStrategy::default(),
             path_config: tyclaw_control::PathConfig::default(),
+            performance: None,
         }
     }
 
@@ -180,6 +182,15 @@ impl OrchestratorBuilder {
         self
     }
 
+    /// 注入统一性能治理配置（污染过滤 / 会话规模 / 截断 / 并发 / 超时 等）。
+    ///
+    /// 未注入时使用 [`PerformanceConfig::default`]（取需求默认阈值）。
+    /// 全链路注入由 main.rs（任务 19.1）调用。
+    pub fn with_performance(mut self, config: crate::config::PerformanceConfig) -> Self {
+        self.performance = Some(config);
+        self
+    }
+
     pub fn build(self) -> Orchestrator {
         let Self {
             provider,
@@ -197,6 +208,7 @@ impl OrchestratorBuilder {
             control_config,
             workspace_key_strategy,
             path_config,
+            performance,
         } = self;
 
         // 初始化 nudge 提示词加载器（从 config/prompts/nudges/ 加载）
@@ -205,6 +217,10 @@ impl OrchestratorBuilder {
         let control = control_config.unwrap_or_default();
         let actual_model = model.unwrap_or_else(|| provider.default_model().to_string());
         let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+
+        // 性能治理配置：未注入时取需求默认值，并执行加载时 clamp（截断下限 / 并发下限 / node 超时上限）。
+        let mut performance = performance.unwrap_or_default();
+        performance.clamp();
 
         // control.yaml 驱动 features 开关
         let features = OrchestratorFeatures {
@@ -220,6 +236,7 @@ impl OrchestratorBuilder {
             write_snapshot,
             ctx_window,
             features.clone(),
+            performance,
         );
 
         // 初始化 prompt 路径变量替换

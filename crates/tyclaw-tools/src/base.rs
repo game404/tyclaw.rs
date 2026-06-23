@@ -116,6 +116,44 @@ pub fn brief_basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// 头尾双段截断：保留头部段 + 尾部段，总字符数 <= `max_chars`，
+/// 尾部段 >= `max_chars * tail_ratio`（默认建议 0.25）。
+/// 中间插入截断标记，标明被省略的中间字符数。
+/// 输入字符数 <= `max_chars` 时原样返回，不附加任何截断标记。
+///
+/// 说明：
+/// - 全程按字符（`char`）而非字节计数，多字节 UTF-8 安全。
+/// - `tail_ratio` 会被 clamp 到 `[0.0, 1.0]`，防止尾段长度越界。
+/// - 头部段长度为 `max_chars - tail_len`，因此保留头尾字符总数恰为 `max_chars`（<= 上限）。
+pub fn truncate_head_tail(text: &str, max_chars: usize, tail_ratio: f64) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len();
+
+    // 未超上限：恒等返回，不加标记（R5.6）。
+    if total <= max_chars {
+        return text.to_string();
+    }
+
+    // 尾段长度 = ceil(max_chars * ratio)，clamp 到 [0, max_chars]，保证 head_len 不下溢。
+    let ratio = if tail_ratio.is_finite() {
+        tail_ratio.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let tail_len = ((max_chars as f64) * ratio).ceil() as usize;
+    let tail_len = tail_len.min(max_chars);
+    let head_len = max_chars - tail_len;
+
+    // 被省略的中间字符数 = 原字符数 - 保留头尾段字符数（R5.4）。
+    let omitted = total - head_len - tail_len;
+
+    let head: String = chars[..head_len].iter().collect();
+    let tail: String = chars[total - tail_len..].iter().collect();
+    let marker = format!("\n... (truncated, {omitted} chars omitted) ...\n");
+
+    format!("{head}{marker}{tail}")
+}
+
 /// 根据 JSON Schema 中声明的属性类型，自动转换参数类型。
 ///
 /// LLM 有时会把数字或布尔值以字符串形式传递（如 "42"、"true"），
@@ -201,6 +239,7 @@ pub fn validate_params(params: &HashMap<String, Value>, schema: &Value) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::json;
 
     /// 测试：字符串参数转换为整数
@@ -248,5 +287,176 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("path".into(), json!("/tmp/test"));
         assert_eq!(validate_params(&params, &schema), None);
+    }
+
+    /// 测试：未超上限时 truncate_head_tail 为恒等操作（R5.6）
+    #[test]
+    fn test_truncate_head_tail_identity_under_limit() {
+        let s = "hello world";
+        assert_eq!(truncate_head_tail(s, 100, 0.25), s);
+        // 恰好等于上限也应原样返回
+        assert_eq!(truncate_head_tail(s, s.chars().count(), 0.25), s);
+        assert!(!truncate_head_tail(s, 100, 0.25).contains("truncated"));
+    }
+
+    /// 测试：超上限时保留头尾两段、总量受限且尾段达比例（R5.3）
+    #[test]
+    fn test_truncate_head_tail_keeps_head_and_tail() {
+        let s: String = "abcdefghij".repeat(10); // 100 chars
+        let out = truncate_head_tail(&s, 40, 0.25);
+        // 头部以原文开头、尾部以原文结尾
+        assert!(out.starts_with("abcde"));
+        assert!(out.ends_with("ghij"));
+        assert!(out.contains("truncated"));
+        // 头(30) + 尾(10) = 40，尾段 >= 40 * 0.25 = 10
+        let kept: usize = 30 + 10;
+        let omitted = 100 - kept;
+        assert!(out.contains(&format!("{omitted} chars omitted")));
+    }
+
+    /// 测试：截断标记标明正确的省略字符数（R5.4）
+    #[test]
+    fn test_truncate_head_tail_omitted_count() {
+        let s: String = "x".repeat(50);
+        let max = 20;
+        let out = truncate_head_tail(&s, max, 0.25);
+        // tail_len = ceil(20 * 0.25) = 5, head_len = 15, omitted = 50 - 20 = 30
+        assert!(out.contains("30 chars omitted"));
+    }
+
+    /// 测试：多字节 UTF-8 不会触发边界 panic 且按字符计数（R5.3）
+    #[test]
+    fn test_truncate_head_tail_utf8_safe() {
+        let s: String = "建".repeat(40); // 40 个多字节字符
+        let out = truncate_head_tail(&s, 16, 0.25);
+        assert!(out.contains("truncated"));
+        // tail_len = ceil(16*0.25)=4, head_len=12, omitted = 40-16 = 24
+        assert!(out.contains("24 chars omitted"));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 100, ..Default::default() })]
+
+        // Feature: execution-performance-optimization, Property 19: 头尾双段截断满足总量与尾段比例约束
+        #[test]
+        fn prop_truncate_head_tail_total_and_tail_ratio(
+            // 字符集合含多字节 UTF-8（ASCII、中文、emoji），构造任意文本。
+            text in proptest::collection::vec(
+                prop_oneof![
+                    proptest::char::range('a', 'z'),
+                    Just('建'),
+                    Just('字'),
+                    Just('🚀'),
+                    Just('\n'),
+                ],
+                0..16000usize,
+            ).prop_map(|cs| cs.into_iter().collect::<String>()),
+            max_chars in 8000usize..=12000usize,
+        ) {
+            let tail_ratio = 0.25_f64;
+            let out = truncate_head_tail(&text, max_chars, tail_ratio);
+            let total = text.chars().count();
+
+            // 仅在超过上限、实际触发截断时检查约束。
+            if total > max_chars {
+                // 复现函数内部分段逻辑：尾段 = ceil(max*ratio)，头段 = max - 尾段。
+                let tail_len = ((max_chars as f64) * tail_ratio).ceil() as usize;
+                let tail_len = tail_len.min(max_chars);
+                let head_len = max_chars - tail_len;
+                let omitted = total - head_len - tail_len;
+
+                // 从输出中剥离截断标记，余下即为保留的头尾两段。
+                let marker = format!("\n... (truncated, {omitted} chars omitted) ...\n");
+                let stripped = out.replacen(&marker, "", 1);
+                let kept = stripped.chars().count();
+
+                // 约束 1：保留总量（不含标记）<= 上限。
+                prop_assert_eq!(kept, head_len + tail_len);
+                prop_assert!(kept <= max_chars);
+
+                // 约束 2：尾段字符数 >= max_chars * 0.25。
+                let min_tail = (max_chars as f64 * tail_ratio).floor() as usize;
+                prop_assert!(tail_len >= min_tail);
+                prop_assert!((tail_len as f64) >= max_chars as f64 * tail_ratio - 1.0);
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 100, ..Default::default() })]
+
+        // Feature: execution-performance-optimization, Property 20: 截断标记标明正确的省略字符数
+        #[test]
+        fn prop_truncate_head_tail_omitted_count(
+            // 字符集合含多字节 UTF-8（ASCII、中文、emoji），构造任意文本。
+            text in proptest::collection::vec(
+                prop_oneof![
+                    proptest::char::range('a', 'z'),
+                    Just('建'),
+                    Just('字'),
+                    Just('🚀'),
+                    Just('\n'),
+                ],
+                0..16000usize,
+            ).prop_map(|cs| cs.into_iter().collect::<String>()),
+            max_chars in 8000usize..=12000usize,
+        ) {
+            let tail_ratio = 0.25_f64;
+            let out = truncate_head_tail(&text, max_chars, tail_ratio);
+            let total = text.chars().count();
+
+            // 仅在超过上限、实际触发截断时检查省略字符数标记。
+            if total > max_chars {
+                // 复现函数内部分段逻辑：尾段 = ceil(max*ratio)，头段 = max - 尾段。
+                let tail_len = ((max_chars as f64) * tail_ratio).ceil() as usize;
+                let tail_len = tail_len.min(max_chars);
+                let head_len = max_chars - tail_len;
+
+                // 省略中间字符数 = 原字符数 - 保留头尾段字符数（R5.4）。
+                let omitted = total - (head_len + tail_len);
+
+                // 输出须在头尾段间插入截断标记，并标明精确的省略字符数。
+                let expected_marker = format!("\n... (truncated, {omitted} chars omitted) ...\n");
+                prop_assert!(
+                    out.contains(&expected_marker),
+                    "output missing expected truncation marker: {expected_marker:?}"
+                );
+                // 标记标明的省略数等于 (原字符数 - 保留头尾段字符数)。
+                let omitted_substr = format!("{omitted} chars omitted");
+                prop_assert!(out.contains(&omitted_substr));
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 100, ..Default::default() })]
+
+        // Feature: execution-performance-optimization, Property 21: 未超上限时截断为恒等操作
+        #[test]
+        fn prop_truncate_head_tail_identity_under_limit(
+            // 字符集合含多字节 UTF-8（ASCII、中文、emoji），构造任意文本。
+            text in proptest::collection::vec(
+                prop_oneof![
+                    proptest::char::range('a', 'z'),
+                    Just('建'),
+                    Just('字'),
+                    Just('🚀'),
+                    Just('\n'),
+                ],
+                0..2000usize,
+            ).prop_map(|cs| cs.into_iter().collect::<String>()),
+            // 额外余量 0..=500，确保 max_chars >= 字符数（未超上限）。
+            slack in 0usize..=500usize,
+        ) {
+            let char_count = text.chars().count();
+            let max_chars = char_count + slack;
+
+            let out = truncate_head_tail(&text, max_chars, 0.25);
+
+            // 未超上限：输出与输入逐字符相等（恒等操作）。
+            prop_assert_eq!(&out, &text);
+            // 未超上限：不附加任何截断标记。
+            prop_assert!(!out.contains("truncated"));
+        }
     }
 }

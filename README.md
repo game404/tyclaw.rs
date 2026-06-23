@@ -192,6 +192,13 @@ APT_MIRROR=mirrors.aliyun.com PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simp
 
 Python 依赖通过 `docker/sandbox/requirements.txt` 管理，新增包只需编辑该文件后重新构建。
 
+重建镜像后可运行依赖预装烟雾测试，验证 matplotlib / openpyxl 等已预装且首次运行不触发 pip install：
+
+```bash
+bash docker/sandbox/smoke_test.sh
+# 镜像不存在时允许自动构建（较慢）：BUILD=1 bash docker/sandbox/smoke_test.sh
+```
+
 镜像基于 `python:3.11-slim`，预装以下工具和库：
 
 | 类别 | 内容 |
