@@ -8,7 +8,9 @@ use tracing::{debug, info, warn, Level};
 
 use tyclaw_agent::runtime::{OnProgress, ProgressEvent};
 use tyclaw_agent::{RuntimeResult, RuntimeStatus};
-use tyclaw_control::{AuditEntry, AuditLog};
+use tyclaw_control::{
+    warn_max_iterations_reset, AuditEntry, AuditLog, FailureAuditEntry, FailureCode,
+};
 use tyclaw_memory::{extract_case, CaseRetriever};
 use tyclaw_prompt::{strip_non_task_user_message, PromptInputs, SkillContent};
 use tyclaw_types::TyclawError;
@@ -30,6 +32,17 @@ pub(crate) fn spawn_audit_log(audit: &Arc<AuditLog>, entry: AuditEntry) {
     tokio::task::spawn_blocking(move || {
         if let Err(e) = audit.log(&entry) {
             warn!(error = %e, "failed to write audit log");
+        }
+    });
+}
+
+/// 非阻塞写失败审计（R14.1）：与 [`spawn_audit_log`] 同策略，但写入独立的
+/// `*.failures.jsonl`，附带失败原因码，供慢请求原因分布统计使用。
+pub(crate) fn spawn_failure_audit_log(audit: &Arc<AuditLog>, entry: FailureAuditEntry) {
+    let audit = Arc::clone(audit);
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = audit.log_failure(&entry) {
+            warn!(error = %e, "failed to write failure audit log");
         }
     });
 }
@@ -525,6 +538,7 @@ impl Orchestrator {
             &mut session,
             pairs_fixes,
             &perf.session_limits,
+            &perf.consolidation,
             &consolidator,
             self.provider.as_ref(),
             &self.app.model,
@@ -774,6 +788,9 @@ impl Orchestrator {
         let channel_owned = ctx.channel.to_string();
         let chat_id_owned = ctx.chat_id.to_string();
         let user_id_owned = ctx.user_id.to_string();
+        // 供 provider 并发控制器申请 per-user 许可（R6.2/R6.5）。与 TIMER 用途不同、
+        // 消费者也不同（provider crate 的 task-local），故单独克隆一份。
+        let user_id_for_provider = ctx.user_id.to_string();
         let conversation_id_owned = ctx.chat_id.to_string();
 
         // 9a. Per-workspace work root
@@ -842,8 +859,11 @@ impl Orchestrator {
                                         conversation_id_owned,
                                         tyclaw_sandbox::CURRENT_SANDBOX.scope(
                             sb_clone,
-                            tyclaw_agent::runtime::INJECTION_QUEUE
-                                .scope(injection_queue.clone(), run_future),
+                            tyclaw_provider::CURRENT_USER_ID.scope(
+                                user_id_for_provider.clone(),
+                                tyclaw_agent::runtime::INJECTION_QUEUE
+                                    .scope(injection_queue.clone(), run_future),
+                            ),
                         ),
                                     ),
                                 ),
@@ -871,8 +891,11 @@ impl Orchestrator {
                                     tyclaw_tools::timer::TIMER_CURRENT_CONVERSATION_ID
                                         .scope(
                                             conversation_id_owned,
-                                            tyclaw_agent::runtime::INJECTION_QUEUE
-                                                .scope(injection_queue, run_future),
+                                            tyclaw_provider::CURRENT_USER_ID.scope(
+                                                user_id_for_provider.clone(),
+                                                tyclaw_agent::runtime::INJECTION_QUEUE
+                                                    .scope(injection_queue, run_future),
+                                            ),
                                         ),
                                 ),
                             ),
@@ -970,6 +993,7 @@ impl Orchestrator {
             cache_hit_tokens: result.cache_hit_tokens,
             cache_write_tokens: result.cache_write_tokens,
             request_id,
+            hit_max_iterations: result.hit_max_iterations,
         }))
     }
 
@@ -981,6 +1005,21 @@ impl Orchestrator {
         run: CompletedRun,
     ) -> Result<AgentResponse, TyclawError> {
         let duration = ctx.start.elapsed().as_secs_f64();
+
+        // R14.1/R14.2：本轮因命中 max_iterations 上限而终止 → 以 WARN 级别打点告警，
+        // 并写一条带原因码 `hit_max_iterations` 的失败审计，供慢请求原因分布统计。
+        if run.hit_max_iterations {
+            warn_max_iterations_reset(&ctx.workspace_key);
+            spawn_failure_audit_log(
+                &self.persistence.audit,
+                FailureAuditEntry {
+                    workspace_key: ctx.workspace_key.clone(),
+                    failure_code: FailureCode::HitMaxIterations,
+                    turn_id: run.turn_id.clone(),
+                    duration_ms: (duration * 1000.0) as u64,
+                },
+            );
+        }
 
         // 10. 保存轮次到会话
         if !run.messages.is_empty() {
@@ -1262,6 +1301,9 @@ struct CompletedRun {
     cache_hit_tokens: u64,
     cache_write_tokens: u64,
     request_id: u64,
+    /// 本轮是否因命中 `max_iterations` 上限而终止（R2.2/R14）。
+    /// post_process 据此打 WARN 告警并写失败审计（原因码 hit_max_iterations）。
+    hit_max_iterations: bool,
 }
 
 /// run_agent 的返回值：要么提前返回（ask_user），要么正常完成。

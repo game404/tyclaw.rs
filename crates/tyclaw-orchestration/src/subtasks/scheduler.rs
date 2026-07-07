@@ -118,10 +118,14 @@ impl DagScheduler {
 
         // 整个调度循环（含收割与循环依赖兜底）包在 dispatch 整体超时内。
         // 超时则取消所有在途任务（终止未完成 node），随后由 classify 标注 chain_timeout。
+        //
+        // join_set 提升到超时块之外：超时取消 `scheduling` 后（future 被 drop，仅释放对
+        // join_set 的可变借用，不会 abort 任务——JoinSet 本身在此作用域存活），可再对
+        // join_set 做一次非阻塞收割，把「已成功但尚未被收割」的 node 纳入结果，避免被
+        // classify 误判为 chain_timeout（R7.4/R7.5）。
         let dispatch_timeout = Duration::from_millis(self.dispatch_max_duration_ms);
+        let mut join_set: JoinSet<(String, ExecutionRecord)> = JoinSet::new();
         let scheduling = async {
-            let mut join_set: JoinSet<(String, ExecutionRecord)> = JoinSet::new();
-
             loop {
             // 检查是否全部完成
             {
@@ -283,6 +287,10 @@ impl DagScheduler {
                 let main_ctx_owned = main_context.map(|s| s.to_string());
                 // 捕获当前 sandbox scope（task_local 不跨 spawn 传递，需要手动传）
                 let sandbox_for_spawn = tyclaw_sandbox::current_sandbox();
+                // 同理捕获 user_id（provider task_local 不跨 spawn）：子代理的 LLM 调用据此
+                // 向并发控制器申请 per-user 许可，否则会全部落到 `_anonymous` 桶（R6.2/R6.5）。
+                let user_id_for_spawn =
+                    tyclaw_provider::CURRENT_USER_ID.try_with(|u| u.clone()).ok();
                 tracing::debug!(node_id = %node_id, "Scheduler spawning task");
                 join_set.spawn(async move {
                     // 在 spawned task 中重建 sandbox scope
@@ -326,10 +334,17 @@ impl DagScheduler {
 
                     (node_id, record)
                     }; // end inner async
+                    // 在 spawned task 中重建 user_id scope（同 sandbox，task_local 不跨 spawn）。
+                    let with_user = async move {
+                        match user_id_for_spawn {
+                            Some(uid) => tyclaw_provider::CURRENT_USER_ID.scope(uid, inner).await,
+                            None => inner.await,
+                        }
+                    };
                     if let Some(sb) = sandbox_for_spawn {
-                        tyclaw_sandbox::CURRENT_SANDBOX.scope(sb, inner).await
+                        tyclaw_sandbox::CURRENT_SANDBOX.scope(sb, with_user).await
                     } else {
-                        inner.await
+                        with_user.await
                     }
                 });
             }
@@ -417,6 +432,21 @@ impl DagScheduler {
                 dispatch_max_duration_ms = self.dispatch_max_duration_ms,
                 "dispatch overall timeout reached — terminating unfinished nodes (chain_timeout)"
             );
+            // 尽力收割：调度被取消时，可能已有任务完成但结果还留在 join_set 未被收割。
+            // 非阻塞地取出这些真实结果并入 records，使其不被 classify 误判为 chain_timeout。
+            // 仍在运行的任务不会在此完成，随 join_set 在函数结束时 drop 而被 abort。
+            while let Some(result) = join_set.try_join_next() {
+                if let Ok((node_id, record)) = result {
+                    let mut st = statuses.lock().await;
+                    st.insert(node_id.clone(), record.status);
+                    if record.status == NodeStatus::Success {
+                        if let Some(ref out) = record.output {
+                            outputs.lock().await.insert(node_id.clone(), out.clone());
+                        }
+                    }
+                    records.lock().await.push(record);
+                }
+            }
         }
 
         // 汇总已完成记录，对未完成 node 补 chain_timeout 失败记录（R7.4/R7.5）。

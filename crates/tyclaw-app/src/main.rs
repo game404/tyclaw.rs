@@ -413,11 +413,12 @@ async fn main() {
     }
 }
 
-/// 将统一的 [`PerformanceConfig`] 中的并发与 SSE 子配置注入 provider 运行时单例。
+/// 将统一的 [`PerformanceConfig`] 注入运行时单例（provider 并发/SSE + 工具层截断）。
 ///
 /// - 并发：`global` 优先取旧字段 `llm.max_concurrent_llm`（向后兼容），其余取
 ///   `performance.concurrency`；映射到 provider 的 `ConcurrencyConfig`。
 /// - SSE：`performance.sse` 映射到 provider 的 `SseConfig`（动态 chunk 超时 + 重试）。
+/// - 截断：`performance.truncation` 映射到工具层 `TruncationLimits`（exec/grep 输出截断）。
 fn init_provider_runtime(
     performance: &tyclaw_orchestration::PerformanceConfig,
     max_concurrent_llm: usize,
@@ -443,12 +444,22 @@ fn init_provider_runtime(
         max_retries: perf.sse.max_retries,
     });
 
+    // 工具层截断（R5）：注入 exec/grep 输出截断上限与尾段比例，使线上调参生效。
+    // 未注入时工具单例停留在默认值，[performance].truncation 的定制不会生效。
+    tyclaw_tools::init_truncation_limits(tyclaw_tools::TruncationLimits {
+        exec_truncate_chars: perf.truncation.exec_truncate_chars,
+        grep_truncate_chars: perf.truncation.grep_truncate_chars,
+        tail_ratio: perf.truncation.tail_ratio,
+    });
+
     info!(
         global_max_inflight = global,
         per_user_max_inflight = perf.concurrency.per_user_max_inflight,
         queue_timeout_secs = perf.concurrency.queue_timeout_secs,
         sse_chunk_timeout_secs = perf.sse.chunk_timeout_secs,
         sse_high_concurrency_timeout_secs = perf.sse.high_concurrency_timeout_secs,
+        exec_truncate_chars = perf.truncation.exec_truncate_chars,
+        grep_truncate_chars = perf.truncation.grep_truncate_chars,
         "provider runtime initialized from PerformanceConfig"
     );
 }

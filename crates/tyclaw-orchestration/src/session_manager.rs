@@ -13,10 +13,10 @@ use parking_lot::Mutex;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use tyclaw_memory::{consolidate_with_provider, MemoryConsolidator};
+use tyclaw_memory::MemoryConsolidator;
 use tyclaw_provider::LLMProvider;
 
-use crate::config::SizeLimitConfig;
+use crate::config::{ConsolidationConfig, SizeLimitConfig};
 use crate::history::adjust_truncation_boundary;
 
 /// 生成 session ID：`s_{YYYYMMDD}_{HHmmss}_{4位hex}`
@@ -698,6 +698,7 @@ impl SessionManager {
         session: &mut Session,
         pairs_fixes: usize,
         cfg: &SizeLimitConfig,
+        consolidation: &ConsolidationConfig,
         consolidator: &MemoryConsolidator,
         provider: &dyn LLMProvider,
         model: &str,
@@ -718,21 +719,32 @@ impl SessionManager {
             // adjust 兜底：保证不以孤立 tool_result 开头（boundary 已是 user 起点，通常 no-op）。
             let boundary = adjust_truncation_boundary(&session.messages, boundary);
 
-            // 将 boundary 之前的消息合并入记忆（best-effort），随后从活动会话移除。
-            // 合并失败时，转储被丢弃的消息到恢复文件，避免静默数据丢失。
-            if boundary > 0 {
-                let chunk = session.messages[..boundary].to_vec();
-                let merged_ok =
-                    consolidate_with_provider(&consolidator.store, &chunk, provider, model).await;
-                if !merged_ok {
+            // 将 boundary 之前「尚未合并」的消息合并入记忆（best-effort），随后从活动会话移除。
+            // 从 `session.last_consolidated` 起（而非 0），避免把已合并进记忆的前缀重复送 LLM，
+            // 与下方强制合并分支保持一致。分批（不拆分单个 user turn、单批 ≤ max_messages_per_batch、
+            // ≤ max_rounds 批）避免整段一次性交给 LLM 超上下文（R4）；分批未覆盖到 boundary 的残余
+            // （失败批/达轮次上限）在 drain 前转储到恢复文件，避免静默数据丢失。
+            if boundary > session.last_consolidated {
+                let run = consolidator
+                    .consolidate_in_batches(
+                        &session.messages[..boundary],
+                        session.last_consolidated,
+                        consolidation.max_messages_per_batch,
+                        consolidation.max_rounds,
+                        provider,
+                        model,
+                    )
+                    .await;
+                if run.last_consolidated < boundary {
+                    let dropped = session.messages[run.last_consolidated..boundary].to_vec();
                     let dump = consolidator
                         .store
-                        .dump_unrecoverable(&session.workspace_key, &chunk);
+                        .dump_unrecoverable(&session.workspace_key, &dropped);
                     warn!(
                         workspace_key = %session.workspace_key,
-                        dropped = chunk.len(),
+                        dropped = dropped.len(),
                         dump = ?dump,
-                        "Forced reset: consolidation failed, dropped messages dumped for recovery"
+                        "Forced reset: partial consolidation, remaining messages dumped for recovery"
                     );
                 }
             }
@@ -770,18 +782,28 @@ impl SessionManager {
             cfg.rolling_target,
         );
         if boundary > session.last_consolidated {
-            let chunk = session.messages[session.last_consolidated..boundary].to_vec();
-            let merged_ok =
-                consolidate_with_provider(&consolidator.store, &chunk, provider, model).await;
-            if merged_ok {
-                let merged = boundary - session.last_consolidated;
-                session.last_consolidated = boundary;
+            // 分批合并 [last_consolidated, boundary)：传入 `..boundary` 子切片，使分批天然
+            // 不越过目标边界（consolidate_in_batches 无结束边界入参），保持“只合并到
+            // rolling_target”的原意；未压到目标以下的残余由下方滚动截断兜底（R3.2/R4）。
+            let run = consolidator
+                .consolidate_in_batches(
+                    &session.messages[..boundary],
+                    session.last_consolidated,
+                    consolidation.max_messages_per_batch,
+                    consolidation.max_rounds,
+                    provider,
+                    model,
+                )
+                .await;
+            if run.last_consolidated > session.last_consolidated {
+                let merged = run.last_consolidated - session.last_consolidated;
+                session.last_consolidated = run.last_consolidated;
                 session.updated_at = Utc::now();
                 action = SizeLimitAction::ForcedConsolidation { merged };
             } else {
                 warn!(
                     workspace_key = %session.workspace_key,
-                    "Forced consolidation failed; falling back to rolling truncation"
+                    "Forced consolidation made no progress; falling back to rolling truncation"
                 );
             }
         }
@@ -1197,6 +1219,7 @@ mod size_limit_tests {
             &mut session,
             0,
             &small_cfg(),
+            &ConsolidationConfig::default(),
             &consolidator,
             &provider,
             "fake-model",
@@ -1222,6 +1245,7 @@ mod size_limit_tests {
             &mut session,
             0,
             &cfg,
+            &ConsolidationConfig::default(),
             &consolidator,
             &provider,
             "fake-model",
@@ -1255,6 +1279,7 @@ mod size_limit_tests {
             &mut session,
             cfg.pairs_fixes_force_reset + 1, // 触发强制重置
             &cfg,
+            &ConsolidationConfig::default(),
             &consolidator,
             &provider,
             "fake-model",
@@ -1286,6 +1311,7 @@ mod size_limit_tests {
             &mut session,
             cfg.pairs_fixes_force_reset + 1, // pairs_fixes > force_reset → ForcedReset
             &cfg,
+            &ConsolidationConfig::default(),
             &consolidator,
             &provider,
             "fake-model",
@@ -1400,6 +1426,7 @@ mod size_limit_tests {
                     &mut session,
                     pairs_fixes,
                     &cfg,
+                    &ConsolidationConfig::default(),
                     &consolidator,
                     &provider,
                     "fake-model",
