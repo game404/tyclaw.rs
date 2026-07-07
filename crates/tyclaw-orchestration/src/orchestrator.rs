@@ -46,6 +46,7 @@ pub struct Orchestrator {
     /// 有状态的持久化服务（会话/审计/案例/技能/合并/限流/工作区管理）
     pub(crate) persistence: PersistenceLayer,
     pub(crate) pending_files: Arc<tyclaw_tools::PendingFileStore>,
+    pub(crate) pending_recommends: Arc<tyclaw_tools::PendingRecommendStore>,
     pub(crate) pending_ask_user:
         parking_lot::Mutex<HashMap<String, (String, Vec<HashMap<String, Value>>)>>,
     pub(crate) timer_service: Option<Arc<tyclaw_tools::timer::TimerService>>,

@@ -14,8 +14,8 @@ use tyclaw_tools::ToolRuntime;
 use tyclaw_tools::{
     timer::TimerService, ApplyPatchTool, AskUserTool, CopyFileTool, DeleteFileTool, EditFileTool,
     ExecTool, GlobTool, GrepSearchTool, ListDirTool, MkdirTool, MoveFileTool, PendingFileStore,
-    ReadFileTool, SendFileTool, TimerTool, ToolRegistry, WebFetchTool, WebSearchConfig,
-    WebSearchTool, WriteFileTool,
+    PendingRecommendStore, ReadFileTool, SendFileTool, SuggestRecommendsTool, TimerTool,
+    ToolRegistry, WebFetchTool, WebSearchConfig, WebSearchTool, WriteFileTool,
 };
 use tyclaw_types::constants::DEFAULT_CONTEXT_WINDOW;
 
@@ -264,9 +264,12 @@ impl OrchestratorBuilder {
         }
 
         let pending_files: Arc<PendingFileStore> = Arc::new(PendingFileStore::new());
+        let pending_recommends: Arc<PendingRecommendStore> =
+            Arc::new(PendingRecommendStore::new());
         let surface_config = ToolSurfaceConfig {
             app: app.clone(),
             pending_files: pending_files.clone(),
+            pending_recommends: pending_recommends.clone(),
             timer_service: timer_service.as_ref(),
             web_search_config: web_search_config.clone(),
             subtasks_config: subtasks_config.clone(),
@@ -296,6 +299,7 @@ impl OrchestratorBuilder {
             context,
             persistence,
             pending_files,
+            pending_recommends,
             pending_ask_user: parking_lot::Mutex::new(HashMap::new()),
             timer_service,
             active_tasks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -346,6 +350,7 @@ pub(crate) fn default_tool_registry(workspace: &Path) -> ToolRegistry {
 struct ToolSurfaceConfig<'a> {
     app: Arc<AppContext>,
     pending_files: Arc<PendingFileStore>,
+    pending_recommends: Arc<PendingRecommendStore>,
     timer_service: Option<&'a Arc<TimerService>>,
     web_search_config: Option<WebSearchConfig>,
     subtasks_config: Option<crate::subtasks::SubtasksConfig>,
@@ -372,6 +377,7 @@ fn build_tool_surface_registry(
         &mut tools,
         &config.app.workspace,
         config.pending_files.clone(),
+        config.pending_recommends.clone(),
         config.timer_service,
         config.web_search_config.clone(),
     );
@@ -394,6 +400,7 @@ fn register_orchestration_tools(
     tools: &mut ToolRegistry,
     workspace: &Path,
     pending_files: Arc<PendingFileStore>,
+    pending_recommends: Arc<PendingRecommendStore>,
     timer_service: Option<&Arc<TimerService>>,
     web_search_config: Option<WebSearchConfig>,
 ) {
@@ -401,6 +408,8 @@ fn register_orchestration_tools(
         Some(workspace.to_path_buf()),
         pending_files,
     )));
+
+    tools.register(Box::new(SuggestRecommendsTool::new(pending_recommends)));
 
     if let Some(timer) = timer_service {
         tools.register(Box::new(TimerTool::new(timer.clone())));
