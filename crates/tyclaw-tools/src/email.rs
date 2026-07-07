@@ -18,6 +18,7 @@ use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 use crate::base::{brief_truncate, RiskLevel, Tool};
 use crate::filesystem::safe_resolve;
+use tyclaw_tool_abi::Sandbox;
 
 /// 默认单封邮件附件累计上限（25MB）。
 const DEFAULT_MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
@@ -112,6 +113,163 @@ impl SendEmailTool {
         }
         Ok(out)
     }
+
+    /// 解析除附件外的公共邮件要素（发件人 / 收件人 / 主题 / 正文）。
+    fn parse_parts(&self, params: &HashMap<String, Value>) -> Result<EmailParts, String> {
+        let subject = params
+            .get("subject")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let body = params
+            .get("body")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let body_type = params
+            .get("body_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("text")
+            .to_string();
+        let from_name = params
+            .get("from_name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+
+        let to_list = extract_addresses(params, "to");
+        if to_list.is_empty() {
+            return Err("Error: 'to' must contain at least one recipient address.".to_string());
+        }
+        let to = self.parse_recipients(&to_list, "to")?;
+        let cc = self.parse_recipients(&extract_addresses(params, "cc"), "cc")?;
+        let bcc = self.parse_recipients(&extract_addresses(params, "bcc"), "bcc")?;
+
+        // 发件人：地址固定取配置，仅允许覆盖显示名。
+        let base_from: Mailbox = self.config.from.parse().map_err(|e| {
+            format!(
+                "Error: Invalid configured sender 'email.from' ({}): {e}",
+                self.config.from
+            )
+        })?;
+        let from = match from_name {
+            Some(name) => Mailbox::new(Some(name.to_string()), base_from.email),
+            None => base_from,
+        };
+
+        Ok(EmailParts {
+            from,
+            to,
+            cc,
+            bcc,
+            subject,
+            body,
+            body_type,
+            recipient_count: to_list.len(),
+        })
+    }
+
+    /// 用公共要素与已读入的附件组装最终 [`Message`]。
+    fn assemble(parts: EmailParts, attachments: Vec<AttachmentData>) -> Result<Message, String> {
+        let mut builder = Message::builder().from(parts.from).subject(parts.subject);
+        for m in parts.to {
+            builder = builder.to(m);
+        }
+        for m in parts.cc {
+            builder = builder.cc(m);
+        }
+        for m in parts.bcc {
+            builder = builder.bcc(m);
+        }
+
+        let is_html = parts.body_type == "html";
+        if attachments.is_empty() {
+            let content_type = if is_html {
+                ContentType::TEXT_HTML
+            } else {
+                ContentType::TEXT_PLAIN
+            };
+            builder
+                .header(content_type)
+                .body(parts.body)
+                .map_err(|e| format!("Error: Failed to build email: {e}"))
+        } else {
+            let body_part = if is_html {
+                SinglePart::html(parts.body)
+            } else {
+                SinglePart::plain(parts.body)
+            };
+            let mut mp = MultiPart::mixed().singlepart(body_part);
+            for att in attachments {
+                mp = mp.singlepart(Attachment::new(att.filename).body(att.bytes, att.content_type));
+            }
+            builder
+                .multipart(mp)
+                .map_err(|e| format!("Error: Failed to build email: {e}"))
+        }
+    }
+
+    /// 构建 SMTP 传输并发送，返回工具输出字符串。
+    async fn deliver(&self, email: Message, recipient_count: usize) -> String {
+        let tls = self.config.tls.to_ascii_lowercase();
+        let transport_builder = match tls.as_str() {
+            "starttls" => {
+                match AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&self.config.smtp_host) {
+                    Ok(b) => b,
+                    Err(e) => return format!("Error: Failed to init STARTTLS transport: {e}"),
+                }
+            }
+            "none" => {
+                AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&self.config.smtp_host)
+            }
+            _ => match AsyncSmtpTransport::<Tokio1Executor>::relay(&self.config.smtp_host) {
+                Ok(b) => b,
+                Err(e) => return format!("Error: Failed to init TLS transport: {e}"),
+            },
+        };
+
+        let mut transport_builder = transport_builder;
+        if self.config.smtp_port != 0 {
+            transport_builder = transport_builder.port(self.config.smtp_port);
+        }
+        if !self.config.username.is_empty() {
+            transport_builder = transport_builder.credentials(Credentials::new(
+                self.config.username.clone(),
+                self.config.password.clone(),
+            ));
+        }
+        let mailer = transport_builder.build();
+
+        match mailer.send(email).await {
+            Ok(resp) => {
+                let code = resp.code().to_string();
+                debug!(smtp_code = %code, "email sent");
+                json!({
+                    "status": "ok",
+                    "smtp_code": code,
+                    "response": resp.message().collect::<Vec<_>>(),
+                    "recipients": recipient_count,
+                })
+                .to_string()
+            }
+            Err(e) => {
+                warn!(error = %e, "email send failed");
+                format!("Error: Failed to send email: {e}")
+            }
+        }
+    }
+}
+
+/// 邮件公共要素（附件之外）。
+struct EmailParts {
+    from: Mailbox,
+    to: Vec<Mailbox>,
+    cc: Vec<Mailbox>,
+    bcc: Vec<Mailbox>,
+    subject: String,
+    body: String,
+    body_type: String,
+    recipient_count: usize,
 }
 
 /// 从参数中提取字符串数组：支持字符串（逗号/分号分隔）或字符串数组。
@@ -129,6 +287,35 @@ fn extract_addresses(params: &HashMap<String, Value>, key: &str) -> Vec<String> 
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// 从参数中提取文件路径列表：支持单个字符串或字符串数组。
+///
+/// 与 [`extract_addresses`] 不同，**不按逗号/分号切分**——文件路径本身可能含逗号。
+fn extract_paths(params: &HashMap<String, Value>, key: &str) -> Vec<String> {
+    match params.get(key) {
+        Some(Value::String(s)) => {
+            let s = s.trim();
+            if s.is_empty() {
+                Vec::new()
+            } else {
+                vec![s.to_string()]
+            }
+        }
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+            .filter(|p| !p.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// 已读入内存的附件数据。
+struct AttachmentData {
+    filename: String,
+    bytes: Vec<u8>,
+    content_type: ContentType,
 }
 
 /// 根据文件扩展名猜测 MIME 类型，未知回退 application/octet-stream。
@@ -216,175 +403,109 @@ impl Tool for SendEmailTool {
         RiskLevel::Write
     }
 
+    fn should_sandbox(&self) -> bool {
+        // 附件可能是 Agent 在沙箱内生成的文件；沙箱启用时应从容器读取附件。
+        // 无沙箱时执行器会自动回落到 host 的 `execute`。
+        true
+    }
+
+    /// Host 路径：附件从 workspace 内文件读取（`safe_resolve` 防目录穿越）。
     async fn execute(&self, params: HashMap<String, Value>) -> String {
         if !self.config.is_configured() {
             return "Error: Email is not configured. Set 'email.smtp_host' and 'email.from' in config.yaml.".to_string();
         }
-
-        let subject = params
-            .get("subject")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let body = params
-            .get("body")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let body_type = params
-            .get("body_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("text");
-        let from_name = params
-            .get("from_name")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty());
-
-        // 收件人解析与白名单校验。
-        let to_list = extract_addresses(&params, "to");
-        if to_list.is_empty() {
-            return "Error: 'to' must contain at least one recipient address.".to_string();
-        }
-        let to_mboxes = match self.parse_recipients(&to_list, "to") {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        let cc_mboxes = match self.parse_recipients(&extract_addresses(&params, "cc"), "cc") {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        let bcc_mboxes = match self.parse_recipients(&extract_addresses(&params, "bcc"), "bcc") {
-            Ok(v) => v,
+        let parts = match self.parse_parts(&params) {
+            Ok(p) => p,
             Err(e) => return e,
         };
 
-        // 发件人：地址固定取配置，仅允许覆盖显示名。
-        let base_from: Mailbox = match self.config.from.parse() {
-            Ok(m) => m,
-            Err(e) => {
-                return format!(
-                    "Error: Invalid configured sender 'email.from' ({}): {e}",
-                    self.config.from
-                )
-            }
-        };
-        let from_mbox = match from_name {
-            Some(name) => Mailbox::new(Some(name.to_string()), base_from.email),
-            None => base_from,
-        };
-
-        // 组装邮件。
-        let mut builder = Message::builder().from(from_mbox).subject(subject);
-        for m in to_mboxes {
-            builder = builder.to(m);
-        }
-        for m in cc_mboxes {
-            builder = builder.cc(m);
-        }
-        for m in bcc_mboxes {
-            builder = builder.bcc(m);
-        }
-
-        let content_type = if body_type == "html" {
-            ContentType::TEXT_HTML
-        } else {
-            ContentType::TEXT_PLAIN
-        };
-
-        // 附件读取（限定 workspace + 累计大小上限）。
-        let attachment_paths = extract_addresses(&params, "attachments");
-        let email = if attachment_paths.is_empty() {
-            match builder.header(content_type).body(body) {
-                Ok(m) => m,
-                Err(e) => return format!("Error: Failed to build email: {e}"),
-            }
-        } else {
-            let body_part = if body_type == "html" {
-                SinglePart::html(body)
-            } else {
-                SinglePart::plain(body)
+        let mut attachments = Vec::new();
+        let mut total: usize = 0;
+        for path in extract_paths(&params, "attachments") {
+            let resolved = match safe_resolve(&path, self.workspace.as_deref()) {
+                Ok(p) => p,
+                Err(e) => return e,
             };
-            let mut mp = MultiPart::mixed().singlepart(body_part);
-            let mut total: usize = 0;
-            for path in &attachment_paths {
-                let resolved = match safe_resolve(path, self.workspace.as_deref()) {
-                    Ok(p) => p,
-                    Err(e) => return e,
-                };
-                let bytes = match tokio::fs::read(&resolved).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        return format!("Error: Failed to read attachment '{path}': {e}");
-                    }
-                };
-                total = total.saturating_add(bytes.len());
-                if total > self.config.max_attachment_bytes {
-                    return format!(
-                        "Error: Attachments exceed the maximum total size of {} bytes.",
-                        self.config.max_attachment_bytes
-                    );
-                }
-                let filename = resolved
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "attachment".to_string());
-                let ct = guess_mime(&filename);
-                mp = mp.singlepart(Attachment::new(filename).body(bytes, ct));
+            let bytes = match tokio::fs::read(&resolved).await {
+                Ok(b) => b,
+                Err(e) => return format!("Error: Failed to read attachment '{path}': {e}"),
+            };
+            total = total.saturating_add(bytes.len());
+            if total > self.config.max_attachment_bytes {
+                return format!(
+                    "Error: Attachments exceed the maximum total size of {} bytes.",
+                    self.config.max_attachment_bytes
+                );
             }
-            match builder.multipart(mp) {
-                Ok(m) => m,
-                Err(e) => return format!("Error: Failed to build email: {e}"),
-            }
+            let filename = resolved
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "attachment".to_string());
+            let content_type = guess_mime(&filename);
+            attachments.push(AttachmentData {
+                filename,
+                bytes,
+                content_type,
+            });
+        }
+
+        let recipient_count = parts.recipient_count;
+        let email = match Self::assemble(parts, attachments) {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
+        self.deliver(email, recipient_count).await
+    }
+
+    /// 沙箱路径：附件从沙箱容器文件系统读取，与其余文件工具保持一致。
+    async fn execute_in_sandbox(
+        &self,
+        sandbox: &dyn Sandbox,
+        params: HashMap<String, Value>,
+    ) -> String {
+        if !self.config.is_configured() {
+            return "Error: Email is not configured. Set 'email.smtp_host' and 'email.from' in config.yaml.".to_string();
+        }
+        let parts = match self.parse_parts(&params) {
+            Ok(p) => p,
+            Err(e) => return e,
         };
 
-        // 构建 SMTP 传输并发送。
-        let tls = self.config.tls.to_ascii_lowercase();
-        let transport_builder = match tls.as_str() {
-            "starttls" => match AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(
-                &self.config.smtp_host,
-            ) {
-                Ok(b) => b,
-                Err(e) => return format!("Error: Failed to init STARTTLS transport: {e}"),
-            },
-            "none" => {
-                AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&self.config.smtp_host)
+        let mut attachments = Vec::new();
+        let mut total: usize = 0;
+        for path in extract_paths(&params, "attachments") {
+            if !sandbox.file_exists(&path).await {
+                return format!("Error: File not found in sandbox: {path}");
             }
-            _ => match AsyncSmtpTransport::<Tokio1Executor>::relay(&self.config.smtp_host) {
+            let bytes = match sandbox.read_file(&path).await {
                 Ok(b) => b,
-                Err(e) => return format!("Error: Failed to init TLS transport: {e}"),
-            },
+                Err(e) => return format!("Error: Failed to read attachment '{path}': {e}"),
+            };
+            total = total.saturating_add(bytes.len());
+            if total > self.config.max_attachment_bytes {
+                return format!(
+                    "Error: Attachments exceed the maximum total size of {} bytes.",
+                    self.config.max_attachment_bytes
+                );
+            }
+            let filename = std::path::Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "attachment".to_string());
+            let content_type = guess_mime(&filename);
+            attachments.push(AttachmentData {
+                filename,
+                bytes,
+                content_type,
+            });
+        }
+
+        let recipient_count = parts.recipient_count;
+        let email = match Self::assemble(parts, attachments) {
+            Ok(m) => m,
+            Err(e) => return e,
         };
-
-        let mut transport_builder = transport_builder;
-        if self.config.smtp_port != 0 {
-            transport_builder = transport_builder.port(self.config.smtp_port);
-        }
-        if !self.config.username.is_empty() {
-            transport_builder = transport_builder.credentials(Credentials::new(
-                self.config.username.clone(),
-                self.config.password.clone(),
-            ));
-        }
-        let mailer = transport_builder.build();
-
-        match mailer.send(email).await {
-            Ok(resp) => {
-                let code = resp.code().to_string();
-                debug!(smtp_code = %code, "email sent");
-                json!({
-                    "status": "ok",
-                    "smtp_code": code,
-                    "response": resp.message().collect::<Vec<_>>(),
-                    "recipients": to_list.len(),
-                })
-                .to_string()
-            }
-            Err(e) => {
-                warn!(error = %e, "email send failed");
-                format!("Error: Failed to send email: {e}")
-            }
-        }
+        self.deliver(email, recipient_count).await
     }
 }
 
@@ -431,6 +552,22 @@ mod tests {
 
         let p3: HashMap<String, Value> = HashMap::new();
         assert!(extract_addresses(&p3, "to").is_empty());
+    }
+
+    #[test]
+    fn test_extract_paths_does_not_split_on_comma() {
+        // 文件路径含逗号时应作为单个路径，而非被切分。
+        let mut p = HashMap::new();
+        p.insert("attachments".into(), json!("work/report,final.pdf"));
+        let paths = extract_paths(&p, "attachments");
+        assert_eq!(paths, vec!["work/report,final.pdf".to_string()]);
+
+        let mut p2 = HashMap::new();
+        p2.insert("attachments".into(), json!(["a.txt", "b,c.txt"]));
+        assert_eq!(
+            extract_paths(&p2, "attachments"),
+            vec!["a.txt".to_string(), "b,c.txt".to_string()]
+        );
     }
 
     #[test]
