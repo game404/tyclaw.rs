@@ -261,6 +261,21 @@ subtasks:
 #   max_results: 5
 
 # ============================================================================
+# 邮件发送（可选）—— 启用 send_email 工具
+# 配置后 Agent 可通过 send_email 工具发送邮件（正文 + workspace 内附件）。
+# 发件人地址固定为 from，LLM 只能通过 from_name 覆盖显示名，不能改地址。
+# ============================================================================
+# email:
+#   smtp_host: "smtp.example.com"   # SMTP 服务器主机名（必填）
+#   smtp_port: 465                  # 465=隐式 TLS(implicit)，587=STARTTLS
+#   tls: "implicit"                 # implicit | starttls | none
+#   username: "bot@example.com"     # SMTP 登录用户名（为空则不鉴权）
+#   password: ""                    # 登录密码 / 授权码
+#   from: "Tyclaw Bot <bot@example.com>"  # 发件人（必填），建议地址与 username 一致
+#   allowed_domains: []             # 收件人域名白名单，如 ["example.com"]；为空=不限制
+#   max_attachment_bytes: 26214400  # 单封附件累计上限，默认 25MB
+
+# ============================================================================
 # 访问控制（可选）
 # ============================================================================
 # control:

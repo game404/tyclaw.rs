@@ -153,7 +153,7 @@ fn render_read_file_output(
 /// - 绝对路径直接返回
 /// - 相对路径基于 workspace 目录拼接
 /// - 没有 workspace 时，相对路径原样返回
-fn resolve_path(path: &str, workspace: Option<&Path>) -> PathBuf {
+pub(crate) fn resolve_path(path: &str, workspace: Option<&Path>) -> PathBuf {
     let p = PathBuf::from(shellexpand::tilde(path).as_ref());
     if p.is_absolute() {
         p
@@ -195,7 +195,7 @@ fn canonicalize_best_effort(path: &PathBuf) -> Result<PathBuf, String> {
 }
 
 /// Canonicalize a path and verify it is within the workspace.
-fn safe_resolve(path: &str, workspace: Option<&Path>) -> Result<PathBuf, String> {
+pub(crate) fn safe_resolve(path: &str, workspace: Option<&Path>) -> Result<PathBuf, String> {
     let resolved = resolve_path(path, workspace);
     let canonical = canonicalize_best_effort(&resolved)?;
 

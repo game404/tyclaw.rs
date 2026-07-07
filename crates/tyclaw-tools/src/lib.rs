@@ -32,6 +32,9 @@ pub mod timer;
 /// Web 工具 —— web_search 搜索 + web_fetch 内容抓取
 pub mod web;
 
+/// 邮件发送工具 —— send_email 通过 SMTP 发送正文与附件
+pub mod email;
+
 /// 步骤级 TTL 缓存 —— 长链路 Skill 可缓存中间结果的复用
 pub mod step_cache;
 
@@ -66,6 +69,7 @@ pub use segment::{order_segments, take_completed, Attachment, AttachmentKind, Re
 pub use precheck::{
     config_missing_error, readonly_error, PrecheckState, CONFIG_MISSING_PREFIX, READONLY_PREFIX,
 };
+pub use email::{EmailConfig, SendEmailTool};
 pub use timer::TimerTool;
 pub use tyclaw_tool_abi::{
     AllowAllGate, GatePolicy, PathMount, Sandbox, SandboxDirEntry, SandboxExecResult, SandboxPool,

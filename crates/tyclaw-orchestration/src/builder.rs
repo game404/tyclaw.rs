@@ -13,9 +13,10 @@ use tyclaw_provider::LLMProvider;
 use tyclaw_tools::ToolRuntime;
 use tyclaw_tools::{
     timer::TimerService, ApplyPatchTool, AskUserTool, CopyFileTool, DeleteFileTool, EditFileTool,
-    ExecTool, GlobTool, GrepSearchTool, ListDirTool, MkdirTool, MoveFileTool, PendingFileStore,
-    PendingRecommendStore, ReadFileTool, SendFileTool, SuggestRecommendsTool, TimerTool,
-    ToolRegistry, WebFetchTool, WebSearchConfig, WebSearchTool, WriteFileTool,
+    EmailConfig, ExecTool, GlobTool, GrepSearchTool, ListDirTool, MkdirTool, MoveFileTool,
+    PendingFileStore, PendingRecommendStore, ReadFileTool, SendEmailTool, SendFileTool,
+    SuggestRecommendsTool, TimerTool, ToolRegistry, WebFetchTool, WebSearchConfig, WebSearchTool,
+    WriteFileTool,
 };
 use tyclaw_types::constants::DEFAULT_CONTEXT_WINDOW;
 
@@ -40,6 +41,7 @@ pub struct OrchestratorBuilder {
     pub(crate) subtasks_config: Option<crate::subtasks::SubtasksConfig>,
     pub(crate) timer_service: Option<Arc<TimerService>>,
     pub(crate) web_search_config: Option<WebSearchConfig>,
+    pub(crate) email_config: Option<EmailConfig>,
     pub(crate) control_config: Option<tyclaw_control::ControlConfig>,
     pub(crate) workspace_key_strategy: tyclaw_control::WorkspaceKeyStrategy,
     pub(crate) path_config: tyclaw_control::PathConfig,
@@ -61,6 +63,7 @@ impl OrchestratorBuilder {
             subtasks_config: None,
             timer_service: None,
             web_search_config: None,
+            email_config: None,
             control_config: None,
             workspace_key_strategy: tyclaw_control::WorkspaceKeyStrategy::default(),
             path_config: tyclaw_control::PathConfig::default(),
@@ -177,6 +180,11 @@ impl OrchestratorBuilder {
         self
     }
 
+    pub fn with_email(mut self, config: EmailConfig) -> Self {
+        self.email_config = Some(config);
+        self
+    }
+
     pub fn with_control(mut self, config: tyclaw_control::ControlConfig) -> Self {
         self.control_config = Some(config);
         self
@@ -205,6 +213,7 @@ impl OrchestratorBuilder {
             subtasks_config,
             timer_service,
             web_search_config,
+            email_config,
             control_config,
             workspace_key_strategy,
             path_config,
@@ -289,6 +298,7 @@ impl OrchestratorBuilder {
             pending_recommends: pending_recommends.clone(),
             timer_service: timer_service.as_ref(),
             web_search_config: web_search_config.clone(),
+            email_config: email_config.clone(),
             subtasks_config: subtasks_config.clone(),
             provider: provider.clone(),
         };
@@ -370,6 +380,7 @@ struct ToolSurfaceConfig<'a> {
     pending_recommends: Arc<PendingRecommendStore>,
     timer_service: Option<&'a Arc<TimerService>>,
     web_search_config: Option<WebSearchConfig>,
+    email_config: Option<EmailConfig>,
     subtasks_config: Option<crate::subtasks::SubtasksConfig>,
     provider: Arc<dyn LLMProvider>,
 }
@@ -397,6 +408,7 @@ fn build_tool_surface_registry(
         config.pending_recommends.clone(),
         config.timer_service,
         config.web_search_config.clone(),
+        config.email_config.clone(),
     );
 
     if let Some(st_config) = config.subtasks_config.clone().filter(|c| c.enabled) {
@@ -420,11 +432,18 @@ fn register_orchestration_tools(
     pending_recommends: Arc<PendingRecommendStore>,
     timer_service: Option<&Arc<TimerService>>,
     web_search_config: Option<WebSearchConfig>,
+    email_config: Option<EmailConfig>,
 ) {
     tools.register(Box::new(SendFileTool::new(
         Some(workspace.to_path_buf()),
         pending_files,
     )));
+
+    tools.register(Box::new(SendEmailTool::new(
+        email_config.unwrap_or_default(),
+        Some(workspace.to_path_buf()),
+    )));
+    info!("Email tool registered (send_email)");
 
     tools.register(Box::new(SuggestRecommendsTool::new(pending_recommends)));
 
