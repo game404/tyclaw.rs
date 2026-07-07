@@ -143,6 +143,10 @@ pub struct AgentResponse {
     /// Agent 期望发送给用户的文件路径列表。
     /// 由 `send_file` 工具写入，上层（如 DingTalk bot）负责实际发送。
     pub output_files: Vec<String>,
+    /// Agent 输出的「猜你想问」推荐问题列表。
+    /// 由 `suggest_recommends` 工具写入，上层（如 DingTalk bot）渲染为卡片推荐组件。
+    /// 为空表示本轮无推荐（默认）。
+    pub recommends: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -43,6 +43,13 @@ const API_UPDATE: &str = "https://api.dingtalk.com/v1.0/card/instances";
 /// 卡片模板变量 key（需与钉钉后台模板一致）。
 const CONTENT_KEY: &str = "content";
 const RESULT_KEY: &str = "result";
+/// 推荐问题按钮数据（JSON 数组字符串，形如 `[{"text":"...","url":"dtmd://..."}]`）。
+/// 模板侧用「按钮」组件循环渲染，链接值绑定 `url` 并勾选「是否 dtmd 链接」，
+/// 用户点击即以本人身份把 `text` 对应问题发回会话。
+const RECOMMENDS_KEY: &str = "recommends";
+/// 推荐问题的 markdown 文本（含 dtmd 链接）。模板侧用独立「markdown」组件绑定，
+/// 用于验证卡片内 markdown 组件是否支持 dtmd 协议链接。
+const RECOMMENDS_MD_KEY: &str = "recommends_md";
 /// `progress`（0-100 百分比）是 AI 卡片可选模板变量。当前模板暂未使用，
 /// 保留常量待后续模板升级后直接启用。
 #[allow(dead_code)]
@@ -270,8 +277,17 @@ impl CardReplier {
 
     /// 任务完成：关流 + 覆盖 cardData 为最终回复。
     ///
+    /// * `reply` —— 最终回复正文（调用方已拼好 header/footer）。
+    /// * `recommends_json` —— 推荐问题按钮数据的 JSON 数组字符串（无则传 `"[]"`）。
+    /// * `recommends_md` —— 推荐问题的 markdown 文本（含 dtmd 链接，无则传空串）。
+    ///
     /// 返回 `Err` 时调用方应 fallback 到纯文本回复，避免用户什么都收不到。
-    pub async fn finalize(&self, reply: &str) -> Result<(), String> {
+    pub async fn finalize(
+        &self,
+        reply: &str,
+        recommends_json: &str,
+        recommends_md: &str,
+    ) -> Result<(), String> {
         {
             let mut s = self.state.lock();
             if s.finalized {
@@ -292,8 +308,8 @@ impl CardReplier {
         } else {
             reply.to_string()
         };
-        // 覆盖 cardData 为最终状态：结果写入 result，flowStatus 设为完成。
-        self.update_card_data(&final_content)
+        // 覆盖 cardData 为最终状态：结果写入 result，flowStatus 设为完成，附带推荐问题。
+        self.update_card_data(&final_content, recommends_json, recommends_md)
             .await
             .map_err(|e| {
                 warn!(error = %e, "AI card finalize: update cardData failed");
@@ -316,7 +332,7 @@ impl CardReplier {
             .stream_put(EMPTY_PLACEHOLDER, false, true)
             .await;
         let body = self.render_body_with_suffix("\n\n⏹ 任务已被手动终止，如需继续请重新提问。");
-        let _ = self.update_card_data(&body).await;
+        let _ = self.update_card_data(&body, "[]", "").await;
     }
 
     /// 把当前状态渲染成 markdown 并推一条 streaming 更新。
@@ -398,7 +414,17 @@ impl CardReplier {
     }
 
     /// PUT /v1.0/card/instances —— 覆盖整个 cardData（最终态）。
-    async fn update_card_data(&self, result: &str) -> Result<(), String> {
+    ///
+    /// `recommends_json` 为推荐问题按钮数据的 JSON 数组字符串（无则传 `"[]"`），
+    /// 写入模板变量 `recommends` 供按钮组件循环渲染；
+    /// `recommends_md` 为推荐问题 markdown 文本（含 dtmd 链接），
+    /// 写入模板变量 `recommends_md` 供独立 markdown 组件渲染。
+    async fn update_card_data(
+        &self,
+        result: &str,
+        recommends_json: &str,
+        recommends_md: &str,
+    ) -> Result<(), String> {
         let token = self
             .token_manager
             .get_token()
@@ -410,6 +436,8 @@ impl CardReplier {
                 "cardParamMap": {
                     FLOW_STATUS_KEY: FLOW_STATUS_FINISHED,
                     RESULT_KEY: result,
+                    RECOMMENDS_KEY: recommends_json,
+                    RECOMMENDS_MD_KEY: recommends_md,
                 }
             }
         });

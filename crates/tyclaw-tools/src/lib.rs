@@ -42,7 +42,7 @@ pub use filesystem::{
     ApplyPatchTool, DeleteFileTool, EditFileTool, ListDirTool, PendingFileStore, ReadFileTool,
     SendFileTool, WriteFileTool, CURRENT_REQUEST_ID,
 };
-pub use interaction::AskUserTool;
+pub use interaction::{AskUserTool, PendingRecommendStore, SuggestRecommendsTool};
 pub use registry::ToolRegistry;
 pub use shell::ExecTool;
 pub use timer::TimerTool;

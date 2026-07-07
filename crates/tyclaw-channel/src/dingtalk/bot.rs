@@ -59,6 +59,50 @@ impl DingTalkBot {
         })
     }
 
+    /// 生成 AI 卡片「推荐问题按钮」数据的 JSON 数组字符串，写入模板变量 `recommends`。
+    ///
+    /// 形如 `[{"text":"今天天气","url":"dtmd://dingtalkclient/sendMessage?content=..."}]`。
+    /// 模板侧用「按钮」组件循环渲染，链接值绑定 `url` 并勾选「是否 dtmd 链接」。
+    /// 用户点击按钮 → 钉钉客户端以本人身份把 `text` 问题发回会话 → 触发新一轮问答。
+    /// 无推荐问题时返回 `"[]"`。
+    fn build_recommends_json(recommends: &[String]) -> String {
+        if recommends.is_empty() {
+            return "[]".to_string();
+        }
+        let items: Vec<serde_json::Value> = recommends
+            .iter()
+            .map(|q| {
+                let encoded = urlencoding::encode(q);
+                serde_json::json!({
+                    "text": q,
+                    "url": format!("dtmd://dingtalkclient/sendMessage?content={encoded}"),
+                })
+            })
+            .collect();
+        serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// 渲染「猜你想问」markdown 片段，用于**纯文本 fallback 场景**（未启用卡片或卡片失败）。
+    ///
+    /// 卡片正文的 markdown 组件不支持 dtmd，因此卡片场景改用按钮组件
+    /// （见 [`Self::build_recommends_json`]）；但普通 markdown 消息支持 dtmd，
+    /// fallback 时把推荐问题内联为 dtmd 链接即可点击。
+    ///
+    /// 返回值以 `\n\n` 分隔前缀，可直接拼到正文尾部；无推荐问题时返回空串。
+    fn render_recommend_questions(recommends: &[String]) -> String {
+        if recommends.is_empty() {
+            return String::new();
+        }
+        let mut md = String::from("\n\n---\n\n**🤔 你可能还想问：**\n\n");
+        for q in recommends {
+            let encoded = urlencoding::encode(q);
+            md.push_str(&format!(
+                "- [{q}](dtmd://dingtalkclient/sendMessage?content={encoded})\n"
+            ));
+        }
+        md
+    }
+
     /// 根据当前消息尝试创建 AI 卡片。
     /// 模板未配置或创建失败时返回 `None`——调用方据此决定是否回退到纯文本。
     async fn try_create_card(
@@ -340,15 +384,23 @@ impl ChatbotHandler for DingTalkBot {
                 } else {
                     format!("<font size=2 color=#888888>🦀 {duration_secs}秒</font>")
                 };
-                let formatted = format!("{header}\n\n{reply_text}\n\n{footer}");
+                // 推荐问题：卡片走按钮组件（recommends JSON 变量），
+                // fallback 的纯 markdown 消息走内联 dtmd 链接（markdown 支持 dtmd）。
+                let recommends_json = Self::build_recommends_json(&response.recommends);
+                let recommend_md = Self::render_recommend_questions(&response.recommends);
+                let formatted = format!("{header}\n\n{reply_text}\n\n{footer}{recommend_md}");
 
                 // 有卡片时写入最终态；如果卡片 finalize 失败，fallback 到纯文本。
-                // 卡片场景：不需要 header（问题已在"输出中"阶段展示过），只要正文+footer。
+                // 卡片场景：不需要 header（问题已在"输出中"阶段展示过），只要正文+footer；
+                // 推荐问题通过 recommends 按钮变量注入，不拼进正文。
                 let card_content = format!("{reply_text}\n\n{footer}");
                 let mut need_text_fallback = card.is_none();
                 if let Some(ref c) = card {
                     ai_card::unregister_card(&self.card_registry, &chat_id);
-                    if let Err(e) = c.finalize(&card_content).await {
+                    if let Err(e) = c
+                        .finalize(&card_content, &recommends_json, &recommend_md)
+                        .await
+                    {
                         warn!(error = %e, "AI card finalize failed, falling back to text reply");
                         need_text_fallback = true;
                     }

@@ -184,6 +184,7 @@ impl Orchestrator {
                     prompt_tokens: result.total_prompt_tokens,
                     completion_tokens: result.total_completion_tokens,
                     output_files: Vec::new(),
+                    recommends: Vec::new(),
                 });
             }
 
@@ -215,6 +216,7 @@ impl Orchestrator {
                 prompt_tokens: result.total_prompt_tokens,
                 completion_tokens: result.total_completion_tokens,
                 output_files,
+                recommends: Vec::new(),
             });
         }
 
@@ -316,6 +318,7 @@ impl Orchestrator {
             prompt_tokens: 0,
             completion_tokens: 0,
             output_files: Vec::new(),
+            recommends: Vec::new(),
         })
     }
 
@@ -338,6 +341,7 @@ impl Orchestrator {
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     output_files: Vec::new(),
+                    recommends: Vec::new(),
                 }));
             }
 
@@ -365,6 +369,7 @@ impl Orchestrator {
                         prompt_tokens: 0,
                         completion_tokens: 0,
                         output_files: Vec::new(),
+                        recommends: Vec::new(),
                     }));
                 }
                 Err(e) => {
@@ -375,6 +380,7 @@ impl Orchestrator {
                         prompt_tokens: 0,
                         completion_tokens: 0,
                         output_files: Vec::new(),
+                        recommends: Vec::new(),
                     }));
                 }
             }
@@ -407,6 +413,7 @@ impl Orchestrator {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 output_files: Vec::new(),
+                recommends: Vec::new(),
             }));
         }
 
@@ -854,6 +861,7 @@ impl Orchestrator {
                 prompt_tokens: result.total_prompt_tokens,
                 completion_tokens: result.total_completion_tokens,
                 output_files: Vec::new(),
+                recommends: Vec::new(),
             }));
         }
 
@@ -1020,6 +1028,8 @@ impl Orchestrator {
 
         // 收集 send_file 工具产生的待发送文件
         let output_files = self.pending_files.drain(run.request_id);
+        // 收集 suggest_recommends 工具产生的推荐问题
+        let recommends = self.pending_recommends.drain(run.request_id);
 
         Ok(AgentResponse {
             text: run.final_content,
@@ -1028,6 +1038,7 @@ impl Orchestrator {
             prompt_tokens: run.total_prompt_tokens,
             completion_tokens: run.total_completion_tokens,
             output_files,
+            recommends,
         })
     }
 
