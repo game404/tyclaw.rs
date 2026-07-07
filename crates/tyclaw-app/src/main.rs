@@ -282,8 +282,9 @@ async fn main() {
 
     info!(?config_path, "Loaded config (or defaults)");
 
-    // 初始化 LLM 并发限制
-    tyclaw_provider::init_concurrency(cfg.llm.max_concurrent_llm);
+    // 初始化 provider 运行时：并发控制器（全局/单用户/排队超时）+ SSE 动态超时与重试。
+    // 配置来自统一的 PerformanceConfig，使线上调参真正生效（R6/R10）。
+    init_provider_runtime(&cfg.performance, cfg.llm.max_concurrent_llm);
 
     // 配置优先级：命令行参数 > 环境变量 > providers[name] > llm 内联字段 > 默认值
     //
@@ -401,6 +402,7 @@ async fn main() {
         web_search_config: cfg.web_search,
         control_config: cfg.control,
         workspace_config: cfg.workspace,
+        performance: cfg.performance,
         startup_lines: config_lines,
     };
 
@@ -409,6 +411,57 @@ async fn main() {
     } else {
         run_cli(run_config, app_cfg.monitor).await;
     }
+}
+
+/// 将统一的 [`PerformanceConfig`] 注入运行时单例（provider 并发/SSE + 工具层截断）。
+///
+/// - 并发：`global` 优先取旧字段 `llm.max_concurrent_llm`（向后兼容），其余取
+///   `performance.concurrency`；映射到 provider 的 `ConcurrencyConfig`。
+/// - SSE：`performance.sse` 映射到 provider 的 `SseConfig`（动态 chunk 超时 + 重试）。
+/// - 截断：`performance.truncation` 映射到工具层 `TruncationLimits`（exec/grep 输出截断）。
+fn init_provider_runtime(
+    performance: &tyclaw_orchestration::PerformanceConfig,
+    max_concurrent_llm: usize,
+) {
+    let mut perf = performance.clone();
+    perf.clamp();
+
+    let global = if max_concurrent_llm != 0 {
+        max_concurrent_llm
+    } else {
+        perf.concurrency.global_max_inflight
+    };
+    tyclaw_provider::init_concurrency_controller(tyclaw_provider::ConcurrencyConfig {
+        global_max_inflight: global,
+        per_user_max_inflight: perf.concurrency.per_user_max_inflight,
+        queue_timeout: std::time::Duration::from_secs(perf.concurrency.queue_timeout_secs),
+    });
+
+    tyclaw_provider::init_sse_config(tyclaw_provider::SseConfig {
+        chunk_timeout_secs: perf.sse.chunk_timeout_secs,
+        high_concurrency_timeout_secs: perf.sse.high_concurrency_timeout_secs,
+        high_concurrency_inflight: perf.sse.high_concurrency_inflight,
+        max_retries: perf.sse.max_retries,
+    });
+
+    // 工具层截断（R5）：注入 exec/grep 输出截断上限与尾段比例，使线上调参生效。
+    // 未注入时工具单例停留在默认值，[performance].truncation 的定制不会生效。
+    tyclaw_tools::init_truncation_limits(tyclaw_tools::TruncationLimits {
+        exec_truncate_chars: perf.truncation.exec_truncate_chars,
+        grep_truncate_chars: perf.truncation.grep_truncate_chars,
+        tail_ratio: perf.truncation.tail_ratio,
+    });
+
+    info!(
+        global_max_inflight = global,
+        per_user_max_inflight = perf.concurrency.per_user_max_inflight,
+        queue_timeout_secs = perf.concurrency.queue_timeout_secs,
+        sse_chunk_timeout_secs = perf.sse.chunk_timeout_secs,
+        sse_high_concurrency_timeout_secs = perf.sse.high_concurrency_timeout_secs,
+        exec_truncate_chars = perf.truncation.exec_truncate_chars,
+        grep_truncate_chars = perf.truncation.grep_truncate_chars,
+        "provider runtime initialized from PerformanceConfig"
+    );
 }
 
 fn canonicalize_workspace(path: &Path) -> PathBuf {
@@ -449,6 +502,8 @@ struct RunConfig {
     web_search_config: tyclaw_tools::WebSearchConfig,
     control_config: tyclaw_orchestration::ControlConfig,
     workspace_config: tyclaw_orchestration::WorkspaceRuntimeConfig,
+    /// 统一性能治理配置（污染过滤 / 会话规模 / 截断 / 并发 / 超时 等）。
+    performance: tyclaw_orchestration::PerformanceConfig,
     /// 启动时的配置摘要（在 CLI 滚动区显示）
     startup_lines: Vec<String>,
 }
@@ -468,6 +523,7 @@ impl RunConfig {
             .with_subtasks(self.subtasks_config)
             .with_web_search(self.web_search_config)
             .with_control(self.control_config)
+            .with_performance(self.performance)
             .with_timer(timer_svc)
             .build();
         if let Some(works_dir) = self.works_dir {

@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::config::PerformanceConfig;
 use crate::types::OrchestratorFeatures;
 
 /// 不可变的应用级配置，通过 Arc 在所有层之间共享。
@@ -21,6 +22,9 @@ pub struct AppContext {
     pub context_window_tokens: usize,
     /// 功能开关（审计/记忆/RBAC/限流）
     pub features: OrchestratorFeatures,
+    /// 统一性能治理配置（污染过滤 / 会话规模 / 截断 / 并发 / 超时 等）。
+    /// 编排请求生命周期的治理关卡（污染剔除 / 配对修复 / 规模上限）据此读取阈值。
+    pub performance: PerformanceConfig,
 }
 
 impl AppContext {
@@ -30,6 +34,7 @@ impl AppContext {
         write_snapshot: bool,
         context_window_tokens: usize,
         features: OrchestratorFeatures,
+        performance: PerformanceConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
             workspace,
@@ -37,6 +42,7 @@ impl AppContext {
             write_snapshot,
             context_window_tokens,
             features,
+            performance,
         })
     }
 }

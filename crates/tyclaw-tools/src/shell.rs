@@ -3,7 +3,7 @@
 //! 在沙箱化的 shell 环境中执行命令，并提供：
 //! - 危险命令拦截（如 rm -rf、格式化磁盘、fork 炸弹等）
 //! - 执行超时控制（默认60秒）
-//! - 输出长度限制（最大10000字符，超过部分截断）
+//! - 输出长度限制（头尾双段截断，上限可配置，默认 20000 字符）
 
 use async_trait::async_trait;
 use regex::Regex;
@@ -13,10 +13,8 @@ use tokio::process::Command;
 
 use tyclaw_tool_abi::Sandbox;
 
-use crate::base::{brief_truncate, RiskLevel, Tool};
-
-/// 命令输出的最大字符数。超过此限制的输出会被截断。
-const MAX_OUTPUT_CHARS: usize = 20_000;
+use crate::base::{brief_truncate, truncate_head_tail, RiskLevel, Tool};
+use crate::truncation::current_truncation_limits;
 
 /// 命令执行的默认超时时间（秒）。
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -41,38 +39,6 @@ static DENY_PATTERNS: &[&str] = &[
     r">\s*/dev/[sh]d",             // 覆写磁盘设备
     r"\bchmod\s+-R\s+777\s+/\b",  // 递归 chmod 根目录
 ];
-
-/// 按"字符数"安全截断 UTF-8 字符串。
-///
-/// 返回值：
-/// - `Some((prefix, remaining_chars))`：发生截断，包含截断后的前缀和剩余字符数
-/// - `None`：无需截断
-fn truncate_by_chars(text: &str, max_chars: usize) -> Option<(&str, usize)> {
-    if max_chars == 0 {
-        let total = text.chars().count();
-        return Some(("", total));
-    }
-
-    let mut char_count = 0usize;
-    let mut cut_byte = text.len();
-    let mut truncated = false;
-
-    for (idx, _) in text.char_indices() {
-        if char_count == max_chars {
-            cut_byte = idx;
-            truncated = true;
-            break;
-        }
-        char_count += 1;
-    }
-
-    if !truncated {
-        return None;
-    }
-
-    let remaining = text[cut_byte..].chars().count();
-    Some((&text[..cut_byte], remaining))
-}
 
 /// Shell 命令执行工具。
 ///
@@ -178,11 +144,8 @@ impl Tool for ExecTool {
         {
             Ok(r) => {
                 let text = r.to_tool_output();
-                if let Some((prefix, remaining)) = truncate_by_chars(&text, MAX_OUTPUT_CHARS) {
-                    format!("{prefix}\n... (truncated, {remaining} more chars)")
-                } else {
-                    text
-                }
+                let limits = current_truncation_limits();
+                truncate_head_tail(&text, limits.exec_truncate_chars, limits.tail_ratio)
             }
             Err(e) => format!("Error: {e}"),
         }
@@ -261,12 +224,9 @@ impl Tool for ExecTool {
                 } else {
                     parts.join("\n")
                 };
-                // 输出截断（按字符数，避免 UTF-8 边界 panic）
-                if let Some((prefix, remaining)) = truncate_by_chars(&text, MAX_OUTPUT_CHARS) {
-                    format!("{prefix}\n... (truncated, {remaining} more chars)")
-                } else {
-                    text
-                }
+                // 输出截断（头尾双段保留，按字符数避免 UTF-8 边界 panic，上限可配置 R5）
+                let limits = current_truncation_limits();
+                truncate_head_tail(&text, limits.exec_truncate_chars, limits.tail_ratio)
             }
         }
     }
@@ -535,13 +495,40 @@ mod tests {
         assert!(result.contains("Exit code: 1"));
     }
 
-    /// 测试：UTF-8 文本按字符截断不会触发边界 panic
-    #[test]
-    fn test_truncate_by_chars_utf8_boundary() {
-        let s = "abc建def";
-        // 截断到 4 个字符，应该是 "abc建"
-        let (prefix, remain) = truncate_by_chars(s, 4).expect("should truncate");
-        assert_eq!(prefix, "abc建");
-        assert_eq!(remain, 3);
+    /// 测试：exec 输出超限时头尾双段保留（含截断标记，且尾部为原始结尾）
+    #[tokio::test]
+    async fn test_exec_output_head_tail_truncation() {
+        // 还原默认上限，避免其他用例污染（单例进程内共享）
+        crate::truncation::init_truncation_limits(crate::truncation::TruncationLimits::default());
+        let limits = current_truncation_limits();
+        // 构造远超上限的输出：用 seq 打印从 1 到一个很大的数，确保字符数 > 上限
+        let n = limits.exec_truncate_chars * 2;
+        let tool = ExecTool::new(None, None);
+        let mut params = HashMap::new();
+        // 打印一长串可识别的尾部标记，确保结尾稳定
+        params.insert(
+            "command".into(),
+            json!(format!(
+                "head -c {} /dev/zero | tr '\\0' 'a'; printf 'TAIL_MARKER_END'",
+                n
+            )),
+        );
+        let result = tool.execute(params).await;
+        // 1) 含截断标记（头尾之间插入）
+        assert!(
+            result.contains("truncated") && result.contains("chars omitted"),
+            "expected truncation marker, got tail: {}",
+            &result[result.len().saturating_sub(80)..]
+        );
+        // 2) 头部保留原始开头
+        assert!(result.starts_with('a'));
+        // 3) 尾部保留原始结尾（证明不是纯头部截断）
+        assert!(
+            result.ends_with("TAIL_MARKER_END"),
+            "expected original tail preserved"
+        );
+        // 4) 保留字符总数不超过上限（去掉标记后）
+        let total_chars = result.chars().count();
+        assert!(total_chars <= limits.exec_truncate_chars + 64);
     }
 }

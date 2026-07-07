@@ -25,6 +25,7 @@ pub mod consolidator;
 // 重新导出核心类型
 pub use case_store::{CaseRecord, CaseStore};
 pub use consolidator::MemoryConsolidator;
+pub use consolidator::{run_consolidation_batches, BatchOutcome, ConsolidationRunResult};
 pub use extractor::{extract_case, looks_like_resolved_issue};
 pub use memory_store::{consolidate_with_provider, MemoryStore};
 pub use retriever::CaseRetriever;

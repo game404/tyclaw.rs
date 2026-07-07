@@ -339,6 +339,10 @@ pub(crate) fn maybe_compact_system_message(
     messages: &mut [HashMap<String, Value>],
     total_iterations: usize,
 ) {
+    // EXTENDED_SYSTEM_ROUNDS 是可调阈值（当前为 0）：前 N 轮保留完整 system prompt。
+    // 为 0 时该早退恒不触发（total_iterations 自首轮起 ≥ 1），即从首轮即精简；
+    // 保留 `<=` 以便阈值调高为正数时语义正确。clippy 仅因当前常量取类型最小值而告警。
+    #[allow(clippy::absurd_extreme_comparisons)]
     if total_iterations <= EXTENDED_SYSTEM_ROUNDS {
         return;
     }

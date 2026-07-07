@@ -1,6 +1,7 @@
 pandas
 numpy
 openpyxl
+matplotlib
 requests
 opencv-python-headless
 av

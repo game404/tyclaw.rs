@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 
 use tyclaw_tool_abi::{Sandbox, SandboxGlobEntry, SandboxGrepRequest, SandboxGrepResponse};
 
-use crate::base::{brief_basename, brief_truncate, RiskLevel, Tool};
+use crate::base::{brief_basename, brief_truncate, truncate_head_tail, RiskLevel, Tool};
+use crate::truncation::current_truncation_limits;
 
 // ── 路径解析 ──────────────────────────────────────────────
 
@@ -510,7 +511,11 @@ fn format_grep_response(
     if truncated {
         result.push_str(&format!("\n... (truncated at {max_results} results)"));
     }
-    result
+
+    // 字符级头尾双段截断：grep 输出可能在行数受限后仍很长（超长行 / 大量上下文），
+    // 超过可配置上限时同时保留头部与尾部（R5.2 / R5.3 / R5.4），避免 LLM 反复重查。
+    let limits = current_truncation_limits();
+    truncate_head_tail(&result, limits.grep_truncate_chars, limits.tail_ratio)
 }
 
 fn validate_glob_pattern(pattern: &str) -> Option<String> {
@@ -1021,6 +1026,74 @@ mod tests {
         SandboxDirEntry, SandboxExecResult, SandboxFileStat, SandboxGlobEntry, SandboxGrepRequest,
         SandboxGrepResponse, SandboxWalkEntry,
     };
+
+    /// grep_search 输出超限时头尾双段保留（含截断标记，且尾部为原始结尾）。
+    #[test]
+    fn test_grep_output_head_tail_truncation() {
+        // 构造远超字符上限的 grep 输出。format_grep_response 会对行排序，
+        // 故用排序后稳定可预测的内容，通过「与未截断输出尾部比对」验证尾部保留。
+        let line_count = 20_000usize; // 行数足够，总字符量远超默认上限
+        let mut stdout = String::new();
+        for i in 0..line_count {
+            // 行号零填充，保证字典序与数值序一致，排序稳定。
+            stdout.push_str(&format!("src/file.rs:{i:06}:match_content_{i:06}\n"));
+        }
+        stdout.push_str("zzz_tail.rs:000001:TAIL_MARKER_END"); // 'z' 排序最大 → 永远在末尾
+
+        let resp_full = SandboxGrepResponse {
+            stdout: stdout.clone(),
+            stderr: String::new(),
+            exit_code: 0,
+        };
+        let resp_trunc = SandboxGrepResponse {
+            stdout,
+            stderr: String::new(),
+            exit_code: 0,
+        };
+
+        // 先用极大上限取得未截断的完整输出（作为尾部基准）。
+        crate::truncation::init_truncation_limits(crate::truncation::TruncationLimits {
+            exec_truncate_chars: crate::truncation::DEFAULT_TRUNCATE_CHARS,
+            grep_truncate_chars: usize::MAX / 2,
+            tail_ratio: crate::truncation::DEFAULT_TAIL_RATIO,
+        });
+        let full = format_grep_response(resp_full, "content", usize::MAX);
+        assert!(!full.contains("chars omitted"), "full output must not truncate");
+
+        // 再用默认上限触发头尾双段截断。
+        crate::truncation::init_truncation_limits(crate::truncation::TruncationLimits::default());
+        let limits = current_truncation_limits();
+        let out = format_grep_response(resp_trunc, "content", usize::MAX);
+
+        // 1) 头尾之间含截断标记。
+        assert!(
+            out.contains("truncated") && out.contains("chars omitted"),
+            "expected char-level truncation marker"
+        );
+        // 2) 头部保留原始开头（"N matches:" 前缀）。
+        assert!(out.starts_with(&full[..16]));
+        // 3) 尾部保留原始结尾（证明不是纯头部截断）。
+        assert!(
+            out.ends_with("TAIL_MARKER_END") && full.ends_with("TAIL_MARKER_END"),
+            "expected original tail preserved"
+        );
+        // 4) 保留字符总数不超过上限（去掉标记后裕量）。
+        assert!(out.chars().count() <= limits.grep_truncate_chars + 64);
+    }
+
+    /// grep_search 输出未超限时不附加截断标记（R5.6）。
+    #[test]
+    fn test_grep_output_no_truncation_under_limit() {
+        crate::truncation::init_truncation_limits(crate::truncation::TruncationLimits::default());
+        let resp = SandboxGrepResponse {
+            stdout: "src/a.rs:1:hello\nsrc/b.rs:2:world".into(),
+            stderr: String::new(),
+            exit_code: 0,
+        };
+        let out = format_grep_response(resp, "content", 200);
+        assert!(!out.contains("chars omitted"));
+        assert!(out.contains("hello") && out.contains("world"));
+    }
 
     struct TestSandbox {
         root: PathBuf,

@@ -40,6 +40,54 @@ impl MemoryStore {
         std::fs::write(&self.memory_file, content)
     }
 
+    /// 将无法合并入记忆、又即将从活动会话中移除的消息转储到恢复文件，避免静默丢失。
+    ///
+    /// 用于强制重置（R3.5）时记忆合并失败的兜底：把被丢弃的消息以 JSONL 追加到
+    /// `{memory_dir}/reset_dumps/{workspace_key}.jsonl`，便于事后人工恢复/排查。
+    /// 返回写入的转储文件路径（失败返回 None 并已打日志）。
+    pub fn dump_unrecoverable<T: serde::Serialize>(
+        &self,
+        workspace_key: &str,
+        messages: &[T],
+    ) -> Option<PathBuf> {
+        use std::io::Write;
+        if messages.is_empty() {
+            return None;
+        }
+        let dir = self.memory_dir.join("reset_dumps");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!(dir = %dir.display(), error = %e, "Failed to create reset_dumps dir");
+            return None;
+        }
+        // 文件名按 workspace 隔离；同一 workspace 多次失败追加到同一文件。
+        let safe_key: String = workspace_key
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let path = dir.join(format!("{safe_key}.jsonl"));
+        let ts = chrono::Local::now().to_rfc3339();
+        let mut buf = String::new();
+        for msg in messages {
+            match serde_json::to_string(msg) {
+                Ok(line) => buf.push_str(&format!("{{\"dumped_at\":\"{ts}\",\"message\":{line}}}\n")),
+                Err(e) => warn!(error = %e, "Failed to serialize message for reset dump"),
+            }
+        }
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(buf.as_bytes()) {
+                    warn!(path = %path.display(), error = %e, "Failed to write reset dump");
+                    return None;
+                }
+                Some(path)
+            }
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "Failed to open reset dump file");
+                None
+            }
+        }
+    }
+
     /// 追加历史日志。
     pub fn append_history(&self, entry: &str) -> std::io::Result<()> {
         use std::io::Write;

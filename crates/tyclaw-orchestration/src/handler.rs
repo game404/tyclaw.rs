@@ -2,12 +2,15 @@
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn, Level};
 
 use tyclaw_agent::runtime::{OnProgress, ProgressEvent};
 use tyclaw_agent::{RuntimeResult, RuntimeStatus};
-use tyclaw_control::AuditEntry;
+use tyclaw_control::{
+    warn_max_iterations_reset, AuditEntry, AuditLog, FailureAuditEntry, FailureCode,
+};
 use tyclaw_memory::{extract_case, CaseRetriever};
 use tyclaw_prompt::{strip_non_task_user_message, PromptInputs, SkillContent};
 use tyclaw_types::TyclawError;
@@ -21,6 +24,28 @@ use crate::types::{
     MAX_DYNAMIC_INJECTED_SKILLS, MAX_DYNAMIC_SIMILAR_CASES_CHARS, MAX_HISTORY_TOKENS_HARD_LIMIT,
     MIN_HISTORY_BUDGET_TOKENS, RESET_ON_START_FIELD, TOOL_RESULT_MAX_CHARS,
 };
+
+/// 非阻塞写审计日志：移入 `spawn_blocking` 避免阻塞 async worker，并在失败时打 WARN
+/// （而非静默吞掉），保证审计落盘失败可观测。
+pub(crate) fn spawn_audit_log(audit: &Arc<AuditLog>, entry: AuditEntry) {
+    let audit = Arc::clone(audit);
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = audit.log(&entry) {
+            warn!(error = %e, "failed to write audit log");
+        }
+    });
+}
+
+/// 非阻塞写失败审计（R14.1）：与 [`spawn_audit_log`] 同策略，但写入独立的
+/// `*.failures.jsonl`，附带失败原因码，供慢请求原因分布统计使用。
+pub(crate) fn spawn_failure_audit_log(audit: &Arc<AuditLog>, entry: FailureAuditEntry) {
+    let audit = Arc::clone(audit);
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = audit.log_failure(&entry) {
+            warn!(error = %e, "failed to write failure audit log");
+        }
+    });
+}
 
 /// 请求处理中间状态，在各阶段之间传递。
 struct HandlerContext<'a> {
@@ -295,7 +320,7 @@ impl Orchestrator {
         if self.app.features.enable_audit {
             let session_id = self.persistence.sessions.get_session_id(&ctx.workspace_key)
                 .unwrap_or_else(|| "unknown".into());
-            let _ = self.persistence.audit.log(&AuditEntry {
+            spawn_audit_log(&self.persistence.audit, AuditEntry {
                 timestamp: chrono::Utc::now(),
                 workspace_key: ctx.workspace_key.clone(),
                 session_id,
@@ -464,6 +489,87 @@ impl Orchestrator {
         msg
     }
 
+    /// Fresh user turn 治理关卡链（R1 / R3）。
+    ///
+    /// 在构建本回合 prompt 前，对持久化会话历史按 design.md §1/§3 约定的顺序依次施加：
+    ///   1. **污染剔除**（`filter_pollution`，R1.1/R1.2/R1.4）：剔除上一轮残留的失败
+    ///      兜底消息（如 `I cannot make progress`），为失去结果的 tool_call 补齐占位，
+    ///      并记录污染剔除审计（`removed_count` + `workspace_key`，含 0；R1.5）。
+    ///   2. **配对修复**（`enforce_tool_call_pairing`，R3.6）：丢弃孤立 tool_result，
+    ///      维持 tool_call/tool_result 配对完整；丢弃数作为 `pairs_fixes` 供下一关卡。
+    ///   3. **规模上限**（`enforce_size_limits`，R3.2/R3.3/R3.5）：强制合并 / 滚动截断 /
+    ///      强制重置，并记录 size-limit 动作审计（触发原因 + `workspace_key`；R3.8）。
+    ///
+    /// 关卡仅作用于活动（未合并）历史区间，治理后的会话被持久化，供后续轮次复用。
+    /// 阈值统一取自 `AppContext::performance`（`PollutionConfig` / `SizeLimitConfig`）。
+    async fn apply_fresh_turn_gates(&self, ctx: &HandlerContext<'_>) {
+        let mut session = self
+            .persistence
+            .sessions
+            .get_or_create_clone(&ctx.workspace_key);
+        let perf = &self.app.performance;
+
+        // 仅治理活动（未合并）历史区间，保留已合并前缀不变。
+        let active_start = session.last_consolidated.min(session.messages.len());
+        let active: Vec<HashMap<String, Value>> = session.messages[active_start..].to_vec();
+
+        // ── Gate 1: 污染剔除 + 审计（R1.1/R1.2/R1.4/R1.5）──
+        let (pollution, pollution_audit) = crate::pollution_filter::filter_pollution_audited(
+            &active,
+            &perf.pollution,
+            &ctx.workspace_key,
+        );
+
+        // ── Gate 2: 配对修复（R3.6）──
+        let paired = history::enforce_tool_call_pairing(&pollution.cleaned);
+        // 配对修复数：本次丢弃的孤立 tool_result 数量，作为 Pairs_Fixes 信号驱动规模治理。
+        let pairs_fixes = pollution.cleaned.len().saturating_sub(paired.len());
+
+        // 将治理后的活动历史写回会话（保留已合并前缀）。
+        session.messages.truncate(active_start);
+        session.messages.extend(paired);
+
+        // 污染剔除审计（R1.5）：始终记录一条（含 removed_count == 0）。
+        info!(
+            workspace_key = %pollution_audit.workspace_key,
+            removed_count = pollution_audit.removed_count,
+            placeholders = pollution.placeholder_ids.len(),
+            "Gate(pollution_filter): audited fresh user turn"
+        );
+
+        // ── Gate 3: 会话规模上限 + 审计（R3.2/R3.3/R3.5/R3.8）──
+        let mem_dir = self.persistence.workspace_mgr.memory_dir(&ctx.workspace_key);
+        let consolidator =
+            tyclaw_memory::MemoryConsolidator::new(&mem_dir, self.app.context_window_tokens);
+        let action = crate::session_manager::SessionManager::enforce_size_limits(
+            &mut session,
+            pairs_fixes,
+            &perf.session_limits,
+            &perf.consolidation,
+            &consolidator,
+            self.provider.as_ref(),
+            &self.app.model,
+        )
+        .await;
+
+        // size-limit 动作审计（R3.8）：仅在触发动作时记录触发原因与 workspace。
+        if let Some(audit) =
+            crate::session_manager::build_size_limit_audit(&ctx.workspace_key, &action)
+        {
+            info!(
+                workspace_key = %audit.workspace_key,
+                action = audit.action.as_str(),
+                reason = audit.reason.as_str(),
+                "Gate(size_limit): audited fresh user turn"
+            );
+        }
+
+        // 持久化治理后的会话，供 prompt 构建与后续轮次复用。
+        if let Err(e) = self.persistence.sessions.save(&session) {
+            warn!(error = %e, workspace_key = %ctx.workspace_key, "Failed to persist session after fresh-turn gates");
+        }
+    }
+
     /// Steps 5-8: 收集技能、检索案例、构建历史、过滤记忆、组装 prompt。
     async fn prepare_prompt(
         &self,
@@ -471,6 +577,11 @@ impl Orchestrator {
         user_message: &str,
         req: &RequestContext,
     ) -> Vec<HashMap<String, Value>> {
+        // 5. Fresh user turn 治理关卡链：污染剔除 → 配对修复 → 规模上限（R1/R3）。
+        //    在构建 prompt 历史前对持久化会话施加治理，确保送入 Agent_Loop 的历史
+        //    已剔除污染、配对完整且规模可控。
+        self.apply_fresh_turn_gates(ctx).await;
+
         let _workspace = self.persistence.workspace_mgr.get_workspace(ctx.workspace_id);
         let mut budget_plan = helpers::compute_context_budget_plan(user_message);
         let is_first_turn = {
@@ -684,6 +795,9 @@ impl Orchestrator {
         let channel_owned = ctx.channel.to_string();
         let chat_id_owned = ctx.chat_id.to_string();
         let user_id_owned = ctx.user_id.to_string();
+        // 供 provider 并发控制器申请 per-user 许可（R6.2/R6.5）。与 TIMER 用途不同、
+        // 消费者也不同（provider crate 的 task-local），故单独克隆一份。
+        let user_id_for_provider = ctx.user_id.to_string();
         let conversation_id_owned = ctx.chat_id.to_string();
 
         // 9a. Per-workspace work root
@@ -752,8 +866,11 @@ impl Orchestrator {
                                         conversation_id_owned,
                                         tyclaw_sandbox::CURRENT_SANDBOX.scope(
                             sb_clone,
-                            tyclaw_agent::runtime::INJECTION_QUEUE
-                                .scope(injection_queue.clone(), run_future),
+                            tyclaw_provider::CURRENT_USER_ID.scope(
+                                user_id_for_provider.clone(),
+                                tyclaw_agent::runtime::INJECTION_QUEUE
+                                    .scope(injection_queue.clone(), run_future),
+                            ),
                         ),
                                     ),
                                 ),
@@ -781,8 +898,11 @@ impl Orchestrator {
                                     tyclaw_tools::timer::TIMER_CURRENT_CONVERSATION_ID
                                         .scope(
                                             conversation_id_owned,
-                                            tyclaw_agent::runtime::INJECTION_QUEUE
-                                                .scope(injection_queue, run_future),
+                                            tyclaw_provider::CURRENT_USER_ID.scope(
+                                                user_id_for_provider.clone(),
+                                                tyclaw_agent::runtime::INJECTION_QUEUE
+                                                    .scope(injection_queue, run_future),
+                                            ),
                                         ),
                                 ),
                             ),
@@ -881,6 +1001,7 @@ impl Orchestrator {
             cache_hit_tokens: result.cache_hit_tokens,
             cache_write_tokens: result.cache_write_tokens,
             request_id,
+            hit_max_iterations: result.hit_max_iterations,
         }))
     }
 
@@ -892,6 +1013,21 @@ impl Orchestrator {
         run: CompletedRun,
     ) -> Result<AgentResponse, TyclawError> {
         let duration = ctx.start.elapsed().as_secs_f64();
+
+        // R14.1/R14.2：本轮因命中 max_iterations 上限而终止 → 以 WARN 级别打点告警，
+        // 并写一条带原因码 `hit_max_iterations` 的失败审计，供慢请求原因分布统计。
+        if run.hit_max_iterations {
+            warn_max_iterations_reset(&ctx.workspace_key);
+            spawn_failure_audit_log(
+                &self.persistence.audit,
+                FailureAuditEntry {
+                    workspace_key: ctx.workspace_key.clone(),
+                    failure_code: FailureCode::HitMaxIterations,
+                    turn_id: run.turn_id.clone(),
+                    duration_ms: (duration * 1000.0) as u64,
+                },
+            );
+        }
 
         // 10. 保存轮次到会话
         if !run.messages.is_empty() {
@@ -966,7 +1102,7 @@ impl Orchestrator {
 
             let session_id = self.persistence.sessions.get_session_id(&ctx.workspace_key)
                 .unwrap_or_else(|| "unknown".into());
-            let _ = self.persistence.audit.log(&AuditEntry {
+            spawn_audit_log(&self.persistence.audit, AuditEntry {
                 timestamp: chrono::Utc::now(),
                 workspace_key: ctx.workspace_key.clone(),
                 session_id,
@@ -1176,10 +1312,281 @@ struct CompletedRun {
     cache_hit_tokens: u64,
     cache_write_tokens: u64,
     request_id: u64,
+    /// 本轮是否因命中 `max_iterations` 上限而终止（R2.2/R14）。
+    /// post_process 据此打 WARN 告警并写失败审计（原因码 hit_max_iterations）。
+    hit_max_iterations: bool,
 }
 
 /// run_agent 的返回值：要么提前返回（ask_user），要么正常完成。
 enum AgentRunResult {
     EarlyReturn(AgentResponse),
     Completed(CompletedRun),
+}
+
+#[cfg(test)]
+mod fresh_turn_gates_tests {
+    //! 编排关卡端到端集成测试（任务 19.3）。
+    //!
+    //! 验证 fresh user turn 治理关卡链在**单回合内**协同工作：
+    //!   污染剔除（`filter_pollution`，R1.1/R1.2）
+    //!   → 配对修复（`enforce_tool_call_pairing`，R3.6）
+    //!   → 规模上限（`enforce_size_limits`，R3.2/R3.6）。
+    //!
+    //! 测试通过真实的 `Orchestrator`（经 `OrchestratorBuilder` 构建，注入一个
+    //! 脚本化的 `LLMProvider`）直接驱动关卡链入口 `apply_fresh_turn_gates`，
+    //! 在一份精心构造的会话历史上观察三关卡治理后的**持久化会话**，断言：
+    //!   - 污染消息被剔除、占位回填（含 `[pollution-removed]` 标识），失败兜底文案消失；
+    //!   - 配对修复后不残留任何孤立 tool_result（每条 tool 消息都有在先的 assistant 声明）；
+    //!   - 规模上限动作生效（活动消息数回落到 `max_messages` 以内）。
+    //!
+    //! 整个测试不触网：脚本化 provider 在记忆合并被触发时返回 `save_memory` 工具调用，
+    //! 使强制合并确定性地成功。
+
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+
+    use tyclaw_provider::types::{ChatRequest, LLMResponse, ToolCallRequest};
+    use tyclaw_provider::LLMProvider;
+    use tyclaw_types::TyclawError;
+
+    use crate::config::{PerformanceConfig, PollutionConfig, SizeLimitConfig};
+    use crate::pollution_filter::POLLUTION_PLACEHOLDER_MARKER;
+    use crate::OrchestratorBuilder;
+
+    /// 脚本化 provider：任何 `chat` 调用都返回一个 `save_memory` 工具调用，
+    /// 使 `enforce_size_limits` 触发的强制记忆合并确定性地成功（不触网）。
+    struct ConsolidatingProvider;
+
+    #[async_trait]
+    impl LLMProvider for ConsolidatingProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<LLMResponse, TyclawError> {
+            let mut arguments: HashMap<String, Value> = HashMap::new();
+            arguments.insert("history_entry".into(), json!("test history entry"));
+            arguments.insert("memory_update".into(), json!("test memory update"));
+            Ok(LLMResponse {
+                content: None,
+                tool_calls: vec![ToolCallRequest {
+                    id: "mem_call".into(),
+                    name: "save_memory".into(),
+                    arguments,
+                }],
+                finish_reason: "tool_calls".into(),
+                usage: HashMap::new(),
+                reasoning_content: None,
+            })
+        }
+
+        fn default_model(&self) -> &str {
+            "test-model"
+        }
+    }
+
+    fn umsg(content: &str) -> HashMap<String, Value> {
+        let mut m = HashMap::new();
+        m.insert("role".into(), json!("user"));
+        m.insert("content".into(), json!(content));
+        m
+    }
+
+    fn assistant_call(id: &str, name: &str) -> HashMap<String, Value> {
+        let mut m = HashMap::new();
+        m.insert("role".into(), json!("assistant"));
+        m.insert("content".into(), json!(""));
+        m.insert(
+            "tool_calls".into(),
+            json!([{"id": id, "type": "function", "function": {"name": name, "arguments": "{}"}}]),
+        );
+        m
+    }
+
+    fn tool_result(id: &str, name: &str, content: &str) -> HashMap<String, Value> {
+        let mut m = HashMap::new();
+        m.insert("role".into(), json!("tool"));
+        m.insert("tool_call_id".into(), json!(id));
+        m.insert("name".into(), json!(name));
+        m.insert("content".into(), json!(content));
+        m
+    }
+
+    /// 跨整段历史校验「无孤立 tool_result」：每条 tool 消息的 tool_call_id
+    /// 都能在其之前出现的 assistant.tool_calls 声明中找到配对（R3.6）。
+    fn assert_no_orphan_tool_results(messages: &[HashMap<String, Value>]) {
+        let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for m in messages {
+            match m.get("role").and_then(|v| v.as_str()) {
+                Some("assistant") => {
+                    if let Some(tcs) = m.get("tool_calls").and_then(|v| v.as_array()) {
+                        for tc in tcs {
+                            if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                declared.insert(id.to_string());
+                            }
+                        }
+                    }
+                }
+                Some("tool") => {
+                    let id = m
+                        .get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .expect("tool message must carry tool_call_id");
+                    assert!(
+                        declared.contains(id),
+                        "orphan tool_result {id} survived the gate chain"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// 端到端：污染剔除 + 配对修复 + 规模限制在单回合内协同工作（R1.1/R1.2/R3.6）。
+    #[tokio::test]
+    async fn pollution_pairing_and_size_limits_cooperate_in_one_turn() {
+        // 激进的规模阈值，使活动消息数（治理后 12 条）必定超过 max_messages 而触发规模治理。
+        let perf = PerformanceConfig {
+            pollution: PollutionConfig::default(),
+            session_limits: SizeLimitConfig {
+                max_messages: 6,
+                rolling_target: 4,
+                pairs_fixes_warn: 30,
+                pairs_fixes_force_reset: 60,
+            },
+            ..PerformanceConfig::default()
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // 全局 prompt_store 在构建编排器时经 nudge_loader 初始化（读取
+        // workspace/config/prompts.yaml）；强制记忆合并还需 `memory_consolidation_prompt`。
+        // 写入最小 prompts.yaml 以满足两者（OnceLock 幂等，首个初始化生效）。
+        let cfg_dir = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("prompts.yaml"),
+            "memory_consolidation_prompt: |\n  Summarize the conversation and call save_memory.\n",
+        )
+        .unwrap();
+
+        let orch = OrchestratorBuilder::new(Arc::new(ConsolidatingProvider), tmp.path())
+            .with_model("test-model")
+            .with_performance(perf.clone())
+            .build();
+
+        let workspace_key = "test_ws".to_string();
+        orch.persistence.workspace_mgr.ensure_workspace(&workspace_key);
+
+        // 构造单回合前的会话历史，混合三类待治理情形：
+        //   (a) 上一轮残留的失败兜底污染 tool_result（已配对）→ 应被占位替换；
+        //   (b) 一个孤立 tool_result（无对应 assistant 声明）→ 应被配对修复丢弃；
+        //   (c) 足量完整 user turn，使治理后活动消息数超 max_messages → 触发规模治理。
+        let mut seeded = vec![
+            umsg("task 0"),
+            assistant_call("call_0", "exec"),
+            // (a) 污染：失败兜底文案，已配对 → 替换为占位。
+            tool_result("call_0", "exec", "I cannot make progress on this task"),
+            umsg("task 1"),
+            assistant_call("call_1", "exec"),
+            tool_result("call_1", "exec", "valid output 1"),
+            // (b) 孤立 tool_result：无任何 assistant 声明该 id（非污染，正文不含关键词）。
+            tool_result("orphan_x", "exec", "orphan output line"),
+            umsg("task 2"),
+            assistant_call("call_2", "exec"),
+            tool_result("call_2", "exec", "valid output 2"),
+            umsg("task 3"),
+            assistant_call("call_3", "exec"),
+            tool_result("call_3", "exec", "valid output 3"),
+        ];
+
+        // 写入持久化会话（活动区间，last_consolidated = 0）。
+        let mut session = orch.persistence.sessions.get_or_create_clone(&workspace_key);
+        session.messages.append(&mut seeded);
+        session.last_consolidated = 0;
+        orch.persistence.sessions.save(&session).unwrap();
+
+        let pre_active = session.messages.len() - session.last_consolidated;
+        assert_eq!(pre_active, 13, "sanity: 13 active messages before gates");
+
+        // 构造 HandlerContext，仅 workspace_key 被关卡链使用。
+        let ctx = HandlerContext {
+            start: Instant::now(),
+            user_id: "u1",
+            user_name: "User One",
+            workspace_id: "ws",
+            channel: "cli",
+            chat_id: "direct",
+            workspace_key: workspace_key.clone(),
+            conversation_key: format!("{workspace_key}\u{1}cli\u{1}direct"),
+            on_progress: None,
+        };
+
+        // ── 驱动真实关卡链入口 ──
+        orch.apply_fresh_turn_gates(&ctx).await;
+
+        // 读取治理后的持久化会话。
+        orch.persistence.sessions.invalidate(&workspace_key);
+        let governed = orch.persistence.sessions.get_or_create_clone(&workspace_key);
+        let msgs = &governed.messages;
+
+        // ── 断言 1：污染剔除（R1.1/R1.2）──
+        // 失败兜底文案不复存在。
+        for m in msgs {
+            if let Some(c) = m.get("content").and_then(|v| v.as_str()) {
+                assert!(
+                    !c.contains("I cannot make progress"),
+                    "pollution failure text must be removed"
+                );
+            }
+        }
+        // call_0 的结果被替换为含标识的占位 tool_result。
+        let placeholder = msgs.iter().find(|m| {
+            m.get("tool_call_id").and_then(|v| v.as_str()) == Some("call_0")
+        });
+        let placeholder = placeholder.expect("placeholder tool_result for call_0 must exist");
+        let placeholder_content = placeholder
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            placeholder_content.contains(POLLUTION_PLACEHOLDER_MARKER),
+            "backfilled placeholder must carry the pollution-removed marker"
+        );
+
+        // ── 断言 2：配对修复（R3.6）──
+        // 孤立 tool_result 被丢弃。
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.get("tool_call_id").and_then(|v| v.as_str()) == Some("orphan_x")),
+            "orphan tool_result must be dropped by pairing repair"
+        );
+        // 全段历史无任何孤立 tool_result（配对完整）。
+        assert_no_orphan_tool_results(msgs);
+
+        // ── 断言 3：规模上限生效（R3.2/R3.6）──
+        // 活动（未合并）消息数回落到 max_messages 以内，且确实较治理前显著减少。
+        let active = governed.messages.len() - governed.last_consolidated;
+        assert!(
+            active <= perf.session_limits.max_messages,
+            "active message count {active} must fall within max_messages {}",
+            perf.session_limits.max_messages
+        );
+        assert!(
+            active < pre_active,
+            "size-limit governance must reduce the active window (pre={pre_active}, post={active})"
+        );
+
+        // 规模治理后的活动窗口不以孤立 tool_result（role==tool）开头（R3.6/R3.7）。
+        let active_window = &governed.messages[governed.last_consolidated..];
+        if let Some(first) = active_window.first() {
+            assert_ne!(
+                first.get("role").and_then(|v| v.as_str()),
+                Some("tool"),
+                "active window must not start with an orphan tool_result"
+            );
+        }
+    }
 }

@@ -125,6 +125,9 @@ pub struct RuntimeResult {
     /// 本轮唯一标识。agent_loop 给所有新增消息打上此 `_turn_id`，
     /// save_turn 据此精确筛选本轮消息，不受前缀压缩/标记消费的影响。
     pub turn_id: String,
+    /// 本轮是否因命中 `max_iterations` 上限而终止（R2.2）。
+    /// 子任务状态校正据此判定：命中上限且产出空白/受阻时应判为 Failed/Blocked。
+    pub hit_max_iterations: bool,
 }
 
 /// 进度事件——agent loop / handler 向外部渠道（CLI、钉钉卡片等）汇报的消息载荷。

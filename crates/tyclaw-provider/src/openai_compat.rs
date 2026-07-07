@@ -20,9 +20,86 @@ use crate::provider::LLMProvider;
 /// 正常 LLM 请求 10-30s 内开始返回；60s 不响应基本是死连接或严重排队。
 const SEND_TIMEOUT_SECS: u64 = 60;
 
-/// SSE chunk 间隔超时：两个连续 data chunk 之间的最大等待。
-/// thinking 模型可能有较长的首 chunk 延迟，但 90s 内一定会有心跳或数据。
-const CHUNK_TIMEOUT_SECS: u64 = 90;
+/// SSE 动态超时配置（R10）。
+///
+/// 原先 SSE chunk 间隔超时是硬编码常量 `CHUNK_TIMEOUT_SECS = 90`，本结构将其改为
+/// 运行期可配置 + 高并发动态阈值：
+/// - 基线 `chunk_timeout_secs`（默认 90s）：两个连续 data chunk 之间的最大等待。
+///   thinking 模型可能有较长的首 chunk 延迟，但基线时间内一定会有心跳或数据。
+/// - 高并发 `high_concurrency_timeout_secs`（默认 150s）：当 in-flight LLM 调用数
+///   超过 `high_concurrency_inflight` 阈值时启用更宽松的超时，避免 90s 级停顿放大耗时（R10.2）。
+///
+/// 不变量：`high_concurrency_timeout_secs >= chunk_timeout_secs`（高并发不应比基线更严格）。
+#[derive(Debug, Clone)]
+pub struct SseConfig {
+    /// chunk 超时基线（秒），默认 90。
+    pub chunk_timeout_secs: u64,
+    /// 高并发 chunk 超时（秒），默认 150。
+    pub high_concurrency_timeout_secs: u64,
+    /// 触发动态超时提升的 in-flight 阈值，默认 8。
+    pub high_concurrency_inflight: usize,
+    /// SSE 最大重试次数，默认 3。
+    pub max_retries: usize,
+}
+
+impl Default for SseConfig {
+    fn default() -> Self {
+        Self {
+            chunk_timeout_secs: 90,
+            high_concurrency_timeout_secs: 150,
+            high_concurrency_inflight: 8,
+            max_retries: 3,
+        }
+    }
+}
+
+/// 依据当前 in-flight 数选择 chunk 超时阈值（R10.2，Property 28）。
+///
+/// 当 `current_inflight > cfg.high_concurrency_inflight` 时返回
+/// `high_concurrency_timeout_secs`，否则返回基线 `chunk_timeout_secs`。
+/// 设为 `pub` 以便属性测试（任务 14.2）直接调用。
+pub fn effective_chunk_timeout(cfg: &SseConfig, current_inflight: usize) -> std::time::Duration {
+    let secs = if current_inflight > cfg.high_concurrency_inflight {
+        cfg.high_concurrency_timeout_secs
+    } else {
+        cfg.chunk_timeout_secs
+    };
+    std::time::Duration::from_secs(secs)
+}
+
+/// 运行期 SSE 配置单例。编排层启动时通过 [`init_sse_config`] 注入，
+/// 未注入时惰性初始化为 [`SseConfig::default`]，保持向后兼容（基线 90s）。
+static SSE_CONFIG: std::sync::OnceLock<std::sync::RwLock<SseConfig>> = std::sync::OnceLock::new();
+
+fn sse_config_cell() -> &'static std::sync::RwLock<SseConfig> {
+    SSE_CONFIG.get_or_init(|| std::sync::RwLock::new(SseConfig::default()))
+}
+
+/// 注入运行期 SSE 配置（启动时由编排层调用一次）。
+pub fn init_sse_config(cfg: SseConfig) {
+    *sse_config_cell()
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = cfg;
+}
+
+/// 读取当前 SSE 配置快照。
+pub fn current_sse_config() -> SseConfig {
+    sse_config_cell()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// 估算当前全局 in-flight LLM 调用数：全局上限 - 可用许可。
+///
+/// 许可由并发控制器（R6）持有，每个进行中的 LLM 调用占用一枚全局许可，
+/// 因此 `global_max_inflight - available_global_permits` 即为当前 in-flight 数。
+fn current_global_inflight() -> usize {
+    let ctrl = crate::concurrency::controller();
+    ctrl.config()
+        .global_max_inflight
+        .saturating_sub(ctrl.available_global_permits())
+}
 
 /// Reasoning 累积上限（字符数）。GLM 偶尔会在 reasoning 中无限输出
 /// （把整个代码写进 thinking），超过此阈值后截断 reasoning 并继续处理。
@@ -581,8 +658,23 @@ impl OpenAICompatProvider {
         let mut reasoning_truncated_at: Option<std::time::Instant> = None;
         let mut abort_stream = false;
 
+        // SSE 动态超时配置快照（R10.1）：基线 + 高并发阈值。
+        let mut sse_cfg = current_sse_config();
+        // 使高并发阈值与实际全局并发上限自洽：默认 high_concurrency_inflight=8 可能 ≥ 全局上限
+        // （默认 4），导致 `current_inflight > 阈值` 永远为 false、动态超时形同虚设。
+        // 将阈值钳制为 (global_limit - 1)，确保接近/达到饱和（in-flight 达全局上限）时启用更宽松超时；
+        // 同时保留用户配置的更低阈值（在饱和前提前放宽）。
+        let global_limit = crate::concurrency::controller().config().global_max_inflight;
+        if global_limit > 0 {
+            sse_cfg.high_concurrency_inflight =
+                sse_cfg.high_concurrency_inflight.min(global_limit - 1);
+        }
+
         loop {
-            let chunk_timeout = std::time::Duration::from_secs(CHUNK_TIMEOUT_SECS);
+            // 依据当前 in-flight LLM 调用数动态选择 chunk 超时阈值（R10.2）。
+            // in-flight 来源：并发控制器全局许可（global 上限 - 可用许可）。
+            // 每次迭代重新计算，使阈值随并发状态实时调整；无高并发时退回基线，保持向后兼容。
+            let chunk_timeout = effective_chunk_timeout(&sse_cfg, current_global_inflight());
             let chunk = match tokio::time::timeout(chunk_timeout, stream.next()).await {
                 Ok(Some(Ok(c))) => {
                     last_chunk_time = std::time::Instant::now();
@@ -2389,5 +2481,242 @@ mod tests {
         let prepared2 = provider.prepare_body(&req2);
         provider.commit_cache_plan(prepared2.commit_plan.unwrap());
         assert_eq!(provider.cache_breakpoint_idx("prefix-growth"), 3);
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 100, ..Default::default() })]
+
+        // Feature: execution-performance-optimization, Property 28: chunk 超时阈值随并发单调选择
+        // Validates: Requirements 10.2
+        #[test]
+        fn prop_effective_chunk_timeout_selects_by_inflight(
+            chunk_timeout_secs in 1u64..=300,
+            delta in 0u64..=300,
+            high_concurrency_inflight in 0usize..=64,
+            max_retries in 0usize..=10,
+            current_inflight in 0usize..=128,
+        ) {
+            let high_concurrency_timeout_secs = chunk_timeout_secs + delta;
+
+            // 不变量（构造保证）：高并发阈值不应比基线更严格
+            prop_assert!(high_concurrency_timeout_secs >= chunk_timeout_secs);
+
+            let cfg = SseConfig {
+                chunk_timeout_secs,
+                high_concurrency_timeout_secs,
+                high_concurrency_inflight,
+                max_retries,
+            };
+
+            let result = effective_chunk_timeout(&cfg, current_inflight);
+
+            if current_inflight > high_concurrency_inflight {
+                prop_assert_eq!(
+                    result,
+                    std::time::Duration::from_secs(high_concurrency_timeout_secs)
+                );
+            } else {
+                prop_assert_eq!(
+                    result,
+                    std::time::Duration::from_secs(chunk_timeout_secs)
+                );
+            }
+        }
+    }
+}
+
+/// SSE 重试与心跳维持集成测试（任务 14.5，覆盖 R10.3 / R10.4）。
+///
+/// 真实 SSE 网络往返过重，难以在单测中稳定复现「已开始接收数据后超时重试」。
+/// 因此在最实用的接缝上做聚焦集成测试：
+/// - R10.3（已开始接收数据后超时重试）：用一个总是返回**临时性**错误
+///   （SSE chunk timeout）的假 Provider 驱动 `chat_with_retry`（trait 默认方法），
+///   断言重试被逐次尝试、耗尽后返回可识别的「请稍后重试」提示（`RETRY_LATER_MESSAGE`），
+///   而非透传原始失败兜底文案。重试间的指数退避（1s/2s/4s）借
+///   `#[tokio::test(start_paused = true)]` 让 tokio 自动虚拟推进时间，保持测试快速。
+/// - R10.3 恢复路径：临时错误若干次后转为成功，断言 `chat_with_retry` 最终返回成功响应
+///   （重试恢复），用内部原子计数器记录调用次数。
+/// - R10.4 相关（SSE 等待期的动态 chunk 超时 / 心跳间隔选择）：断言
+///   `effective_chunk_timeout` 在高并发（in-flight 超阈值）时选用更宽松的
+///   高并发超时、否则用基线超时——这正是 SSE 逐 chunk 等待（含心跳维持窗口）所用的判定。
+#[cfg(test)]
+mod sse_retry_heartbeat_integration {
+    use super::*;
+    use crate::provider::{LLMProvider, RETRY_LATER_MESSAGE};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 失败兜底/污染文案样例：重试耗尽提示绝不能包含此类文本（R10.5 关联）。
+    const FAILURE_FALLBACK: &str = "I cannot make progress";
+
+    /// 始终返回临时性错误（SSE chunk 超时）的假 Provider。
+    ///
+    /// 用于复现「已开始接收数据后 SSE 超时 → 触发退避重试 → 重试耗尽」的链路：
+    /// `chat()` 每次都返回 `finish_reason="error"` 且内容含临时错误标记
+    /// （`"SSE chunk timeout"` 含 `timeout` 关键词，被 `is_transient_error` 判为可重试），
+    /// 并记录被调用的总次数以验证重试确实发生。
+    struct AlwaysTransientProvider {
+        model: String,
+        calls: AtomicUsize,
+    }
+
+    impl AlwaysTransientProvider {
+        fn new() -> Self {
+            Self { model: "fake-model".to_string(), calls: AtomicUsize::new(0) }
+        }
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for AlwaysTransientProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<LLMResponse, TyclawError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // 模拟「已开始接收数据后」chunk 间隔超时（与 chat_stream 中的客户端侧超时同义）。
+            Ok(LLMResponse::error(
+                "SSE chunk timeout [client-side] (90s, has_content=true, total=95s)",
+            ))
+        }
+
+        fn default_model(&self) -> &str {
+            &self.model
+        }
+    }
+
+    /// 前 `fail_times` 次返回临时性 SSE 超时错误，其后返回成功响应的假 Provider。
+    ///
+    /// 用于验证「临时错误重试后恢复成功」：断言 `chat_with_retry` 最终返回成功内容。
+    struct TransientThenSuccessProvider {
+        model: String,
+        fail_times: usize,
+        calls: AtomicUsize,
+        success_content: String,
+    }
+
+    impl TransientThenSuccessProvider {
+        fn new(fail_times: usize, success_content: &str) -> Self {
+            Self {
+                model: "fake-model".to_string(),
+                fail_times,
+                calls: AtomicUsize::new(0),
+                success_content: success_content.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for TransientThenSuccessProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<LLMResponse, TyclawError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_times {
+                Ok(LLMResponse::error("SSE chunk timeout [client-side]"))
+            } else {
+                Ok(LLMResponse {
+                    content: Some(self.success_content.clone()),
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".to_string(),
+                    usage: std::collections::HashMap::new(),
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        fn default_model(&self) -> &str {
+            &self.model
+        }
+    }
+
+    /// 用例 1（R10.3）：SSE 超时持续发生时，退避重试被逐次尝试，
+    /// 耗尽后返回可识别的「请稍后重试」提示，而非原始失败兜底文案。
+    ///
+    /// 退避序列 1s/2s/4s 由 `start_paused` 下的 tokio 自动虚拟推进，测试瞬时完成。
+    #[tokio::test(start_paused = true)]
+    async fn sse_timeout_retries_then_exhausts_to_retry_later_prompt() {
+        let provider = AlwaysTransientProvider::new();
+
+        let resp = provider
+            .chat_with_retry(Vec::new(), None, None, None)
+            .await;
+
+        // chat() 被调用 4 次：3 次退避重试 + 1 次最终尝试（证明重试确实发生）。
+        assert_eq!(
+            provider.call_count(),
+            4,
+            "expected 3 backoff retries plus a final attempt"
+        );
+
+        let content = resp.content.as_deref().unwrap_or("");
+        // 重试耗尽后返回可识别的「请稍后重试」提示。
+        assert_eq!(content, RETRY_LATER_MESSAGE);
+        assert!(
+            content.contains("稍后重试"),
+            "exhausted retries must return a retry-later prompt, got: {content}"
+        );
+        // 不得透传原始失败兜底/污染文案。
+        assert!(
+            !content.contains(FAILURE_FALLBACK),
+            "retry-later prompt must not contain failure-fallback text"
+        );
+        assert!(
+            !content.contains("SSE chunk timeout"),
+            "retry-later prompt must not leak the raw transient error"
+        );
+    }
+
+    /// 用例 2（R10.3 恢复路径）：前两次 SSE 超时、第三次成功时，
+    /// `chat_with_retry` 经退避重试后恢复并返回成功响应。
+    #[tokio::test(start_paused = true)]
+    async fn sse_timeout_recovers_on_later_retry() {
+        let provider = TransientThenSuccessProvider::new(2, "final answer");
+
+        let resp = provider
+            .chat_with_retry(Vec::new(), None, None, None)
+            .await;
+
+        // 第 3 次调用（前两次失败后）返回成功。
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(resp.finish_reason, "stop");
+        assert_eq!(resp.content.as_deref(), Some("final answer"));
+    }
+
+    /// 用例 3（R10.4 相关）：SSE 逐 chunk 等待（含心跳维持窗口）所用的动态超时选择——
+    /// in-flight 超阈值时选用更宽松的高并发超时，否则用基线超时。
+    ///
+    /// 这是确定性检查：验证 `effective_chunk_timeout` 在 SSE 等待期会随并发状态
+    /// 在「基线」与「高并发」两档之间切换，保证高并发下不过早判定 chunk 间隔超时。
+    #[test]
+    fn effective_chunk_timeout_switches_with_concurrency() {
+        let cfg = SseConfig {
+            chunk_timeout_secs: 90,
+            high_concurrency_timeout_secs: 150,
+            high_concurrency_inflight: 8,
+            max_retries: 3,
+        };
+
+        // 低于/等于阈值 → 基线超时（心跳/数据在基线窗口内必到达）。
+        assert_eq!(
+            effective_chunk_timeout(&cfg, 0),
+            std::time::Duration::from_secs(90)
+        );
+        assert_eq!(
+            effective_chunk_timeout(&cfg, 8),
+            std::time::Duration::from_secs(90),
+            "at threshold should still use baseline timeout"
+        );
+
+        // 超过阈值（高并发）→ 高并发超时，避免 90s 级停顿在高并发下被过早判超时。
+        assert_eq!(
+            effective_chunk_timeout(&cfg, 9),
+            std::time::Duration::from_secs(150)
+        );
+        assert_eq!(
+            effective_chunk_timeout(&cfg, 64),
+            std::time::Duration::from_secs(150)
+        );
+
+        // 高并发超时不应比基线更严格（不变量）。
+        assert!(cfg.high_concurrency_timeout_secs >= cfg.chunk_timeout_secs);
     }
 }

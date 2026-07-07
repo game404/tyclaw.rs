@@ -369,11 +369,666 @@ pub(crate) fn extract_json_field(json_str: &str, field: &str) -> Option<String> 
         i += 1;
     }
     let raw = &json_str[value_start..i];
-    // 基本反转义
-    let unescaped = raw
-        .replace("\\n", "\n")
-        .replace("\\t", "\t")
-        .replace("\\\"", "\"")
-        .replace("\\\\", "\\");
-    Some(unescaped)
+    Some(unescape_json_string(raw))
+}
+
+/// 单遍反转义 JSON 字符串字面量内容。
+///
+/// 必须单遍处理：串行 `replace` 会相互污染——例如源串 `\\n`（转义反斜杠 + 字母 n，
+/// 应还原为 `\` 和 `n`）会被 `replace("\\n", "\n")` 误判成换行。
+fn unescape_json_string(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('/') => out.push('/'),
+            // 未识别的转义（含 \uXXXX）按原样保留，不做进一步解析。
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+// ============================================================================
+// Prompt Token Compression：工具 schema 精简表示（R11.1 / Property 30）
+// ============================================================================
+//
+// 提供 `compact` 模式的工具定义：在保留工具名与参数结构（properties / type /
+// enum / required）的前提下，去除冗长的 description 文本与示例（examples），
+// 从而降低发送给 LLM 的 token 量。
+//
+// **精简的确定性保证（供 task 15.2 Property 30 依赖）**：
+// `compact_tool_schema` / `compact_tool_definitions` 只会"删减"内容，绝不新增：
+//   - 顶层与参数内的 `description` 被截断为原文的子串（截断/裁剪到示例标记之前
+//     并限制最大字符数），其字符数恒 ≤ 原文；
+//   - 参数对象内的 `examples` / `example` 键被整体移除；
+//   - 工具名、参数 schema 结构（properties 键、type、enum、required 等）原样保留。
+// 因此精简后序列化 JSON 的字符数恒 ≤ 原始，且当存在任一可精简内容（超长
+// description 或 examples）时**严格小于**原始。由于估算 token 量随文本内容单调，
+// 故：
+//   - 对**任意**工具定义集合：`estimate_tool_defs_tokens(compact) ≤ 原始`；
+//   - 当集合中**至少一个**工具含可精简的冗长内容时：严格 `<`。
+// Property 30 的 proptest 生成器需保证生成含冗长 description/examples 的工具，
+// 以触发严格 `<`。
+
+/// compact 模式下顶层工具 description 的最大保留字符数。
+const COMPACT_DESC_MAX_CHARS: usize = 100;
+
+/// compact 模式下单个参数 description 的最大保留字符数。
+const COMPACT_PARAM_DESC_MAX_CHARS: usize = 60;
+
+/// 估算一组工具定义（OpenAI function-calling 格式）的 token 量。
+///
+/// 复用 `tyclaw-types` 的 tiktoken 估算器（与 prompt token 统计口径一致）。
+pub fn estimate_tool_defs_tokens(defs: &[Value]) -> usize {
+    tyclaw_types::tokens::estimate_prompt_tokens(&[], Some(defs))
+}
+
+/// 将一组工具定义转换为 compact（精简）模式。
+///
+/// 保留工具名与参数结构，去除冗长 description 与示例。详见模块文档中的
+/// "精简的确定性保证"。
+pub fn compact_tool_definitions(defs: &[Value]) -> Vec<Value> {
+    defs.iter().map(compact_tool_schema).collect()
+}
+
+/// 将单个工具定义转换为 compact（精简）模式。
+///
+/// 输入应为 OpenAI function-calling 格式：
+/// `{ "type": "function", "function": { "name", "description", "parameters" } }`。
+/// 非该结构的输入将原样返回（不报错）。
+pub fn compact_tool_schema(tool_def: &Value) -> Value {
+    let mut def = tool_def.clone();
+    if let Some(func) = def.get_mut("function").and_then(|f| f.as_object_mut()) {
+        // 精简顶层 description
+        if let Some(Value::String(d)) = func.get("description") {
+            let compacted = compact_description(d, COMPACT_DESC_MAX_CHARS);
+            func.insert("description".into(), Value::String(compacted));
+        }
+        // 精简参数 schema 中的 description / examples
+        if let Some(params) = func.get_mut("parameters") {
+            strip_param_verbosity(params);
+        }
+    }
+    def
+}
+
+/// 递归去除参数 schema 中的冗长内容：
+/// - 移除 `examples` / `example` 键；
+/// - 将 `description` 字符串截断到 `COMPACT_PARAM_DESC_MAX_CHARS`（为空则移除该键）；
+/// - 其余结构（properties / type / enum / required 等）原样保留。
+fn strip_param_verbosity(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("examples");
+            map.remove("example");
+            if let Some(Value::String(d)) = map.get("description") {
+                let compacted = compact_description(d, COMPACT_PARAM_DESC_MAX_CHARS);
+                if compacted.is_empty() {
+                    map.remove("description");
+                } else {
+                    map.insert("description".into(), Value::String(compacted));
+                }
+            }
+            for v in map.values_mut() {
+                strip_param_verbosity(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                strip_param_verbosity(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 将一段 description 精简为原文的子串：
+/// 1) 截断到首个示例/段落标记（"example"/"e.g."/"示例"/空行）之前；
+/// 2) 再裁剪到 `max_chars` 个字符以内。
+///
+/// 返回值恒为原文的前缀子串（去除尾部空白），故字符数 ≤ 原文。
+fn compact_description(desc: &str, max_chars: usize) -> String {
+    // 寻找最早的"示例/段落"标记字节位置（均落在 char 边界上）
+    let mut cut = desc.len();
+    for marker in ["example", "e.g.", "for example"] {
+        if let Some(idx) = find_ascii_ci(desc, marker) {
+            cut = cut.min(idx);
+        }
+    }
+    for marker in ["示例", "\n\n"] {
+        if let Some(idx) = desc.find(marker) {
+            cut = cut.min(idx);
+        }
+    }
+
+    let head = desc[..cut].trim_end();
+
+    // 裁剪到 max_chars 个字符
+    if head.chars().count() > max_chars {
+        let boundary = head
+            .char_indices()
+            .nth(max_chars)
+            .map(|(i, _)| i)
+            .unwrap_or(head.len());
+        head[..boundary].trim_end().to_string()
+    } else {
+        head.to_string()
+    }
+}
+
+/// ASCII 大小写不敏感的子串查找，返回 needle 在 haystack 中首次出现的字节下标。
+///
+/// 仅用于 ASCII needle；命中位置必然落在 char 边界（ASCII 字节不会匹配多字节
+/// UTF-8 序列的延续字节），可安全用于字符串切片。
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || n.len() > h.len() {
+        return None;
+    }
+    'outer: for i in 0..=(h.len() - n.len()) {
+        for j in 0..n.len() {
+            if !h[i + j].eq_ignore_ascii_case(&n[j]) {
+                continue 'outer;
+            }
+        }
+        return Some(i);
+    }
+    None
+}
+
+#[cfg(test)]
+mod compact_schema_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn verbose_tool() -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read the contents of a file from disk. This tool is extremely \
+                    useful and you should use it whenever you need to inspect a file. \
+                    Examples: read_file(path=\"a.txt\"); read_file(path=\"b.txt\", start=1).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The absolute path to the file to read. This must be \
+                                a valid path that exists on the filesystem, otherwise an error \
+                                is returned and you should retry with a corrected path.",
+                            "examples": ["/tmp/a.txt", "/var/log/b.log"]
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "description": "Optional starting line number, 1-indexed."
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn extract_json_field_unescapes_correctly() {
+        // 普通转义。
+        assert_eq!(
+            extract_json_field(r#"{"command":"a\nb\tc\"d"}"#, "command"),
+            Some("a\nb\tc\"d".to_string())
+        );
+        // 关键回归：转义反斜杠 + 字母 n（\\n）必须还原为 `\` 和 `n`，而非换行。
+        assert_eq!(
+            extract_json_field(r#"{"path":"C:\\nodes\\bin"}"#, "path"),
+            Some(r"C:\nodes\bin".to_string())
+        );
+        // 与 serde_json 解析结果一致。
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"path":"C:\\nodes\\bin"}"#).unwrap();
+        assert_eq!(
+            extract_json_field(r#"{"path":"C:\\nodes\\bin"}"#, "path").as_deref(),
+            v["path"].as_str()
+        );
+    }
+
+    #[test]
+    fn compact_reduces_tokens_for_verbose_tool() {
+        let original = vec![verbose_tool()];
+        let compact = compact_tool_definitions(&original);
+        let before = estimate_tool_defs_tokens(&original);
+        let after = estimate_tool_defs_tokens(&compact);
+        assert!(
+            after < before,
+            "compact tokens ({after}) should be strictly less than original ({before})"
+        );
+    }
+
+    #[test]
+    fn compact_preserves_name_and_param_structure() {
+        let compact = compact_tool_schema(&verbose_tool());
+        let func = &compact["function"];
+        assert_eq!(func["name"], json!("read_file"));
+        // 参数结构保留
+        let params = &func["parameters"];
+        assert_eq!(params["type"], json!("object"));
+        assert!(params["properties"]["path"].get("type").is_some());
+        assert_eq!(params["properties"]["path"]["type"], json!("string"));
+        assert_eq!(params["required"], json!(["path"]));
+        // examples 被移除
+        assert!(params["properties"]["path"].get("examples").is_none());
+        // 顶层 description 被精简（不再包含 Examples 段）
+        let desc = func["description"].as_str().unwrap_or("");
+        assert!(!desc.to_lowercase().contains("example"));
+    }
+
+    #[test]
+    fn compact_never_grows_for_minimal_tool() {
+        // 已经很精简的工具：token 量不增加（相等或更小）
+        let minimal = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "noop",
+                "description": "Do nothing.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })];
+        let compact = compact_tool_definitions(&minimal);
+        let before = estimate_tool_defs_tokens(&minimal);
+        let after = estimate_tool_defs_tokens(&compact);
+        assert!(after <= before, "compact ({after}) must not exceed original ({before})");
+    }
+
+    #[test]
+    fn compact_handles_non_function_value_gracefully() {
+        let weird = json!({"foo": "bar"});
+        let out = compact_tool_schema(&weird);
+        assert_eq!(out, weird);
+    }
+
+    use proptest::prelude::*;
+
+    /// 生成一个含冗长 description 与 examples 的工具定义。
+    ///
+    /// 为保证 Property 30 的严格 `<` 成立，每个工具都包含：
+    /// - 顶层超长 description（> 200 字符，并带 "Examples:" 段）；
+    /// - 若干参数，每个参数都带超长 description 以及 `examples` 数组。
+    fn verbose_tool_strategy() -> impl Strategy<Value = serde_json::Value> {
+        (
+            "[a-z][a-z_]{0,15}",                 // 工具名
+            "[a-zA-Z ]{40,80}",                  // description 基础短语（会被重复放大）
+            prop::collection::vec("[a-z][a-z_]{0,10}", 1..=4), // 参数名
+        )
+            .prop_map(|(name, phrase, param_names)| {
+                // 放大成超长 description（远超 100 字符顶层预算），并附带 Examples 段。
+                let long_desc = format!(
+                    "{phrase}. {phrase}. {phrase}. Examples: {name}(x=1); {name}(x=2); {name}(x=3)."
+                );
+                let mut properties = serde_json::Map::new();
+                for (i, pname) in param_names.iter().enumerate() {
+                    // 去重参数名，避免 Map 覆盖导致参数数量不稳定。
+                    let key = format!("{pname}_{i}");
+                    let param_desc = format!(
+                        "{phrase} {phrase} (param {key}). \
+                         This is a deliberately verbose parameter description exceeding the budget."
+                    );
+                    properties.insert(
+                        key,
+                        json!({
+                            "type": "string",
+                            "description": param_desc,
+                            "examples": ["alpha-example-value", "beta-example-value", "gamma"]
+                        }),
+                    );
+                }
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": long_desc,
+                        "parameters": {
+                            "type": "object",
+                            "properties": serde_json::Value::Object(properties),
+                            "required": []
+                        }
+                    }
+                })
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 100, ..Default::default() })]
+
+        // Feature: execution-performance-optimization, Property 30: 精简工具 schema 的 token 量低于原始
+        // Validates: Requirements 11.1
+        #[test]
+        fn prop_compact_schema_strictly_fewer_tokens(
+            defs in prop::collection::vec(verbose_tool_strategy(), 1..=5),
+        ) {
+            let compact = compact_tool_definitions(&defs);
+            let before = estimate_tool_defs_tokens(&defs);
+            let after = estimate_tool_defs_tokens(&compact);
+            prop_assert!(
+                after < before,
+                "compact tokens ({after}) must be strictly less than original ({before})"
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Prompt Token 占比观测指标（R11.3 / task 15.7）
+// ============================================================================
+//
+// 每次请求记录 prompt 各组成部分的 token 量：history（历史消息）、cases
+// （相似/置顶案例正文）、skills（技能注入正文）、tool 定义（function-calling
+// schema）。通过 `compute_token_breakdown` 计算后，`emit_token_breakdown` 以
+// 结构化 `tracing::info!` 事件写入可观测性管线，供 progress/审计指标采集。
+//
+// token 口径与 prompt 统计完全一致——全部复用 `tyclaw_types::tokens` 的
+// tiktoken 估算器（与 `estimate_tool_defs_tokens` 同源），不另造估算逻辑。
+
+/// 单次请求 prompt 各部分的 token 占用明细。
+///
+/// 字段单位均为 token 数，由 tiktoken cl100k_base 估算得到。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PromptTokenBreakdown {
+    /// 历史消息（含工具调用/结果）贡献的 token。
+    pub history: usize,
+    /// 相似/置顶案例正文贡献的 token。
+    pub cases: usize,
+    /// 技能注入正文贡献的 token。
+    pub skills: usize,
+    /// 工具定义（function-calling schema）贡献的 token。
+    pub tool_defs: usize,
+}
+
+/// 各部分 token 占总量的比例（0.0..=1.0）。总量为 0 时各项均为 0.0。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PromptTokenFractions {
+    pub history: f64,
+    pub cases: f64,
+    pub skills: f64,
+    pub tool_defs: f64,
+}
+
+impl PromptTokenBreakdown {
+    /// 各部分 token 之和。
+    pub fn total(&self) -> usize {
+        self.history + self.cases + self.skills + self.tool_defs
+    }
+
+    /// 各部分占总量的比例；总量为 0 时返回全 0，避免除零。
+    pub fn fractions(&self) -> PromptTokenFractions {
+        let total = self.total();
+        if total == 0 {
+            return PromptTokenFractions {
+                history: 0.0,
+                cases: 0.0,
+                skills: 0.0,
+                tool_defs: 0.0,
+            };
+        }
+        let total = total as f64;
+        PromptTokenFractions {
+            history: self.history as f64 / total,
+            cases: self.cases as f64 / total,
+            skills: self.skills as f64 / total,
+            tool_defs: self.tool_defs as f64 / total,
+        }
+    }
+}
+
+/// 估算一段纯文本（案例 / 技能正文）的 token 量。
+///
+/// 复用 prompt 口径的 tiktoken 估算器：将文本包成单条 `content` 消息后计数。
+/// 空文本计 0（不占 token）。
+fn estimate_text_tokens(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let mut msg: HashMap<String, Value> = HashMap::new();
+    msg.insert("content".to_string(), Value::String(text.to_string()));
+    tyclaw_types::tokens::estimate_prompt_tokens(std::slice::from_ref(&msg), None)
+}
+
+/// 计算单次请求 prompt 各部分的 token 占用明细（R11.3）。
+///
+/// 输入按 prompt 装配路径的天然表示选取：
+/// - `history`：历史消息列表（OpenAI message map），复用
+///   [`tyclaw_types::tokens::estimate_prompt_tokens`]；
+/// - `cases_text` / `skills_text`：已渲染的案例 / 技能正文文本；
+/// - `tool_defs`：工具定义（function-calling schema），复用
+///   [`estimate_tool_defs_tokens`]。
+pub fn compute_token_breakdown(
+    history: &[HashMap<String, Value>],
+    cases_text: &str,
+    skills_text: &str,
+    tool_defs: &[Value],
+) -> PromptTokenBreakdown {
+    // 空工具列表序列化为 "[]" 会被估算器计为 1 token；占比指标语义上应记 0，
+    // 与空 cases/skills 文本保持一致。
+    let tool_defs_tokens = if tool_defs.is_empty() {
+        0
+    } else {
+        estimate_tool_defs_tokens(tool_defs)
+    };
+    PromptTokenBreakdown {
+        history: tyclaw_types::tokens::estimate_prompt_tokens(history, None),
+        cases: estimate_text_tokens(cases_text),
+        skills: estimate_text_tokens(skills_text),
+        tool_defs: tool_defs_tokens,
+    }
+}
+
+/// 将 token 占比明细写入可观测性管线（结构化 `tracing` 事件）。
+///
+/// 供 progress/审计指标采集层订阅 `tyclaw::observability::token_breakdown`
+/// target 抓取各字段。
+pub fn emit_token_breakdown(breakdown: &PromptTokenBreakdown) {
+    let total = breakdown.total();
+    let frac = breakdown.fractions();
+    tracing::info!(
+        target: "tyclaw::observability::token_breakdown",
+        history_tokens = breakdown.history,
+        cases_tokens = breakdown.cases,
+        skills_tokens = breakdown.skills,
+        tool_defs_tokens = breakdown.tool_defs,
+        total_tokens = total,
+        history_frac = frac.history,
+        cases_frac = frac.cases,
+        skills_frac = frac.skills,
+        tool_defs_frac = frac.tool_defs,
+        "prompt token breakdown"
+    );
+}
+
+#[cfg(test)]
+mod token_breakdown_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn user_msg(text: &str) -> HashMap<String, Value> {
+        let mut m = HashMap::new();
+        m.insert("role".into(), json!("user"));
+        m.insert("content".into(), json!(text));
+        m
+    }
+
+    fn sample_tool() -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file from disk.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn breakdown_total_sums_all_parts() {
+        let history = vec![user_msg("the quick brown fox jumps over the lazy dog")];
+        let cases = "previously the agent solved a similar billing reconciliation case";
+        let skills = "skill: generate a bar chart with matplotlib from a csv file";
+        let tools = vec![sample_tool()];
+
+        let b = compute_token_breakdown(&history, cases, skills, &tools);
+
+        assert_eq!(b.total(), b.history + b.cases + b.skills + b.tool_defs);
+    }
+
+    #[test]
+    fn each_part_is_counted_when_present() {
+        let history = vec![user_msg("hello world this is the conversation history")];
+        let cases = "case study text that is reasonably long for token counting";
+        let skills = "skill instructions describing how to do the task in detail";
+        let tools = vec![sample_tool()];
+
+        let b = compute_token_breakdown(&history, cases, skills, &tools);
+
+        assert!(b.history > 0, "history should be counted");
+        assert!(b.cases > 0, "cases should be counted");
+        assert!(b.skills > 0, "skills should be counted");
+        assert!(b.tool_defs > 0, "tool defs should be counted");
+    }
+
+    #[test]
+    fn empty_parts_contribute_zero() {
+        let b = compute_token_breakdown(&[], "", "", &[]);
+        assert_eq!(b.history, 0);
+        assert_eq!(b.cases, 0);
+        assert_eq!(b.skills, 0);
+        assert_eq!(b.tool_defs, 0);
+        assert_eq!(b.total(), 0);
+    }
+
+    #[test]
+    fn fractions_sum_to_one_when_nonempty() {
+        let history = vec![user_msg("history content for fraction test, a few tokens here")];
+        let cases = "case content for fraction test with several tokens included";
+        let skills = "skill content for the fraction test also several tokens";
+        let tools = vec![sample_tool()];
+
+        let b = compute_token_breakdown(&history, cases, skills, &tools);
+        let f = b.fractions();
+        let sum = f.history + f.cases + f.skills + f.tool_defs;
+        assert!((sum - 1.0).abs() < 1e-9, "fractions should sum to ~1.0, got {sum}");
+    }
+
+    #[test]
+    fn fractions_are_zero_for_empty_breakdown() {
+        let b = PromptTokenBreakdown::default();
+        let f = b.fractions();
+        assert_eq!(f.history, 0.0);
+        assert_eq!(f.cases, 0.0);
+        assert_eq!(f.skills, 0.0);
+        assert_eq!(f.tool_defs, 0.0);
+    }
+
+    #[test]
+    fn emit_does_not_panic() {
+        let b = compute_token_breakdown(&[user_msg("hi")], "c", "s", &[sample_tool()]);
+        emit_token_breakdown(&b);
+    }
+
+    fn assistant_msg(text: &str) -> HashMap<String, Value> {
+        let mut m = HashMap::new();
+        m.insert("role".into(), json!("assistant"));
+        m.insert("content".into(), json!(text));
+        m
+    }
+
+    fn exec_tool() -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "exec",
+                "description": "Execute a shell or python command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } },
+                    "required": ["command"]
+                }
+            }
+        })
+    }
+
+    // ========================================================================
+    // 集成测试（task 15.8）：验证一次代表性请求中各部分 token 占比被记录（R11.3）
+    // ========================================================================
+
+    /// 端到端：用一个贴近真实 prompt 装配的请求（多条历史消息 + 非空 cases /
+    /// skills + 多个 function-calling 工具定义）走 `compute_token_breakdown`，
+    /// 断言四部分均被独立计数、total 等于四部分之和、fractions 归一且各项落在
+    /// [0,1]，并确认 `emit_token_breakdown` 能将占比写入观测管线而不 panic。
+    #[test]
+    fn integration_token_breakdown_records_all_part_shares() {
+        // 1) 构建一个代表性请求
+        let history = vec![
+            user_msg("请帮我对 0521 的账单做一次对账，并统计异常条目数量"),
+            assistant_msg("好的，我先读取账单文件并按渠道汇总，然后定位差异项"),
+        ];
+        let cases_text =
+            "历史案例：上次账单对账通过逐行 diff + 渠道分组定位到 3 笔异常，最终人工复核确认";
+        let skills_text =
+            "技能：使用 pandas 读取 csv、按列分组聚合、并用 matplotlib 输出对账差异柱状图";
+        let tool_defs = vec![sample_tool(), exec_tool()];
+
+        let breakdown =
+            compute_token_breakdown(&history, cases_text, skills_text, &tool_defs);
+
+        // 2) 各部分都被独立计数（> 0）
+        assert!(breakdown.history > 0, "history 部分应被计数");
+        assert!(breakdown.cases > 0, "cases 部分应被计数");
+        assert!(breakdown.skills > 0, "skills 部分应被计数");
+        assert!(breakdown.tool_defs > 0, "tool 定义部分应被计数");
+
+        // 3) total 等于四部分之和
+        assert_eq!(
+            breakdown.total(),
+            breakdown.history + breakdown.cases + breakdown.skills + breakdown.tool_defs,
+            "total 应等于各部分 token 之和"
+        );
+
+        // 4) 占比归一，且每一项都落在 [0, 1]
+        let f = breakdown.fractions();
+        for (name, frac) in [
+            ("history", f.history),
+            ("cases", f.cases),
+            ("skills", f.skills),
+            ("tool_defs", f.tool_defs),
+        ] {
+            assert!(
+                (0.0..=1.0).contains(&frac),
+                "{name} 占比应落在 [0,1]，实际 {frac}"
+            );
+        }
+        let sum = f.history + f.cases + f.skills + f.tool_defs;
+        assert!(
+            (sum - 1.0).abs() < 1e-9,
+            "各部分占比之和应约等于 1.0，实际 {sum}"
+        );
+
+        // 5) 占比可被写入观测管线（结构化 tracing 事件），不应 panic
+        emit_token_breakdown(&breakdown);
+    }
 }

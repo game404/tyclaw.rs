@@ -486,6 +486,9 @@ impl AgentRuntime for AgentLoop {
 
                 // 前 PLAN_CHECK_ITERATIONS 轮如果没有输出计划，注入催促
                 // Sub-agent 不触发此催促（coding 类已有 workflow 要求，非 coding 类不需要规划）
+                // PLAN_CHECK_ITERATIONS 为可调阈值（当前为 0）：为 0 时恒不触发（total_iterations
+                // 自首轮起 ≥ 1），即禁用强制计划检查；保留 `<=` 以便阈值调高为正数时语义正确。
+                #[allow(clippy::absurd_extreme_comparisons)]
                 if !has_plan && total_iterations <= PLAN_CHECK_ITERATIONS && !is_sub_agent {
                     let nudge = crate::nudge_loader::plan_required();
                     warn!(total_iterations, "LLM skipped planning, injecting nudge");
@@ -950,7 +953,8 @@ impl AgentRuntime for AgentLoop {
             }
         }
 
-        if final_content.is_none() {
+        let hit_max_iterations = final_content.is_none();
+        if hit_max_iterations {
             warn!(
                 total_iterations,
                 exploration_iterations,
@@ -1004,6 +1008,7 @@ impl AgentRuntime for AgentLoop {
             total_prompt_tokens,
             total_completion_tokens,
             turn_id,
+            hit_max_iterations,
         })
     }
 }

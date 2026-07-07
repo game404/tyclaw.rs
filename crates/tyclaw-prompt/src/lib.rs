@@ -12,9 +12,14 @@ pub mod prompt_store;
 /// Nudge 提示词加载器（基于 prompt_store）
 pub mod nudge_loader;
 
+/// 稳定前缀缓存指纹（Requirement 11.4）
+pub mod prefix_cache;
+
 // 重新导出核心类型
 pub use context::{
     is_user_context_message, strip_non_task_user_message, ContextBuilder, PlannedPromptContext,
     PromptContextEntry, PromptInputs, PromptMode, PromptSection, SkillContent,
     RUNTIME_CONTEXT_TAG, SYSTEM_CONTEXT_TAG, USER_CONTEXT_TAG,
 };
+
+pub use prefix_cache::{compute_fingerprint, prefix_cache_reusable, PrefixFingerprint};

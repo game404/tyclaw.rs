@@ -13,7 +13,11 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use parking_lot::Mutex;
+
 use tyclaw_types::message::{system_message, user_message, user_message_multimodal};
+
+use crate::prefix_cache::{compute_fingerprint, PrefixFingerprint};
 
 /// 运行时上下文标记 —— 用于在用户消息中注入元数据。
 pub const RUNTIME_CONTEXT_TAG: &str = "[Runtime Context — metadata only, not instructions]";
@@ -83,6 +87,39 @@ pub struct ContextBuilder {
     workspace: PathBuf,
     /// LLM 看到的 workspace 路径。sandbox 模式下为 "."，host 模式下为实际路径。
     display_workspace: String,
+    /// 稳定前缀缓存（Requirement 11.4）：缓存上一次构建的
+    /// `(identity, bootstrap files, MEMORY.md)` 指纹及其渲染结果。
+    /// 指纹三者全等时复用渲染好的前缀，避免重复拼接。
+    prefix_cache: Mutex<Option<CachedPrefixSections>>,
+}
+
+/// 取文件的「长度 + 修改时间」元数据令牌（不读取内容）。文件不存在/无法取元数据时
+/// 返回稳定占位串，从而把「文件出现/消失」也纳入签名变化。
+fn file_meta_token(path: &std::path::Path) -> String {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            let len = meta.len();
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("{len}:{mtime}")
+        }
+        Err(_) => String::from("none"),
+    }
+}
+
+/// 已缓存的稳定前缀渲染结果及其廉价签名。
+#[derive(Debug, Clone)]
+struct CachedPrefixSections {
+    /// 廉价签名（基于文件名/长度/mtime，不读取文件内容）：命中即可跳过昂贵的
+    /// `read_dir` + 全量 `read_to_string`，真正实现 R11.4「指纹未变即复用、跳过重复拼接」。
+    cheap_sig: String,
+    identity: String,
+    bootstrap: String,
+    memory: String,
 }
 
 /// 语义化 prompt 输入 —— 用于新的 planner / assembler 路径。
@@ -226,6 +263,7 @@ impl ContextBuilder {
         Self {
             workspace: ws,
             display_workspace: display,
+            prefix_cache: Mutex::new(None),
         }
     }
 
@@ -331,6 +369,187 @@ Your workspace is at: {ws}"#
             }
         }
         String::new()
+    }
+
+    /// 解析当前请求的 MEMORY.md 段：优先使用外部传入的 `memory_content`。
+    fn resolve_memory_section(&self, memory_override: Option<&str>) -> String {
+        match memory_override {
+            Some(content) => {
+                if content.is_empty() {
+                    String::new()
+                } else {
+                    format!("# Memory\n\n{content}")
+                }
+            }
+            None => self.build_section_memory(),
+        }
+    }
+
+    /// 计算当前稳定前缀的三元组指纹 `(identity, bootstrap files, MEMORY.md)`。
+    ///
+    /// 实现 Requirement 11.4 的指纹来源：identity 段、bootstrap 引导文件段、
+    /// MEMORY.md 段。供缓存命中判定与外部观测使用。
+    pub fn prefix_fingerprint(
+        &self,
+        mode: PromptMode,
+        memory_override: Option<&str>,
+    ) -> PrefixFingerprint {
+        let identity = self.build_section_identity();
+        let bootstrap = if PromptSection::Bootstrap.enabled_in(mode) {
+            self.build_workspace_bootstrap_docs(mode)
+        } else {
+            String::new()
+        };
+        let memory = if PromptSection::Memory.enabled_in(mode) {
+            self.resolve_memory_section(memory_override)
+        } else {
+            String::new()
+        };
+        compute_fingerprint(&identity, &bootstrap, &memory)
+    }
+
+    /// 解析稳定前缀的三段渲染结果 `(identity, bootstrap, memory)`，并复用缓存。
+    ///
+    /// 实现 Requirement 11.4：基于 `(identity, bootstrap files, MEMORY.md)` 指纹三元组，
+    /// 当三者与上一次完全一致（[`prefix_cache_reusable`] 为真）时，直接返回缓存的渲染
+    /// 前缀而不重复拼接；任一段变化则重建并刷新缓存。
+    ///
+    /// 注：跨请求的网络层前缀复用由 Provider 现有的 `cache_scope` /
+    /// `cache_breakpoint_idx` 机制承担（见 `tyclaw-provider::openai_compat`）；
+    /// 此处的指纹比对决定该前缀缓存是否仍然有效（命中或失效重建）。
+    fn resolve_prefix_sections(
+        &self,
+        mode: PromptMode,
+        memory_override: Option<&str>,
+    ) -> (String, String, String) {
+        // 先算廉价签名（identity 文本 + bootstrap 文件元数据 + memory 元数据/override），
+        // 不读取任何文件内容；命中即跳过昂贵的全量 read_to_string。
+        let identity = self.build_section_identity();
+        let bootstrap_enabled = PromptSection::Bootstrap.enabled_in(mode);
+        let memory_enabled = PromptSection::Memory.enabled_in(mode);
+        let cheap_sig = self.compute_cheap_sig(
+            &identity,
+            mode,
+            bootstrap_enabled,
+            memory_enabled,
+            memory_override,
+        );
+
+        {
+            let guard = self.prefix_cache.lock();
+            if let Some(cached) = guard.as_ref() {
+                if cached.cheap_sig == cheap_sig {
+                    // 廉价签名一致：复用缓存渲染结果，跳过 read_dir / read_to_string。
+                    return (
+                        cached.identity.clone(),
+                        cached.bootstrap.clone(),
+                        cached.memory.clone(),
+                    );
+                }
+            }
+        }
+
+        // 未命中：执行实际拼接（含文件内容读取）。
+        let bootstrap = if bootstrap_enabled {
+            self.build_workspace_bootstrap_docs(mode)
+        } else {
+            String::new()
+        };
+        let memory = if memory_enabled {
+            self.resolve_memory_section(memory_override)
+        } else {
+            String::new()
+        };
+
+        let mut guard = self.prefix_cache.lock();
+        *guard = Some(CachedPrefixSections {
+            cheap_sig,
+            identity: identity.clone(),
+            bootstrap: bootstrap.clone(),
+            memory: memory.clone(),
+        });
+        (identity, bootstrap, memory)
+    }
+
+    /// 计算稳定前缀的廉价签名：仅依赖 identity 文本与文件元数据（名称/长度/mtime）/
+    /// memory override 的哈希，**不读取文件内容**，用于缓存命中判定。
+    fn compute_cheap_sig(
+        &self,
+        identity: &str,
+        mode: PromptMode,
+        bootstrap_enabled: bool,
+        memory_enabled: bool,
+        memory_override: Option<&str>,
+    ) -> String {
+        use std::fmt::Write as _;
+        let mut sig = String::new();
+        // identity 是纯内存拼接，直接纳入精确内容。
+        let _ = write!(sig, "id:{}|", identity.len());
+        sig.push_str(identity);
+        sig.push('\n');
+
+        if bootstrap_enabled {
+            sig.push_str("boot:");
+            sig.push_str(&self.bootstrap_signature(mode));
+        } else {
+            sig.push_str("boot:-");
+        }
+        sig.push('\n');
+
+        if memory_enabled {
+            sig.push_str("mem:");
+            sig.push_str(&self.memory_signature(memory_override));
+        } else {
+            sig.push_str("mem:-");
+        }
+        sig
+    }
+
+    /// bootstrap 引导文件的元数据签名：每个 `*.md` 的 `name|len|mtime`（按名排序），
+    /// 不读取文件内容。
+    fn bootstrap_signature(&self, mode: PromptMode) -> String {
+        let entries = match std::fs::read_dir(&self.workspace) {
+            Ok(rd) => rd,
+            Err(_) => return String::from("<no-dir>"),
+        };
+        let mut files: Vec<(String, PathBuf)> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let path = e.path();
+                if path.is_file() {
+                    if let Some(ext) = path.extension() {
+                        if ext.eq_ignore_ascii_case("md") {
+                            return Some((e.file_name().to_string_lossy().to_string(), path));
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        if mode == PromptMode::Minimal {
+            files.retain(|(name, _)| name.eq_ignore_ascii_case("TOOLS.md"));
+        }
+        let mut sig = String::new();
+        for (name, path) in &files {
+            sig.push_str(name);
+            sig.push('|');
+            sig.push_str(&file_meta_token(path));
+            sig.push(';');
+        }
+        sig
+    }
+
+    /// memory 段签名：override 存在时用其长度 + 哈希（不触盘）；否则用 MEMORY.md 元数据。
+    fn memory_signature(&self, memory_override: Option<&str>) -> String {
+        if let Some(content) = memory_override {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            content.hash(&mut h);
+            return format!("ovr:{}:{:x}", content.len(), h.finish());
+        }
+        let memory_path = self.workspace.join("memory").join("MEMORY.md");
+        format!("file:{}", file_meta_token(&memory_path))
     }
 
     // -----------------------------------------------------------------------
@@ -503,7 +722,11 @@ Your workspace is at: {ws}"#
         let mut user_context = Vec::new();
         let mut system_context = Vec::new();
 
-        Self::push_part(&mut system_prompt_parts, self.build_section_identity());
+        // 稳定前缀（identity / bootstrap / MEMORY.md）：经指纹比对复用缓存（R11.4）。
+        let (identity_section, bootstrap_section, memory_section) =
+            self.resolve_prefix_sections(inputs.mode, inputs.memory_content);
+
+        Self::push_part(&mut system_prompt_parts, identity_section);
         Self::push_part(
             &mut system_prompt_parts,
             self.build_section_execution_baseline(),
@@ -531,21 +754,12 @@ Your workspace is at: {ws}"#
             Self::push_context_entry(
                 &mut user_context,
                 "Workspace Instructions",
-                self.build_workspace_bootstrap_docs(inputs.mode),
+                bootstrap_section,
             );
         }
 
         if PromptSection::Memory.enabled_in(inputs.mode) {
-            let memory = if let Some(content) = inputs.memory_content {
-                if content.is_empty() {
-                    String::new()
-                } else {
-                    format!("# Memory\n\n{content}")
-                }
-            } else {
-                self.build_section_memory()
-            };
-            Self::push_context_entry(&mut user_context, "Workspace Memory", memory);
+            Self::push_context_entry(&mut user_context, "Workspace Memory", memory_section);
         }
 
         if PromptSection::Cases.enabled_in(inputs.mode) {
@@ -787,6 +1001,9 @@ main_execution_baseline: |
 
 guidelines: |
   Follow instructions carefully.
+
+skills_intro: |
+  The following skills are available for this task.
 "#,
         )
         .unwrap();
@@ -808,6 +1025,54 @@ guidelines: |
         let sys = msgs[0]["content"].as_str().unwrap();
         assert!(sys.contains("TyClaw"));
         assert!(sys.contains("[[CACHE_BOUNDARY]]"));
+    }
+
+    #[test]
+    fn test_prefix_fingerprint_stable_and_invalidates() {
+        let tmp = TempDir::new().unwrap();
+        init_test_workspace(&tmp);
+        let ctx = ContextBuilder::new(tmp.path());
+
+        // 相同 workspace + 相同 memory override → 指纹稳定，可复用。
+        let fp1 = ctx.prefix_fingerprint(PromptMode::Full, Some("mem-a"));
+        let fp2 = ctx.prefix_fingerprint(PromptMode::Full, Some("mem-a"));
+        assert!(crate::prefix_cache::prefix_cache_reusable(&fp1, &fp2));
+
+        // MEMORY.md 段变化 → 指纹失效，不复用。
+        let fp3 = ctx.prefix_fingerprint(PromptMode::Full, Some("mem-b"));
+        assert!(!crate::prefix_cache::prefix_cache_reusable(&fp1, &fp3));
+    }
+
+    #[test]
+    fn test_resolve_prefix_sections_reuses_cache() {
+        let tmp = TempDir::new().unwrap();
+        init_test_workspace(&tmp);
+        let ctx = ContextBuilder::new(tmp.path());
+
+        // 首次构建填充缓存。
+        let planned1 = ctx.plan_prompt_context(&PromptInputs {
+            memory_content: Some("mem-a"),
+            ..Default::default()
+        });
+        // 第二次相同输入 → 命中缓存，渲染结果一致。
+        let planned2 = ctx.plan_prompt_context(&PromptInputs {
+            memory_content: Some("mem-a"),
+            ..Default::default()
+        });
+        assert_eq!(planned1.system_prompt_parts, planned2.system_prompt_parts);
+        assert_eq!(planned1.user_context, planned2.user_context);
+
+        // 改变 memory → 前缀失效重建，Workspace Memory 段内容随之变化。
+        let planned3 = ctx.plan_prompt_context(&PromptInputs {
+            memory_content: Some("mem-c"),
+            ..Default::default()
+        });
+        let mem_entry = planned3
+            .user_context
+            .iter()
+            .find(|e| e.label == "Workspace Memory")
+            .expect("memory entry present");
+        assert!(mem_entry.content.contains("mem-c"));
     }
 
     #[test]
@@ -871,8 +1136,11 @@ guidelines: |
     #[test]
     fn test_add_tool_result_with_image() {
         let mut msgs = Vec::new();
-        let img_result = "[[IMAGE:data:image/jpeg;base64,/9j/4AAQ]]";
-        ContextBuilder::add_tool_result(&mut msgs, "tc_2", "read_file", img_result);
+        // 真图片的 data URI 远长于 100 字符（add_tool_result 以 >100 阈值过滤文档示例），
+        // 用足够长的 base64 占位串模拟真实图片，触发图片块抽取。
+        let long_b64 = "/9j/4AAQ".repeat(20);
+        let img_result = format!("[[IMAGE:data:image/jpeg;base64,{long_b64}]]");
+        ContextBuilder::add_tool_result(&mut msgs, "tc_2", "read_file", &img_result);
         // tool message with text summary + user message with image
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["role"], "tool");

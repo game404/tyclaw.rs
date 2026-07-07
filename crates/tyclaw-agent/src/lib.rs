@@ -16,6 +16,13 @@ pub(crate) mod loop_helpers;
 /// 工具结果与参数的历史压缩
 pub(crate) mod compression;
 
+// 重新导出 prompt token 压缩相关的公开 API（工具 schema 精简 + token 占比观测）
+pub use compression::{
+    compact_tool_definitions, compact_tool_schema, compute_token_breakdown,
+    emit_token_breakdown, estimate_tool_defs_tokens, PromptTokenBreakdown,
+    PromptTokenFractions,
+};
+
 /// Agent 内部子模块（迭代预算、工具执行等）
 pub(crate) mod agent;
 

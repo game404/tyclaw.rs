@@ -12,3 +12,9 @@ reqwest = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 futures-util = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+# 启用 tokio test-util 以支持 #[tokio::test(start_paused = true)]：
+# 让退避重试的 sleep 在测试中被虚拟时间自动推进，保持测试快速（任务 14.5）。
+tokio = { workspace = true, features = ["test-util"] }
