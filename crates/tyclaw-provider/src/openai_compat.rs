@@ -659,7 +659,16 @@ impl OpenAICompatProvider {
         let mut abort_stream = false;
 
         // SSE 动态超时配置快照（R10.1）：基线 + 高并发阈值。
-        let sse_cfg = current_sse_config();
+        let mut sse_cfg = current_sse_config();
+        // 使高并发阈值与实际全局并发上限自洽：默认 high_concurrency_inflight=8 可能 ≥ 全局上限
+        // （默认 4），导致 `current_inflight > 阈值` 永远为 false、动态超时形同虚设。
+        // 将阈值钳制为 (global_limit - 1)，确保接近/达到饱和（in-flight 达全局上限）时启用更宽松超时；
+        // 同时保留用户配置的更低阈值（在饱和前提前放宽）。
+        let global_limit = crate::concurrency::controller().config().global_max_inflight;
+        if global_limit > 0 {
+            sse_cfg.high_concurrency_inflight =
+                sse_cfg.high_concurrency_inflight.min(global_limit - 1);
+        }
 
         loop {
             // 依据当前 in-flight LLM 调用数动态选择 chunk 超时阈值（R10.2）。

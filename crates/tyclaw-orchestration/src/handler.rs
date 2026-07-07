@@ -2,12 +2,13 @@
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn, Level};
 
 use tyclaw_agent::runtime::{OnProgress, ProgressEvent};
 use tyclaw_agent::{RuntimeResult, RuntimeStatus};
-use tyclaw_control::AuditEntry;
+use tyclaw_control::{AuditEntry, AuditLog};
 use tyclaw_memory::{extract_case, CaseRetriever};
 use tyclaw_prompt::{strip_non_task_user_message, PromptInputs, SkillContent};
 use tyclaw_types::TyclawError;
@@ -21,6 +22,17 @@ use crate::types::{
     MAX_DYNAMIC_INJECTED_SKILLS, MAX_DYNAMIC_SIMILAR_CASES_CHARS, MAX_HISTORY_TOKENS_HARD_LIMIT,
     MIN_HISTORY_BUDGET_TOKENS, RESET_ON_START_FIELD, TOOL_RESULT_MAX_CHARS,
 };
+
+/// 非阻塞写审计日志：移入 `spawn_blocking` 避免阻塞 async worker，并在失败时打 WARN
+/// （而非静默吞掉），保证审计落盘失败可观测。
+pub(crate) fn spawn_audit_log(audit: &Arc<AuditLog>, entry: AuditEntry) {
+    let audit = Arc::clone(audit);
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = audit.log(&entry) {
+            warn!(error = %e, "failed to write audit log");
+        }
+    });
+}
 
 /// 请求处理中间状态，在各阶段之间传递。
 struct HandlerContext<'a> {
@@ -293,7 +305,7 @@ impl Orchestrator {
         if self.app.features.enable_audit {
             let session_id = self.persistence.sessions.get_session_id(&ctx.workspace_key)
                 .unwrap_or_else(|| "unknown".into());
-            let _ = self.persistence.audit.log(&AuditEntry {
+            spawn_audit_log(&self.persistence.audit, AuditEntry {
                 timestamp: chrono::Utc::now(),
                 workspace_key: ctx.workspace_key.clone(),
                 session_id,
@@ -1043,7 +1055,7 @@ impl Orchestrator {
 
             let session_id = self.persistence.sessions.get_session_id(&ctx.workspace_key)
                 .unwrap_or_else(|| "unknown".into());
-            let _ = self.persistence.audit.log(&AuditEntry {
+            spawn_audit_log(&self.persistence.audit, AuditEntry {
                 timestamp: chrono::Utc::now(),
                 workspace_key: ctx.workspace_key.clone(),
                 session_id,

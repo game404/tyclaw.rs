@@ -145,16 +145,19 @@ pub fn load_yaml<T: Default + serde::de::DeserializeOwned>(config_path: &Path) -
     }
 }
 
-/// 对 API 密钥等敏感字段做掩码（保留首尾 4 字符）。
+/// 对 API 密钥等敏感字段做掩码（保留首尾 4 个字符）。
+///
+/// 按 Unicode 字符（而非字节）切分，避免在多字节 UTF-8 字符边界处切片导致 panic。
 pub fn mask_secret(secret: &str) -> String {
     if secret.is_empty() {
         return "<empty>".into();
     }
-    if secret.len() <= 8 {
+    let chars: Vec<char> = secret.chars().collect();
+    if chars.len() <= 8 {
         return "***".into();
     }
-    let prefix = &secret[..4];
-    let suffix = &secret[secret.len() - 4..];
+    let prefix: String = chars[..4].iter().collect();
+    let suffix: String = chars[chars.len() - 4..].iter().collect();
     format!("{prefix}***{suffix}")
 }
 
@@ -172,7 +175,11 @@ pub const NODE_TIMEOUT_CEIL_SECS: u64 = 300;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct PollutionConfig {
-    /// 污染关键词集合，默认 ["I cannot make progress", "error", "blocked"]。
+    /// 污染关键词集合。
+    ///
+    /// 默认仅收录判别性强的「失败兜底」整短语，避免裸词（如 `error`/`blocked`）
+    /// 误杀正常工具输出（例如 `Build finished: 0 errors`、`no error`）。
+    /// 这些短语对应 Agent_Loop 在无法推进时注入的兜底文案（见 agent_loop.rs）。
     pub keywords: Vec<String>,
     /// 污染候选短消息字符上限，默认 512。
     pub short_message_max_chars: usize,
@@ -183,8 +190,9 @@ impl Default for PollutionConfig {
         Self {
             keywords: vec![
                 "I cannot make progress".to_string(),
-                "error".to_string(),
-                "blocked".to_string(),
+                "unable to make progress".to_string(),
+                "无法继续".to_string(),
+                "无法取得进展".to_string(),
             ],
             short_message_max_chars: 512,
         }
@@ -387,6 +395,33 @@ impl PerformanceConfig {
             .subtask_timeout
             .node_max_duration_secs
             .min(NODE_TIMEOUT_CEIL_SECS);
+
+        // ── 字段间关系约束 ──
+        // tail_ratio 必须落在 [0, 1]；NaN/越界回退默认 0.25。
+        let tr = self.truncation.tail_ratio;
+        if !(0.0..=1.0).contains(&tr) {
+            self.truncation.tail_ratio = 0.25;
+        }
+        // 会话规模：max_messages ≥ 1；rolling_target ∈ [1, max_messages]。
+        self.session_limits.max_messages = self.session_limits.max_messages.max(1);
+        self.session_limits.rolling_target = self
+            .session_limits
+            .rolling_target
+            .clamp(1, self.session_limits.max_messages);
+        // Pairs_Fixes：告警阈值不得高于强制重置阈值。
+        if self.session_limits.pairs_fixes_warn > self.session_limits.pairs_fixes_force_reset {
+            self.session_limits.pairs_fixes_warn = self.session_limits.pairs_fixes_force_reset;
+        }
+        // SSE：高并发超时不得严于（小于）基线 chunk 超时。
+        self.sse.high_concurrency_timeout_secs = self
+            .sse
+            .high_concurrency_timeout_secs
+            .max(self.sse.chunk_timeout_secs);
+        // dispatch 整体超时不应小于单 node 超时。
+        self.subtask_timeout.dispatch_max_duration_secs = self
+            .subtask_timeout
+            .dispatch_max_duration_secs
+            .max(self.subtask_timeout.node_max_duration_secs);
     }
 }
 
@@ -434,16 +469,19 @@ mod perf_config_default_tests {
 
     #[test]
     fn pollution_defaults_match_requirements() {
-        // R1.3：默认污染关键词集合 + 短消息字符上限。
+        // R1.3：默认污染关键词为判别性强的失败兜底短语，不含易误杀的裸词。
         let cfg = PollutionConfig::default();
         assert_eq!(
             cfg.keywords,
             vec![
                 "I cannot make progress".to_string(),
-                "error".to_string(),
-                "blocked".to_string(),
+                "unable to make progress".to_string(),
+                "无法继续".to_string(),
+                "无法取得进展".to_string(),
             ]
         );
+        // 不应包含会误杀正常工具输出的裸词。
+        assert!(!cfg.keywords.iter().any(|k| k == "error" || k == "blocked"));
         assert_eq!(cfg.short_message_max_chars, 512);
     }
 

@@ -245,7 +245,7 @@ impl OrchestratorBuilder {
         let context = ContextBuilder::new(&workspace);
         let persistence = PersistenceLayer {
             workspace_mgr: WorkspaceManager::with_path_config(&workspace, workspace_key_strategy, workspaces_config, path_config),
-            audit: AuditLog::new(workspace.join("audit")),
+            audit: std::sync::Arc::new(AuditLog::new(workspace.join("audit"))),
             case_store: CaseStore::new(workspace.join("cases")),
             sessions: SessionManager::new(&workspace),
             skills: SkillManager::new(workspace.join("skills"), workspace.clone()),

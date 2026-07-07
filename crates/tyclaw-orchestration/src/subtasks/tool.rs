@@ -81,11 +81,16 @@ impl DispatchSubtasksTool {
         routing: &RoutingPolicy,
         app: Arc<AppContext>,
     ) -> Self {
-        let scheduler = Arc::new(DagScheduler::new(
-            executor,
-            Some(max_concurrency),
-            Some(default_timeout_ms),
-        ));
+        // 接入 PerformanceConfig 的子任务链超时（R7）：单 Node / dispatch 整体超时上限
+        // 来自用户配置，而非硬编码默认值。秒 → 毫秒。
+        let st = &app.performance.subtask_timeout;
+        let scheduler = Arc::new(
+            DagScheduler::new(executor, Some(max_concurrency), Some(default_timeout_ms))
+                .with_chain_timeouts(
+                    Some(st.node_max_duration_secs.saturating_mul(1000)),
+                    Some(st.dispatch_max_duration_secs.saturating_mul(1000)),
+                ),
+        );
         let description = Self::build_description(routing, max_concurrency);
         Self {
             scheduler,

@@ -169,21 +169,30 @@ pub trait LLMProvider: Send + Sync {
         // 经由并发控制器获取许可：同时受全局与单用户两级闸门约束，
         // 并具备排队超时能力（R6.2/R6.5）。user_id 由 task-local 提供（未设置走兜底）。
         let user_id = current_user_id();
-        let _permit = match concurrency::acquire_permit(&user_id).await {
-            Ok(permit) => permit,
-            Err(ConcurrencyError::QueueTimeout { limit_kind }) => {
-                warn!(
-                    user_id = %user_id,
-                    limit_kind = limit_kind.as_str(),
-                    "LLM request rejected after concurrency queue timeout"
-                );
-                return LLMResponse::error(
-                    "系统繁忙，请稍后重试（并发排队超时）".to_string(),
-                );
+
+        // 获取许可；排队超时则返回可识别的「请稍后重试」提示（与重试耗尽路径文案一致）。
+        async fn acquire_or_reject(user_id: &str) -> Result<concurrency::Permit, LLMResponse> {
+            match concurrency::acquire_permit(user_id).await {
+                Ok(permit) => Ok(permit),
+                Err(ConcurrencyError::QueueTimeout { limit_kind }) => {
+                    warn!(
+                        user_id = %user_id,
+                        limit_kind = limit_kind.as_str(),
+                        "LLM request rejected after concurrency queue timeout"
+                    );
+                    Err(retry_exhausted_response())
+                }
             }
+        }
+
+        let mut permit = match acquire_or_reject(&user_id).await {
+            Ok(p) => p,
+            Err(resp) => return resp,
         };
 
-        // 按延迟序列依次重试
+        // 按延迟序列依次重试。
+        // 关键：在重试退避（sleep）期间释放许可、重试前重新获取，避免空等时持有稀缺许可、
+        // 加剧全局/单用户排队饥饿（代价：重试需重新排队，超时则返回稍后重试）。
         for (attempt, delay) in RETRY_DELAYS.iter().enumerate() {
             let response = match self.chat(request.clone()).await {
                 Ok(r) => r,
@@ -200,7 +209,12 @@ pub trait LLMProvider: Send + Sync {
                         attempt = attempt + 1,
                         "LLM returned empty response (no content, no tool_calls), retrying"
                     );
+                    drop(permit);
                     tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAYS[attempt])).await;
+                    permit = match acquire_or_reject(&user_id).await {
+                        Ok(p) => p,
+                        Err(resp) => return resp,
+                    };
                     continue;
                 }
                 return response;
@@ -218,9 +232,17 @@ pub trait LLMProvider: Send + Sync {
                 error = response.content.as_deref().unwrap_or(""),
                 "LLM transient error, retrying"
             );
-            // 等待指定延迟后重试
+            // 释放许可后退避，重试前重新获取。
+            drop(permit);
             tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+            permit = match acquire_or_reject(&user_id).await {
+                Ok(p) => p,
+                Err(resp) => return resp,
+            };
         }
+
+        // 最终尝试持有许可（permit 仍在作用域内）。
+        let _permit = permit;
 
         // 最终尝试（第4次调用），不再重试
         let final_resp = match self.chat(request).await {

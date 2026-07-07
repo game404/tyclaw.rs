@@ -257,6 +257,8 @@ impl MemoryConsolidator {
         provider: &dyn LLMProvider,
         model: &str,
     ) -> bool {
+        // 防御越界：陈旧的 last_consolidated 可能超过当前消息数（会话被截断/重置后）。
+        let last_consolidated = last_consolidated.min(messages.len());
         let snapshot = &messages[last_consolidated..];
         if snapshot.is_empty() {
             return true;
@@ -360,6 +362,10 @@ impl MemoryConsolidator {
         model: &str,
     ) -> usize {
         if messages.is_empty() || self.context_window_tokens == 0 {
+            return last_consolidated;
+        }
+        // 防御越界：陈旧的 last_consolidated 超过消息数时无可合并，直接返回。
+        if last_consolidated >= messages.len() {
             return last_consolidated;
         }
 

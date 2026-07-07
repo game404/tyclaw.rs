@@ -91,8 +91,14 @@ impl StepCache {
     /// 写入缓存键。
     ///
     /// 过期时刻为 `expires_at = now + ttl`。若键已存在则覆盖。
+    ///
+    /// 使用 `checked_add` 避免 `Instant + Duration` 溢出 panic：极端 ttl 溢出时
+    /// 退化为「远期过期」（now + ~100 年），即近似永不过期，而非崩溃。
     pub fn put(&mut self, key: &str, val: CachedValue, ttl: Duration, now: Instant) {
-        let expires_at = now + ttl;
+        let expires_at = now
+            .checked_add(ttl)
+            .or_else(|| now.checked_add(Duration::from_secs(3_153_600_000)))
+            .unwrap_or(now);
         self.entries.insert(
             key.to_string(),
             Entry {

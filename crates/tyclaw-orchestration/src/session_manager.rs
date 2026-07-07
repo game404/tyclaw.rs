@@ -69,7 +69,9 @@ impl Session {
     /// - `max_messages`: 最大返回消息数，0 表示返回所有未合并的消息
     /// - 严格保留切片后的原始顺序，不主动跳过开头非 user 消息。
     pub fn get_history(&self, max_messages: usize) -> Vec<HashMap<String, Value>> {
-        let unconsolidated = &self.messages[self.last_consolidated..];
+        // 防御越界：last_consolidated 可能因外部因素超过 messages.len()。
+        let last_consolidated = self.last_consolidated.min(self.messages.len());
+        let unconsolidated = &self.messages[last_consolidated..];
         let sliced = if max_messages > 0 && unconsolidated.len() > max_messages {
             &unconsolidated[unconsolidated.len() - max_messages..]
         } else {
@@ -518,6 +520,10 @@ impl SessionManager {
             }
         }
 
+        // 防御性钳制：磁盘 metadata 里的 last_consolidated 可能与实际消息行数不一致
+        // （文件被截断/手工编辑/写入中途崩溃），否则后续切片 messages[last_consolidated..] 会越界 panic。
+        let last_consolidated = last_consolidated.min(messages.len());
+
         Some(Session {
             workspace_key: workspace_key.to_string(),
             session_id: generate_session_id(), // 每次加载生成新 session_id
@@ -605,15 +611,18 @@ impl SessionManager {
             writeln!(file, "{}", serde_json::to_string(&meta)?)?;
         }
 
-        // 先清缓存，使并发读取者在写入完成后从磁盘重新加载（包含新追加的消息）。
-        // 如果放在写入之后，并发读取者可能在写入期间命中旧缓存。
+        for msg in messages {
+            writeln!(file, "{}", serde_json::to_string(msg)?)?;
+        }
+        // 先落盘（含 flush），再清缓存：保证清缓存之后的任何读取都能从磁盘读到完整、
+        // 包含新追加消息的内容。若顺序相反，并发读取者可能在「已清缓存、未写完」的窗口
+        // 读到旧磁盘内容并把陈旧副本重新写回缓存。
+        use std::io::Write as _;
+        file.flush()?;
+        drop(file);
         {
             let mut cache = self.cache.lock();
             cache.remove(workspace_key);
-        }
-
-        for msg in messages {
-            writeln!(file, "{}", serde_json::to_string(msg)?)?;
         }
 
         Ok(())
@@ -710,10 +719,22 @@ impl SessionManager {
             let boundary = adjust_truncation_boundary(&session.messages, boundary);
 
             // 将 boundary 之前的消息合并入记忆（best-effort），随后从活动会话移除。
+            // 合并失败时，转储被丢弃的消息到恢复文件，避免静默数据丢失。
             if boundary > 0 {
                 let chunk = session.messages[..boundary].to_vec();
-                let _ =
+                let merged_ok =
                     consolidate_with_provider(&consolidator.store, &chunk, provider, model).await;
+                if !merged_ok {
+                    let dump = consolidator
+                        .store
+                        .dump_unrecoverable(&session.workspace_key, &chunk);
+                    warn!(
+                        workspace_key = %session.workspace_key,
+                        dropped = chunk.len(),
+                        dump = ?dump,
+                        "Forced reset: consolidation failed, dropped messages dumped for recovery"
+                    );
+                }
             }
             session.messages.drain(..boundary);
             session.last_consolidated = 0;

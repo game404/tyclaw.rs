@@ -369,13 +369,37 @@ pub(crate) fn extract_json_field(json_str: &str, field: &str) -> Option<String> 
         i += 1;
     }
     let raw = &json_str[value_start..i];
-    // 基本反转义
-    let unescaped = raw
-        .replace("\\n", "\n")
-        .replace("\\t", "\t")
-        .replace("\\\"", "\"")
-        .replace("\\\\", "\\");
-    Some(unescaped)
+    Some(unescape_json_string(raw))
+}
+
+/// 单遍反转义 JSON 字符串字面量内容。
+///
+/// 必须单遍处理：串行 `replace` 会相互污染——例如源串 `\\n`（转义反斜杠 + 字母 n，
+/// 应还原为 `\` 和 `n`）会被 `replace("\\n", "\n")` 误判成换行。
+fn unescape_json_string(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('/') => out.push('/'),
+            // 未识别的转义（含 \uXXXX）按原样保留，不做进一步解析。
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -559,6 +583,27 @@ mod compact_schema_tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn extract_json_field_unescapes_correctly() {
+        // 普通转义。
+        assert_eq!(
+            extract_json_field(r#"{"command":"a\nb\tc\"d"}"#, "command"),
+            Some("a\nb\tc\"d".to_string())
+        );
+        // 关键回归：转义反斜杠 + 字母 n（\\n）必须还原为 `\` 和 `n`，而非换行。
+        assert_eq!(
+            extract_json_field(r#"{"path":"C:\\nodes\\bin"}"#, "path"),
+            Some(r"C:\nodes\bin".to_string())
+        );
+        // 与 serde_json 解析结果一致。
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"path":"C:\\nodes\\bin"}"#).unwrap();
+        assert_eq!(
+            extract_json_field(r#"{"path":"C:\\nodes\\bin"}"#, "path").as_deref(),
+            v["path"].as_str()
+        );
     }
 
     #[test]

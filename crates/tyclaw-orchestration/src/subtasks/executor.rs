@@ -257,18 +257,22 @@ impl NodeExecutor {
 
         match result {
             Ok(runtime_result) => {
+                let hit_max_iter = runtime_result.hit_max_iterations;
                 let raw_output = runtime_result.content.unwrap_or_default();
                 let output_text = sanitize_sub_agent_output(&raw_output);
                 let tools_used = runtime_result.tools_used;
 
-                // R2.1/R2.2：校正节点状态——正文含污染关键词绝不判为 Success。
-                // TODO(任务 19.x)：从 PerformanceConfig 注入完整 PollutionConfig；
-                // 暂用默认配置完成关键的污染检测。
-                // TODO：RuntimeResult 暂无 max_iterations 命中标志，hit_max_iter 暂传 false；
-                // 待 agent runtime 暴露终止原因后接入（污染检测为 R2.1 关键路径，已生效）。
-                let pollution_cfg = PollutionConfig::default();
-                let reconciled_status =
-                    reconcile_node_status(NodeStatus::Success, &output_text, false, &pollution_cfg);
+                // R2.1/R2.2：校正节点状态——正文含污染关键词绝不判为 Success；
+                // 命中 max_iterations 且产出空白/受阻时判为 Failed。
+                // 污染关键词与阈值取自 PerformanceConfig（与 R1 配置一致），
+                // 而非硬编码默认值。
+                let pollution_cfg = &self.app.performance.pollution;
+                let reconciled_status = reconcile_node_status(
+                    NodeStatus::Success,
+                    &output_text,
+                    hit_max_iter,
+                    pollution_cfg,
+                );
 
                 info!(
                     node_id = %node.id,
@@ -835,12 +839,17 @@ mod reconcile_tests {
             NodeStatus::Failed
         );
         assert_eq!(
-            reconcile_node_status(NodeStatus::Success, "fatal ERROR occurred", false, &cfg),
+            reconcile_node_status(NodeStatus::Success, "Unable To Make Progress now", false, &cfg),
             NodeStatus::Failed
         );
         // raw==Blocked 且含污染词：保留 Blocked（仍属失败语义，非 Success）。
         assert_eq!(
-            reconcile_node_status(NodeStatus::Blocked, "task blocked by readonly fs", false, &cfg),
+            reconcile_node_status(
+                NodeStatus::Blocked,
+                "I cannot make progress on readonly fs",
+                false,
+                &cfg
+            ),
             NodeStatus::Blocked
         );
     }
@@ -855,7 +864,12 @@ mod reconcile_tests {
         );
         // 撞顶 + 含污染词 → Failed（即使 raw==Blocked 也归 Failed）。
         assert_eq!(
-            reconcile_node_status(NodeStatus::Blocked, "error: blocked", true, &cfg),
+            reconcile_node_status(
+                NodeStatus::Blocked,
+                "unable to make progress",
+                true,
+                &cfg
+            ),
             NodeStatus::Failed
         );
     }

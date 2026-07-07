@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// 审计日志条目。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,13 +147,35 @@ pub fn warn_max_iterations_reset(workspace_key: &str) {
 /// 存储结构：`{audit_dir}/YYYY-MM-DD.jsonl`
 pub struct AuditLog {
     audit_dir: PathBuf,
+    /// 进程内写锁：串行化追加写，避免多线程并发写时 line 与换行被拆成两次
+    /// write() 系统调用而交错，产生损坏（非法 JSON）的行。
+    write_lock: Mutex<()>,
 }
 
 impl AuditLog {
     pub fn new(audit_dir: impl AsRef<Path>) -> Self {
         Self {
             audit_dir: audit_dir.as_ref().to_path_buf(),
+            write_lock: Mutex::new(()),
         }
+    }
+
+    /// 将单条记录序列化为「JSON + 换行」并以单次 `write_all` 原子追加。
+    ///
+    /// O_APPEND 仅保证「单次 write 调用」的原子追加；`writeln!` 会产生两次写调用
+    /// （正文 + 换行），并发下可能交错。这里先拼好整行再一次性写入，并配合进程内
+    /// 写锁，确保单条记录不被其它写入打断。
+    fn append_line<T: Serialize>(&self, path: &Path, entry: &T) -> Result<(), std::io::Error> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut line = serde_json::to_string(entry)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        line.push('\n');
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        file.write_all(line.as_bytes())?;
+        Ok(())
     }
 
     /// 当天的审计日志文件路径。
@@ -169,14 +192,7 @@ impl AuditLog {
     /// 追加一条审计日志。
     pub fn log(&self, entry: &AuditEntry) -> Result<(), std::io::Error> {
         let path = self.today_file();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let line = serde_json::to_string(entry)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        writeln!(file, "{line}")?;
-        Ok(())
+        self.append_line(&path, entry)
     }
 
     /// 查询审计日志。
@@ -194,14 +210,14 @@ impl AuditLog {
             Some(d) => self.date_file(d),
             None => self.today_file(),
         };
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
+        let content = match read_audit_file(&path) {
+            Some(c) => c,
+            None => return Vec::new(),
         };
 
         let mut entries: Vec<AuditEntry> = content
             .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
+            .filter_map(|line| parse_audit_line(&path, line))
             .filter(|e: &AuditEntry| {
                 workspace_key.map_or(true, |wk| e.workspace_key == wk)
                     && user_id.map_or(true, |uid| e.user_id == uid)
@@ -231,14 +247,7 @@ impl AuditLog {
     /// 避免与常规审计记录混淆 schema。
     pub fn log_failure(&self, entry: &FailureAuditEntry) -> Result<(), std::io::Error> {
         let path = self.today_failure_file();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let line = serde_json::to_string(entry)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        writeln!(file, "{line}")?;
-        Ok(())
+        self.append_line(&path, entry)
     }
 
     /// 查询失败审计记录。
@@ -255,17 +264,45 @@ impl AuditLog {
             Some(d) => self.date_failure_file(d),
             None => self.today_failure_file(),
         };
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
+        let content = match read_audit_file(&path) {
+            Some(c) => c,
+            None => return Vec::new(),
         };
         content
             .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
+            .filter_map(|line| parse_audit_line(&path, line))
             .filter(|e: &FailureAuditEntry| {
                 workspace_key.map_or(true, |wk| e.workspace_key == wk)
             })
             .collect()
+    }
+}
+
+/// 读取审计文件内容；文件不存在视为「无记录」静默返回 None，其它 IO 错误（权限/损坏）
+/// 打 WARN 以便观测，避免把真实异常误当成空结果。
+fn read_audit_file(path: &Path) -> Option<String> {
+    match fs::read_to_string(path) {
+        Ok(c) => Some(c),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "读取审计文件失败");
+            None
+        }
+    }
+}
+
+/// 解析单行审计记录；解析失败（如并发写入产生的损坏行）打 WARN 并跳过，
+/// 而非静默丢弃，以免审计数据无声缺失。
+fn parse_audit_line<T: for<'de> Deserialize<'de>>(path: &Path, line: &str) -> Option<T> {
+    if line.trim().is_empty() {
+        return None;
+    }
+    match serde_json::from_str(line) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "跳过损坏的审计行");
+            None
+        }
     }
 }
 

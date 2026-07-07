@@ -137,25 +137,54 @@ impl PrecheckState {
 
 /// 真实文件系统可写性探测。
 ///
-/// 判定规则：
-/// - 若目标路径已存在为文件/目录：其权限不是只读即视为可写；
-/// - 若目标路径尚不存在：其父目录须存在且非只读（视为可在其中创建）。
+/// 通过「实际尝试」判定，而非读取 mode 位——`permissions().readonly()` 仅检查
+/// mode 中的写位，无法反映当前进程的有效权限（uid/gid、ACL、只读挂载等），在沙盒里
+/// 以非属主用户运行写工具时会产生系统性误判。判定规则：
+/// - 目标已存在且是目录：在其中创建并删除一个唯一临时文件；
+/// - 目标已存在且是文件：以 append 方式打开（不截断），成功即可写；
+/// - 目标不存在：在父目录尝试创建并删除临时文件（隐含校验父目录存在且可写）。
 ///
-/// 任何无法取得元数据的情况一律视为不可写（保守失败）。
+/// 任何尝试失败一律视为不可写（保守失败）。
 fn probe_writable(path: &Path) -> bool {
-    if let Ok(meta) = std::fs::metadata(path) {
-        // 已存在：非只读即可写。
-        return !meta.permissions().readonly();
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => dir_is_writable(path),
+        Ok(_) => {
+            // 已存在的文件：append 打开（不截断）验证当前进程实际可写。
+            std::fs::OpenOptions::new().append(true).open(path).is_ok()
+        }
+        Err(_) => {
+            // 不存在：在父目录尝试创建临时文件，验证可在其中创建。
+            let parent = match path.parent() {
+                // 空父路径（如裸文件名）按当前目录处理。
+                Some(p) if p.as_os_str().is_empty() => Path::new("."),
+                Some(p) => p,
+                None => return false,
+            };
+            dir_is_writable(parent)
+        }
     }
-    // 不存在：检查父目录是否存在且可写。
-    let parent = match path.parent() {
-        // 空父路径（如裸文件名）按当前目录处理。
-        Some(p) if p.as_os_str().is_empty() => Path::new("."),
-        Some(p) => p,
-        None => return false,
-    };
-    match std::fs::metadata(parent) {
-        Ok(meta) => meta.is_dir() && !meta.permissions().readonly(),
+}
+
+/// 通过在目录内实际创建并删除一个唯一临时文件，验证当前进程对该目录的可写性。
+fn dir_is_writable(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let probe = dir.join(format!(".tyclaw_write_probe_{}_{nanos}", std::process::id()));
+    // O_EXCL（create_new）避免误删/覆盖既有文件。
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
         Err(_) => false,
     }
 }

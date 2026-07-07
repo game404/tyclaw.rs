@@ -25,6 +25,9 @@ const DEFAULT_GLOBAL_MAX_INFLIGHT: usize = 4;
 const DEFAULT_PER_USER_MAX_INFLIGHT: usize = 3;
 /// 默认排队超时（R6.3/R6.5）：5 分钟。
 const DEFAULT_QUEUE_TIMEOUT_SECS: u64 = 300;
+/// per-user 信号量表的回收阈值：条目数超过此值时，在下次获取许可时顺带回收空闲条目，
+/// 避免 per-user 表随历史用户数无界增长。
+const PER_USER_GC_THRESHOLD: usize = 1024;
 
 /// 并发控制配置（R6）。
 #[derive(Debug, Clone)]
@@ -187,11 +190,47 @@ impl ConcurrencyController {
     }
 
     /// 获取指定用户的 per-user 信号量（不存在则按上限创建）。
+    ///
+    /// 表条目数超过 [`PER_USER_GC_THRESHOLD`] 时顺带回收空闲条目，避免 per-user 表
+    /// 随历史用户数无界增长（内存泄漏）。
     fn user_semaphore(&self, user_id: &str) -> Arc<Semaphore> {
-        let mut map = self.per_user.lock().expect("per_user mutex poisoned");
+        let mut map = self.per_user.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() > PER_USER_GC_THRESHOLD {
+            Self::prune_idle(&mut map, self.config.per_user_max_inflight, Some(user_id));
+        }
         map.entry(user_id.to_string())
             .or_insert_with(|| Arc::new(Semaphore::new(self.config.per_user_max_inflight)))
             .clone()
+    }
+
+    /// 回收空闲用户条目：仅保留「正被持有（strong_count>1）」或「许可未满（有 in-flight）」
+    /// 或「当前正在请求」的条目。空闲且满额的条目可安全移除，需要时会按默认上限重建。
+    fn prune_idle(
+        map: &mut HashMap<String, Arc<Semaphore>>,
+        per_user_max: usize,
+        keep: Option<&str>,
+    ) {
+        map.retain(|key, sem| {
+            Some(key.as_str()) == keep
+                || Arc::strong_count(sem) > 1
+                || sem.available_permits() != per_user_max
+        });
+    }
+
+    /// 主动回收空闲的 per-user 条目，供上层周期性调用以控制内存占用。
+    /// 返回回收后剩余的条目数。
+    pub fn gc(&self) -> usize {
+        let mut map = self.per_user.lock().unwrap_or_else(|e| e.into_inner());
+        Self::prune_idle(&mut map, self.config.per_user_max_inflight, None);
+        map.len()
+    }
+
+    /// 当前被跟踪的 per-user 条目数（可观测/测试用途）。
+    pub fn tracked_users(&self) -> usize {
+        self.per_user
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// 获取一个执行许可。
@@ -413,5 +452,37 @@ mod tests {
         // 释放后应可立即再次成功获取。
         let second = controller.acquire_permit("alice").await;
         assert!(second.is_ok(), "acquire should succeed after capacity is freed");
+    }
+
+    /// 用例 4：gc() 回收空闲用户条目，但不回收正被持有的条目，避免 per-user 表无界增长。
+    #[tokio::test]
+    async fn gc_reclaims_idle_user_entries() {
+        let controller = ConcurrencyController::new(ConcurrencyConfig {
+            global_max_inflight: 64,
+            per_user_max_inflight: 2,
+            queue_timeout: Duration::from_millis(80),
+        });
+
+        // 制造一批一次性用户的空闲条目。
+        for i in 0..50 {
+            let p = controller
+                .acquire_permit(&format!("user_{i}"))
+                .await
+                .expect("acquire");
+            drop(p); // 立即释放 → 条目变为空闲且满额。
+        }
+        assert_eq!(controller.tracked_users(), 50, "all users tracked before gc");
+
+        // 持有一个用户的许可，确保其不被回收。
+        let held = controller.acquire_permit("active").await.expect("acquire active");
+        assert_eq!(controller.tracked_users(), 51);
+
+        let remaining = controller.gc();
+        assert_eq!(remaining, 1, "only the in-use entry should survive gc");
+        assert_eq!(controller.tracked_users(), 1);
+
+        drop(held);
+        // 再次 gc：现在 active 也空闲 → 全部回收。
+        assert_eq!(controller.gc(), 0, "idle entry reclaimed after release");
     }
 }

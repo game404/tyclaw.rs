@@ -126,9 +126,9 @@ impl Orchestrator {
                         .lock()
                         .retain(|k, _| !k.starts_with(&conv_prefix));
 
-                    // 7. 写审计日志
+                    // 7. 写审计日志（非阻塞，失败打 WARN）
                     let session_id = "reaper".to_string();
-                    let _ = orch.persistence.audit.log(&AuditEntry {
+                    crate::handler::spawn_audit_log(&orch.persistence.audit, AuditEntry {
                         timestamp: chrono::Utc::now(),
                         workspace_key: workspace_key.clone(),
                         session_id,

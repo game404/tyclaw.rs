@@ -226,8 +226,9 @@ mod tests {
             cfg.keywords,
             vec![
                 "I cannot make progress".to_string(),
-                "error".to_string(),
-                "blocked".to_string()
+                "unable to make progress".to_string(),
+                "无法继续".to_string(),
+                "无法取得进展".to_string(),
             ]
         );
         assert_eq!(cfg.short_message_max_chars, 512);
@@ -237,17 +238,26 @@ mod tests {
     fn contains_phrase_is_case_insensitive() {
         let cfg = PollutionConfig::default();
         assert!(contains_pollution_phrase("I CANNOT make Progress now", &cfg));
-        assert!(contains_pollution_phrase("task BLOCKED by readonly fs", &cfg));
+        assert!(contains_pollution_phrase("Unable To Make Progress here", &cfg));
         assert!(!contains_pollution_phrase("everything is fine", &cfg));
+        // 裸词不再误杀正常工具输出。
+        assert!(!contains_pollution_phrase("Build finished: 0 errors", &cfg));
+        assert!(!contains_pollution_phrase("port is blocked by firewall", &cfg));
     }
 
     #[test]
     fn candidate_requires_tool_role() {
         let cfg = PollutionConfig::default();
         // 同样的污染正文，非 tool 角色不应判为候选
-        assert!(is_pollution_candidate(&tool_msg("error occurred"), &cfg));
-        assert!(!is_pollution_candidate(&msg("assistant", "error occurred"), &cfg));
-        assert!(!is_pollution_candidate(&msg("user", "error occurred"), &cfg));
+        assert!(is_pollution_candidate(&tool_msg("I cannot make progress"), &cfg));
+        assert!(!is_pollution_candidate(
+            &msg("assistant", "I cannot make progress"),
+            &cfg
+        ));
+        assert!(!is_pollution_candidate(
+            &msg("user", "I cannot make progress"),
+            &cfg
+        ));
     }
 
     #[test]
@@ -355,7 +365,7 @@ mod tests {
         // tool_call_id 没有对应的 assistant tool_call —— 孤立污染结果。
         let history = vec![
             msg("user", "hi"),
-            tool_result("orphan_id", "exec", "error: something went wrong"),
+            tool_result("orphan_id", "exec", "I cannot make progress here"),
         ];
 
         let res = filter_pollution(&history, &cfg);
@@ -373,7 +383,7 @@ mod tests {
         let history = vec![
             msg("user", "go"),
             assistant_with_call("c1", "exec"),
-            tool_result("c1", "exec", "blocked by readonly fs"),
+            tool_result("c1", "exec", "I cannot make progress on this"),
             assistant_with_call("c2", "read_file"),
             tool_result("c2", "read_file", "valid output"),
         ];
@@ -468,7 +478,7 @@ mod tests {
         let history = vec![
             msg("user", "go"),
             assistant_with_call("c1", "exec"),
-            tool_result("c1", "exec", "blocked by readonly fs"),
+            tool_result("c1", "exec", "I cannot make progress on this"),
             assistant_with_call("c2", "read_file"),
             tool_result("c2", "read_file", "valid output"),
         ];
@@ -606,7 +616,7 @@ mod tests {
                     h.push(assistant_with_call(&id, "exec"));
                     // 污染正文命中默认关键词；干净正文不含任何关键词。
                     let content = if *pollution {
-                        if i % 2 == 0 { "I cannot make progress" } else { "blocked by readonly fs" }
+                        if i % 2 == 0 { "I cannot make progress" } else { "unable to make progress" }
                     } else {
                         "valid clean output data"
                     };
@@ -615,7 +625,7 @@ mod tests {
                 HistItem::OrphanPollution => {
                     // id 不会被任何 assistant 声明（orphan_ 前缀），且为污染 → 应被直接剔除。
                     let id = format!("orphan_{i}");
-                    h.push(tool_result(&id, "exec", "error occurred"));
+                    h.push(tool_result(&id, "exec", "I cannot make progress"));
                 }
             }
         }
