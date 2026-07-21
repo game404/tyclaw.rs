@@ -14,9 +14,8 @@ use tyclaw_tools::ToolRuntime;
 use tyclaw_tools::{
     timer::TimerService, ApplyPatchTool, AskUserTool, CopyFileTool, DeleteFileTool, EditFileTool,
     EmailConfig, ExecTool, GlobTool, GrepSearchTool, ListDirTool, MkdirTool, MoveFileTool,
-    PendingFileStore, PendingRecommendStore, ReadFileTool, SendEmailTool, SendFileTool,
-    SuggestRecommendsTool, TimerTool, ToolRegistry, WebFetchTool, WebSearchConfig, WebSearchTool,
-    WriteFileTool,
+    PendingFileStore, PendingRecommendStore, ReadFileTool, SendEmailTool, SendFileTool, TimerTool,
+    ToolRegistry, WebFetchTool, WebSearchConfig, WebSearchTool, WriteFileTool,
 };
 use tyclaw_types::constants::DEFAULT_CONTEXT_WINDOW;
 
@@ -429,7 +428,7 @@ fn register_orchestration_tools(
     tools: &mut ToolRegistry,
     workspace: &Path,
     pending_files: Arc<PendingFileStore>,
-    pending_recommends: Arc<PendingRecommendStore>,
+    _pending_recommends: Arc<PendingRecommendStore>,
     timer_service: Option<&Arc<TimerService>>,
     web_search_config: Option<WebSearchConfig>,
     email_config: Option<EmailConfig>,
@@ -445,7 +444,10 @@ fn register_orchestration_tools(
     )));
     info!("Email tool registered (send_email)");
 
-    tools.register(Box::new(SuggestRecommendsTool::new(pending_recommends)));
+    // suggest_recommends 工具已停用：推荐问题改由 skill 写进正文末尾的「追问建议」块，
+    // 再由渠道 egress（dingtalk::sanitize::extract_recommends）解析成卡片按钮。
+    // 保留 PendingRecommendStore 与 AgentResponse.recommends 字段以减少改动面。
+    let _ = _pending_recommends;
 
     if let Some(timer) = timer_service {
         tools.register(Box::new(TimerTool::new(timer.clone())));
