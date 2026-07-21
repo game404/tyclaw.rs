@@ -34,6 +34,8 @@ pub struct BaseConfig {
     #[serde(default)]
     pub web_search: tyclaw_tools::WebSearchConfig,
     #[serde(default)]
+    pub email: tyclaw_tools::EmailConfig,
+    #[serde(default)]
     pub control: tyclaw_control::ControlConfig,
     /// 统一性能治理配置（污染过滤 / 会话规模 / 截断 / 并发 / 超时 等）。
     #[serde(default)]

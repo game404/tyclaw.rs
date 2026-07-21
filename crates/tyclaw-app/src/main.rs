@@ -400,6 +400,7 @@ async fn main() {
             sc
         },
         web_search_config: cfg.web_search,
+        email_config: cfg.email,
         control_config: cfg.control,
         workspace_config: cfg.workspace,
         performance: cfg.performance,
@@ -500,6 +501,7 @@ struct RunConfig {
     workspaces: HashMap<String, WorkspaceConfig>,
     subtasks_config: SubtasksConfig,
     web_search_config: tyclaw_tools::WebSearchConfig,
+    email_config: tyclaw_tools::EmailConfig,
     control_config: tyclaw_orchestration::ControlConfig,
     workspace_config: tyclaw_orchestration::WorkspaceRuntimeConfig,
     /// 统一性能治理配置（污染过滤 / 会话规模 / 截断 / 并发 / 超时 等）。
@@ -522,6 +524,7 @@ impl RunConfig {
             .with_workspace_key_strategy(self.workspace_config.key_strategy.clone())
             .with_subtasks(self.subtasks_config)
             .with_web_search(self.web_search_config)
+            .with_email(self.email_config)
             .with_control(self.control_config)
             .with_performance(self.performance)
             .with_timer(timer_svc)
