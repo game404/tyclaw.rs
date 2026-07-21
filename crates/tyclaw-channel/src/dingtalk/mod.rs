@@ -13,6 +13,7 @@ pub mod credential;
 pub mod gateway;
 pub mod handler;
 pub mod message;
+mod sanitize;
 pub mod stream;
 
 pub use ai_card::{

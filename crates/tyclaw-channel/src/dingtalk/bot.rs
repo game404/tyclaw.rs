@@ -357,7 +357,9 @@ impl ChatbotHandler for DingTalkBot {
 
         match result {
             Ok(response) => {
-                let mut reply_text = response.text;
+                // 渠道 egress 兜底：钉钉渲染不了 GFM 管道表格，统一转成 bullet list。
+                // 幂等——无表格时原样返回；置于长度截断之前，避免表格被切半。
+                let mut reply_text = super::sanitize::sanitize_pipe_tables(&response.text);
                 // 空回复不发送（如消息注入到运行中的 agent loop 时）
                 if reply_text.trim().is_empty() {
                     info!("DingTalk: empty response, skipping reply");
