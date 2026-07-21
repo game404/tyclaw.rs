@@ -256,11 +256,13 @@ pub fn sanitize_pipe_tables(text: &str) -> String {
 }
 
 /// 「追问建议 / 猜你想问」标题行的识别标记（去除 emoji/加粗后按子串匹配）。
-const RECOMMEND_HEADINGS: [&str; 4] = [
+const RECOMMEND_HEADINGS: [&str; 6] = [
     "您可能还想了解",
     "你可能还想问",
     "您可能还想问",
     "你可能还想了解",
+    "追问建议",
+    "猜你想问",
 ];
 
 /// 解析单个列表项，返回去掉序号/项目符号与加粗标记后的问题文本。
@@ -565,6 +567,23 @@ mod tests {
         let (body, qs) = extract_recommends(md);
         assert_eq!(qs, vec!["问题一".to_string(), "问题二".to_string()]);
         assert_eq!(body, "结论正文。");
+    }
+
+    #[test]
+    fn test_extract_recommends_zhuiwen_jianyi_heading() {
+        // weekly-report-faq 全量版会输出「追问建议：」标题，需同样被识别为追问块。
+        let md = "综合来看正文。\n\n追问建议：\n- 合大爷下线后累计亏损构成\n- cube world 复盘转产品计划\n\n📎 数据来源：2026产品上线说明";
+        let (body, qs) = extract_recommends(md);
+        assert_eq!(
+            qs,
+            vec![
+                "合大爷下线后累计亏损构成".to_string(),
+                "cube world 复盘转产品计划".to_string(),
+            ]
+        );
+        assert!(body.contains("综合来看正文。"));
+        assert!(body.contains("📎 数据来源：2026产品上线说明"));
+        assert!(!body.contains("追问建议"));
     }
 
     #[test]
