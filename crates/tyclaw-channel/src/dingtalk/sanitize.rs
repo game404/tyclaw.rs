@@ -255,6 +255,138 @@ pub fn sanitize_pipe_tables(text: &str) -> String {
     result_parts.join("\n")
 }
 
+/// 「追问建议 / 猜你想问」标题行的识别标记（去除 emoji/加粗后按子串匹配）。
+const RECOMMEND_HEADINGS: [&str; 4] = [
+    "您可能还想了解",
+    "你可能还想问",
+    "您可能还想问",
+    "你可能还想了解",
+];
+
+/// 解析单个列表项，返回去掉序号/项目符号与加粗标记后的问题文本。
+///
+/// 支持有序（`1.` / `1、` / `1)` / `1）` / `1．`）与无序（`-` / `*` / `•`）两类。
+/// 非列表行返回 `None`。
+fn parse_list_item(line: &str) -> Option<String> {
+    let t = line.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let first = t.chars().next()?;
+
+    let after = if first == '-' || first == '*' || first == '•' {
+        t[first.len_utf8()..].trim_start()
+    } else if first.is_ascii_digit() {
+        // 吸收连续数字
+        let mut idx = 0usize;
+        for c in t.chars() {
+            if c.is_ascii_digit() {
+                idx += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let rest = &t[idx..];
+        let sep = rest.chars().next()?;
+        if matches!(sep, '.' | ')' | '、' | '）' | '．' | '：' | ':') {
+            rest[sep.len_utf8()..].trim_start()
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    let cleaned = after.replace("**", "");
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
+}
+
+/// 从回复正文末尾提取 skill 生成的「追问建议 / 猜你想问」块。
+///
+/// 返回 `(剥离该块后的正文, 追问问题列表)`。用于渠道 egress：正文丰富度由
+/// skill 全权控制（模型把领域感知的追问建议写进正文末尾），本函数只负责把该
+/// 文本块解析出来，交给上层渲染成钉钉卡片的「猜你想问」按钮，并从展示正文里
+/// 去掉它以免重复。
+///
+/// 未匹配到追问块时原样返回 `(text, vec![])`，因此对没有该块的 skill / 渠道无副作用。
+pub fn extract_recommends(text: &str) -> (String, Vec<String>) {
+    let lines: Vec<&str> = text.split('\n').collect();
+
+    // 取最后一个匹配的标题行（避免正文中偶然提及导致误判）。
+    let heading_idx = lines.iter().enumerate().rev().find_map(|(i, line)| {
+        let stripped = line.replace(|c| matches!(c, '*' | '#' | '💡' | '🤔'), "");
+        if RECOMMEND_HEADINGS.iter().any(|m| stripped.contains(m)) {
+            Some(i)
+        } else {
+            None
+        }
+    });
+    let hi = match heading_idx {
+        Some(i) => i,
+        None => return (text.to_string(), Vec::new()),
+    };
+
+    // 从标题行之后收集列表项，遇到非列表行（如数据来源标注）或文本结束即停止。
+    // 允许列表项之间夹空行。
+    let mut questions: Vec<String> = Vec::new();
+    let mut last_item = hi;
+    let mut j = hi + 1;
+    while j < lines.len() {
+        if lines[j].trim().is_empty() {
+            // 探测下一非空行是否仍是列表项：是则跨过空行继续，否则停止。
+            let mut k = j + 1;
+            while k < lines.len() && lines[k].trim().is_empty() {
+                k += 1;
+            }
+            if k < lines.len() && parse_list_item(lines[k]).is_some() {
+                j = k;
+                continue;
+            }
+            break;
+        }
+        match parse_list_item(lines[j]) {
+            Some(q) => {
+                if !questions.contains(&q) {
+                    questions.push(q);
+                }
+                last_item = j;
+                j += 1;
+            }
+            None => break,
+        }
+    }
+
+    if questions.is_empty() {
+        return (text.to_string(), Vec::new());
+    }
+    questions.truncate(5);
+
+    // 向前吞掉紧邻标题的空行与单独的分隔线，避免剥离后留下悬空的 `---`。
+    let mut strip_start = hi;
+    while strip_start > 0 {
+        let prev = lines[strip_start - 1].trim();
+        if prev.is_empty() || prev == "---" || prev == "***" || prev == "___" {
+            strip_start -= 1;
+        } else {
+            break;
+        }
+    }
+
+    let mut kept: Vec<&str> = Vec::new();
+    kept.extend_from_slice(&lines[..strip_start]);
+    if last_item + 1 < lines.len() {
+        kept.extend_from_slice(&lines[last_item + 1..]);
+    }
+    let stripped = kept.join("\n").trim_end().to_string();
+
+    (stripped, questions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +531,60 @@ mod tests {
         assert!(r.contains("- **海外 Google Play**：上线主体 Ark，备注 6月新包上线，主体在 BVI 香港"));
         assert!(r.contains("- **iOS**：上线主体 ARK，备注 7-8月上线"));
         assert!(r.contains("- **俄罗斯**：上线主体 Evista，备注 7月上线"));
+    }
+
+    // --- extract_recommends：追问建议块提取 ---
+
+    #[test]
+    fn test_extract_recommends_numbered() {
+        let md = "正文第一行\n\n- 明细1\n- 明细2\n\n---\n\n💡 **您可能还想了解：**\n1. TM新包的买量数据如何？\n2. 次神项目组的渠道主体拆分\n3. 俄罗斯区6月上线后表现\n\n📎 数据来源：渠道详情 sheet";
+        let (body, qs) = extract_recommends(md);
+        assert_eq!(qs.len(), 3);
+        assert_eq!(qs[0], "TM新包的买量数据如何？");
+        assert_eq!(qs[1], "次神项目组的渠道主体拆分");
+        // 正文保留、追问块被剥离、数据来源标注保留
+        assert!(body.contains("正文第一行"));
+        assert!(body.contains("📎 数据来源：渠道详情 sheet"));
+        assert!(!body.contains("您可能还想了解"));
+        assert!(!body.contains("TM新包的买量数据如何"));
+        // 悬空的 --- 分隔线也被吞掉
+        assert!(!body.contains("---"));
+    }
+
+    #[test]
+    fn test_extract_recommends_no_block() {
+        let md = "普通回答正文\n\n- 要点1\n- 要点2\n\n📎 数据来源：某 sheet";
+        let (body, qs) = extract_recommends(md);
+        assert!(qs.is_empty());
+        assert_eq!(body, md);
+    }
+
+    #[test]
+    fn test_extract_recommends_at_end() {
+        let md = "结论正文。\n\n🤔 你可能还想问：\n- 问题一\n- 问题二";
+        let (body, qs) = extract_recommends(md);
+        assert_eq!(qs, vec!["问题一".to_string(), "问题二".to_string()]);
+        assert_eq!(body, "结论正文。");
+    }
+
+    #[test]
+    fn test_extract_recommends_strips_bold_and_dedup() {
+        let md = "正文\n\n💡 您可能还想了解：\n1. **重复问题**\n2. 重复问题\n3. 另一个问题";
+        let (_body, qs) = extract_recommends(md);
+        assert_eq!(qs, vec!["重复问题".to_string(), "另一个问题".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_recommends_caps_at_five() {
+        let md = "正文\n\n💡 您可能还想了解：\n1. a\n2. b\n3. c\n4. d\n5. e\n6. f\n7. g";
+        let (_body, qs) = extract_recommends(md);
+        assert_eq!(qs.len(), 5);
+    }
+
+    #[test]
+    fn test_extract_recommends_empty_string() {
+        let (body, qs) = extract_recommends("");
+        assert_eq!(body, "");
+        assert!(qs.is_empty());
     }
 }

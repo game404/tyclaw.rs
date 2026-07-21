@@ -357,9 +357,13 @@ impl ChatbotHandler for DingTalkBot {
 
         match result {
             Ok(response) => {
-                // 渠道 egress 兜底：钉钉渲染不了 GFM 管道表格，统一转成 bullet list。
+                // 渠道 egress：先把 skill 写在正文末尾的「追问建议 / 猜你想问」块提取出来
+                // （交给下方渲染成卡片按钮），并从展示正文中剥离，避免与按钮重复。
+                let (body_text, extracted_recommends) =
+                    super::sanitize::extract_recommends(&response.text);
+                // 钉钉渲染不了 GFM 管道表格，统一转成 bullet list。
                 // 幂等——无表格时原样返回；置于长度截断之前，避免表格被切半。
-                let mut reply_text = super::sanitize::sanitize_pipe_tables(&response.text);
+                let mut reply_text = super::sanitize::sanitize_pipe_tables(&body_text);
                 // 空回复不发送（如消息注入到运行中的 agent loop 时）
                 if reply_text.trim().is_empty() {
                     info!("DingTalk: empty response, skipping reply");
@@ -386,10 +390,17 @@ impl ChatbotHandler for DingTalkBot {
                 } else {
                     format!("<font size=2 color=#888888>🦀 {duration_secs}秒</font>")
                 };
-                // 推荐问题：卡片走按钮组件（recommends JSON 变量），
+                // 推荐问题：优先用从正文提取的 skill 追问建议；为空时回退到
+                // AgentResponse.recommends（suggest_recommends 工具已停用，通常为空）。
+                // 卡片走按钮组件（recommends JSON 变量），
                 // fallback 的纯 markdown 消息走内联 dtmd 链接（markdown 支持 dtmd）。
-                let recommends_json = Self::build_recommends_json(&response.recommends);
-                let recommend_md = Self::render_recommend_questions(&response.recommends);
+                let recommends_src: &[String] = if extracted_recommends.is_empty() {
+                    &response.recommends
+                } else {
+                    &extracted_recommends
+                };
+                let recommends_json = Self::build_recommends_json(recommends_src);
+                let recommend_md = Self::render_recommend_questions(recommends_src);
                 let formatted = format!("{header}\n\n{reply_text}\n\n{footer}{recommend_md}");
 
                 // 有卡片时写入最终态；如果卡片 finalize 失败，fallback 到纯文本。
