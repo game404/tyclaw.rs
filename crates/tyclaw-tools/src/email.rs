@@ -289,6 +289,15 @@ fn extract_addresses(params: &HashMap<String, Value>, key: &str) -> Vec<String> 
     }
 }
 
+/// 从参数中提取单个非空文件路径（用于 `body_file`）。
+fn extract_single_path(params: &HashMap<String, Value>, key: &str) -> Option<String> {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// 从参数中提取文件路径列表：支持单个字符串或字符串数组。
 ///
 /// 与 [`extract_addresses`] 不同，**不按逗号/分号切分**——文件路径本身可能含逗号。
@@ -379,7 +388,11 @@ impl Tool for SendEmailTool {
                     "description": "BCC recipient(s) (optional)."
                 },
                 "subject": { "type": "string", "description": "Email subject." },
-                "body": { "type": "string", "description": "Email body content." },
+                "body": { "type": "string", "description": "Email body content. Ignored when 'body_file' is set." },
+                "body_file": {
+                    "type": "string",
+                    "description": "Path (relative to the workspace) to read the body content from. Overrides 'body' when set. Useful for large HTML bodies."
+                },
                 "body_type": {
                     "type": "string",
                     "enum": ["text", "html"],
@@ -395,7 +408,7 @@ impl Tool for SendEmailTool {
                     "description": "Attachment file paths, relative to the workspace."
                 }
             },
-            "required": ["to", "subject", "body"]
+            "required": ["to", "subject"]
         })
     }
 
@@ -414,10 +427,25 @@ impl Tool for SendEmailTool {
         if !self.config.is_configured() {
             return "Error: Email is not configured. Set 'email.smtp_host' and 'email.from' in config.yaml.".to_string();
         }
-        let parts = match self.parse_parts(&params) {
+        let mut parts = match self.parse_parts(&params) {
             Ok(p) => p,
             Err(e) => return e,
         };
+
+        // body_file（若提供）从 workspace 内文件读取正文，覆盖 body。
+        if let Some(body_file) = extract_single_path(&params, "body_file") {
+            let resolved = match safe_resolve(&body_file, self.workspace.as_deref()) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            match tokio::fs::read_to_string(&resolved).await {
+                Ok(s) => parts.body = s,
+                Err(e) => return format!("Error: Failed to read body_file '{body_file}': {e}"),
+            }
+        }
+        if parts.body.is_empty() {
+            return "Error: either 'body' or 'body_file' is required.".to_string();
+        }
 
         let mut attachments = Vec::new();
         let mut total: usize = 0;
@@ -466,10 +494,29 @@ impl Tool for SendEmailTool {
         if !self.config.is_configured() {
             return "Error: Email is not configured. Set 'email.smtp_host' and 'email.from' in config.yaml.".to_string();
         }
-        let parts = match self.parse_parts(&params) {
+        let mut parts = match self.parse_parts(&params) {
             Ok(p) => p,
             Err(e) => return e,
         };
+
+        // body_file（若提供）从沙箱文件系统读取正文，覆盖 body。
+        if let Some(body_file) = extract_single_path(&params, "body_file") {
+            if !sandbox.file_exists(&body_file).await {
+                return format!("Error: File not found in sandbox: {body_file}");
+            }
+            match sandbox.read_file(&body_file).await {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(s) => parts.body = s,
+                    Err(e) => {
+                        return format!("Error: body_file '{body_file}' is not valid UTF-8: {e}")
+                    }
+                },
+                Err(e) => return format!("Error: Failed to read body_file '{body_file}': {e}"),
+            }
+        }
+        if parts.body.is_empty() {
+            return "Error: either 'body' or 'body_file' is required.".to_string();
+        }
 
         let mut attachments = Vec::new();
         let mut total: usize = 0;
@@ -526,7 +573,52 @@ mod tests {
         let required = params["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "to"));
         assert!(required.iter().any(|v| v == "subject"));
-        assert!(required.iter().any(|v| v == "body"));
+        // body 不再强制必填（可用 body_file 替代）。
+        assert!(!required.iter().any(|v| v == "body"));
+        // body_file 属性存在。
+        assert!(params["properties"].get("body_file").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_body_file_overrides_body() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let body_path = dir.path().join("body.html");
+        let mut f = std::fs::File::create(&body_path).unwrap();
+        f.write_all(b"<h1>from file</h1>").unwrap();
+
+        let cfg = EmailConfig {
+            smtp_host: "smtp.example.com".into(),
+            from: "bot@example.com".into(),
+            ..Default::default()
+        };
+        let tool = SendEmailTool::new(cfg, Some(dir.path().to_path_buf()));
+        let mut params = HashMap::new();
+        params.insert("to".into(), json!("user@example.com"));
+        params.insert("subject".into(), json!("hi"));
+        params.insert("body".into(), json!("inline body"));
+        params.insert("body_file".into(), json!("body.html"));
+        params.insert("body_type".into(), json!("html"));
+        // 无法真正发信，但错误里不应再抱怨 body 缺失；
+        // 若 body_file 读取失败会返回 "Failed to read body_file"。
+        let out = tool.execute(params).await;
+        assert!(!out.contains("either 'body' or 'body_file' is required"));
+        assert!(!out.contains("Failed to read body_file"));
+    }
+
+    #[tokio::test]
+    async fn test_missing_body_and_body_file_errors() {
+        let cfg = EmailConfig {
+            smtp_host: "smtp.example.com".into(),
+            from: "bot@example.com".into(),
+            ..Default::default()
+        };
+        let tool = SendEmailTool::new(cfg, None);
+        let mut params = HashMap::new();
+        params.insert("to".into(), json!("user@example.com"));
+        params.insert("subject".into(), json!("hi"));
+        let out = tool.execute(params).await;
+        assert!(out.contains("either 'body' or 'body_file' is required"));
     }
 
     #[tokio::test]
