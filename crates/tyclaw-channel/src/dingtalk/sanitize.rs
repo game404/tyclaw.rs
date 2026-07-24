@@ -226,6 +226,11 @@ fn find_tables(text: &str) -> Vec<(usize, usize, String)> {
 }
 
 /// 把文本中所有 GFM 管道表格转换为 bullet list。无表格时原样返回(幂等)。
+///
+/// 备选出口策略（跨端一致，移动端也不会出现管道符原文）。当前出口默认走
+/// [`repair_pipe_tables`]（保留表格、桌面端渲染）；本函数保留供测试与将来
+/// 「按项目可配置」时切换使用。
+#[allow(dead_code)]
 pub fn sanitize_pipe_tables(text: &str) -> String {
     let tables = find_tables(text);
     if tables.is_empty() {
@@ -253,6 +258,188 @@ pub fn sanitize_pipe_tables(text: &str) -> String {
     }
 
     result_parts.join("\n")
+}
+
+// ============================================================================
+// 表格修复（路线 A）：把畸形/单行拼接的管道表格修复成合法 GFM 表格再下发。
+//
+// 与 `sanitize_pipe_tables`（转 bullet）不同，本路径**保留表格结构**，用于需要
+// 表格渲染的项目。钉钉桌面端可渲染合法 GFM 表格；移动端仍不渲染（已知限制，
+// 见官方文档，跨端需求应改用图片方案）。
+//
+// 修复覆盖两类常见故障：
+//   1. 单行拼接：表头 + 分隔行 + 各数据行被拼进同一物理行（缺真实换行）。
+//   2. 分隔行列数与表头不符（如 6 列表头配 4 段 `|---|`）。
+// ============================================================================
+
+/// 把 `| a | b | c |` 一行按 `|` 切分并去空白，返回**行分组**列表。
+///
+/// 空单元格（来自 `| |` 双竖线、行首/行尾竖线）作为「行边界」——这正是把
+/// 多行表格误拼成一行时留下的可靠分隔信号。例如
+/// `| a | b | |---|---| | 1 | 2 |` 会切成 `[[a,b],[---,---],[1,2]]`。
+fn split_line_into_row_groups(line: &str) -> Vec<Vec<String>> {
+    let trimmed = line.trim();
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    for tok in trimmed.split('|') {
+        let cell = tok.trim();
+        if cell.is_empty() {
+            if !cur.is_empty() {
+                groups.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(cell.to_string());
+        }
+    }
+    if !cur.is_empty() {
+        groups.push(cur);
+    }
+    groups
+}
+
+/// 判断某个分组是否为分隔行（非空且所有单元格都是 `---` 之类的分隔单元格）。
+fn is_separator_group(group: &[String]) -> bool {
+    !group.is_empty() && group.iter().all(|c| is_dash_cell(c.trim()))
+}
+
+/// 用一行单元格拼出规范的管道行：`| a | b | c |`。
+fn format_pipe_row(cells: &[String]) -> String {
+    format!("| {} |", cells.join(" | "))
+}
+
+/// 生成 N 列的规范分隔行：`| --- | --- | ... |`。
+fn format_separator_row(n: usize) -> String {
+    let mut s = String::from("|");
+    for _ in 0..n {
+        s.push_str(" --- |");
+    }
+    s
+}
+
+/// 把解析出的表头 + 数据行渲染成合法的多行 GFM 表格。
+///
+/// - 分隔行列数强制对齐表头列数；
+/// - 数据行不足补空单元格，超出则把多余单元格并入最后一列（避免丢信息）。
+fn normalize_table(header: &[String], data: &[Vec<String>]) -> String {
+    let n = header.len().max(1);
+    let mut out: Vec<String> = Vec::with_capacity(data.len() + 2);
+    out.push(format_pipe_row(header));
+    out.push(format_separator_row(n));
+    for row in data {
+        let mut r = row.clone();
+        if r.len() < n {
+            while r.len() < n {
+                r.push(String::new());
+            }
+        } else if r.len() > n {
+            let extra = r.split_off(n);
+            let joined = extra.join(" ");
+            let joined = joined.trim();
+            if !joined.is_empty() {
+                if let Some(last) = r.last_mut() {
+                    if last.is_empty() {
+                        *last = joined.to_string();
+                    } else {
+                        last.push(' ');
+                        last.push_str(joined);
+                    }
+                }
+            }
+        }
+        out.push(format_pipe_row(&r));
+    }
+    out.join("\n")
+}
+
+/// 尝试把「单行拼接的表格」展开成多行合法表格。非该形态返回 `None`。
+fn try_expand_joined_line(line: &str) -> Option<Vec<String>> {
+    if !is_pipe_row(line) {
+        return None;
+    }
+    let groups = split_line_into_row_groups(line);
+    if groups.len() < 2 {
+        return None; // 单独的表头行/分隔行/数据行，交给多行归一化处理
+    }
+    let sep_idx = groups.iter().position(|g| is_separator_group(g))?;
+    if sep_idx == 0 {
+        return None; // 分隔行前必须有表头
+    }
+    let header = groups[sep_idx - 1].clone();
+    let data: Vec<Vec<String>> = groups[sep_idx + 1..].to_vec();
+
+    let mut result: Vec<String> = Vec::new();
+    // 表头之前若还有其它分组（罕见），原样保留为独立行。
+    for g in &groups[..sep_idx - 1] {
+        result.push(format_pipe_row(g));
+    }
+    result.push(normalize_table(&header, &data));
+    Some(result)
+}
+
+/// 第一遍：把文本中所有「单行拼接表格」展开成多行。跳过代码块。
+fn expand_joined_tables(text: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut in_code_block = false;
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    for line in lines {
+        if is_code_fence(line) {
+            in_code_block = !in_code_block;
+            out.push(line.to_string());
+            continue;
+        }
+        if !in_code_block {
+            if let Some(expanded) = try_expand_joined_line(line) {
+                out.extend(expanded);
+                continue;
+            }
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n")
+}
+
+/// 第二遍：对多行表格做归一化（分隔行列数对齐表头、数据行补齐），保留为表格。
+fn normalize_multiline_tables(text: &str) -> String {
+    let tables = find_tables(text); // 复用检测：返回 (start, end, _bullet)，此处只用区间
+    if tables.is_empty() {
+        return text.to_string();
+    }
+
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut result_parts: Vec<String> = Vec::new();
+    let mut prev_end = 0usize;
+
+    for (start, end, _bullet) in tables {
+        result_parts.push(lines[prev_end..start].join("\n"));
+        if result_parts.last().map(|s| !s.is_empty()).unwrap_or(false) {
+            result_parts.push(String::new());
+        }
+        // start 行是表头，start+1 是分隔行，其后到 end 为数据行。
+        let header = split_pipe_row(lines[start]);
+        let data: Vec<Vec<String>> = lines[start + 2..end]
+            .iter()
+            .map(|l| split_pipe_row(l))
+            .collect();
+        result_parts.push(normalize_table(&header, &data));
+        prev_end = end;
+    }
+
+    if prev_end < lines.len() {
+        let remaining = lines[prev_end..].join("\n");
+        if !remaining.is_empty() {
+            result_parts.push(remaining);
+        }
+    }
+
+    result_parts.join("\n")
+}
+
+/// 把文本中的管道表格**修复为合法 GFM 表格**（保留表格结构，非转 bullet）。
+///
+/// 两遍处理：先展开单行拼接表格，再归一化分隔行列数与数据行。无表格时幂等返回。
+pub fn repair_pipe_tables(text: &str) -> String {
+    let expanded = expand_joined_tables(text);
+    normalize_multiline_tables(&expanded)
 }
 
 /// 「追问建议 / 猜你想问」标题行的识别标记（去除 emoji/加粗后按子串匹配）。
@@ -533,6 +720,84 @@ mod tests {
         assert!(r.contains("- **海外 Google Play**：上线主体 Ark，备注 6月新包上线，主体在 BVI 香港"));
         assert!(r.contains("- **iOS**：上线主体 ARK，备注 7-8月上线"));
         assert!(r.contains("- **俄罗斯**：上线主体 Evista，备注 7月上线"));
+    }
+
+    // --- repair_pipe_tables：表格修复（路线 A，保留表格） ---
+
+    #[test]
+    fn test_repair_wellformed_table_idempotent() {
+        let md = "| A | B | C |\n| --- | --- | --- |\n| 1 | 2 | 3 |";
+        let r = repair_pipe_tables(md);
+        assert!(r.contains("| A | B | C |"));
+        assert!(r.contains("| --- | --- | --- |"));
+        assert!(r.contains("| 1 | 2 | 3 |"));
+    }
+
+    #[test]
+    fn test_repair_separator_col_mismatch() {
+        // 表头 6 列，分隔行只有 4 段 —— 归一化后分隔行应补齐为 6 段。
+        let md = "| a | b | c | d | e | f |\n|---|---|---|---|\n| 1 | 2 | 3 | 4 | 5 | 6 |";
+        let r = repair_pipe_tables(md);
+        assert!(r.contains("| --- | --- | --- | --- | --- | --- |"));
+        assert!(r.contains("| 1 | 2 | 3 | 4 | 5 | 6 |"));
+    }
+
+    #[test]
+    fn test_repair_joined_single_line_simple() {
+        // 表头 + 分隔 + 数据全拼进一行，且分隔段少于表头列数。
+        let md = "| A | B | C | |---|---| | 1 | 2 | 3 | | x | y | z |";
+        let r = repair_pipe_tables(md);
+        // 展开成多行：表头、6→3 列分隔行、两行数据各自成行。
+        assert!(r.contains("| A | B | C |"));
+        assert!(r.contains("| --- | --- | --- |"));
+        assert!(r.contains("| 1 | 2 | 3 |"));
+        assert!(r.contains("| x | y | z |"));
+        // 结果应为多行（含换行），不再是单行畸形。
+        assert!(r.contains('\n'));
+        // 不应退化成 bullet list。
+        assert!(!r.contains("- **"));
+    }
+
+    #[test]
+    fn test_repair_joined_six_col_case() {
+        // 6 列表头 + 单行拼接 + 4 段分隔行（数据为虚构）。
+        let md = "「示例项目」渠道详情：\n\n\
+            | 游戏名称 | 主体分类 | 上线主体 | 渠道细分 | 发行范围 | 上线时间/状态 | \
+            |---|---|---|---| | 示例游戏A | 境内主体 | 甲公司 | 微信小游戏 | 境内 | \
+            暂定，未上线 | | 示例游戏A | 境外主体 | 乙工作室 | Google | 境外 | 2025-06 |\n\n拆分要点：";
+        let r = repair_pipe_tables(md);
+        // 分隔行补齐为 6 段。
+        assert!(r.contains("| --- | --- | --- | --- | --- | --- |"));
+        // 表头与数据各自成行。
+        assert!(r.contains("| 游戏名称 | 主体分类 | 上线主体 | 渠道细分 | 发行范围 | 上线时间/状态 |"));
+        assert!(r.contains("| 示例游戏A | 境内主体 | 甲公司 | 微信小游戏 | 境内 | 暂定，未上线 |"));
+        assert!(r.contains("| 示例游戏A | 境外主体 | 乙工作室 | Google | 境外 | 2025-06 |"));
+        // 周边正文保留。
+        assert!(r.contains("「示例项目」渠道详情："));
+        assert!(r.contains("拆分要点："));
+        // 保留为表格，不转 bullet。
+        assert!(!r.contains("- **"));
+    }
+
+    #[test]
+    fn test_repair_plain_text_unchanged() {
+        let md = "普通文本，没有表格。\n\n第二段。";
+        assert_eq!(repair_pipe_tables(md), md);
+    }
+
+    #[test]
+    fn test_repair_skips_code_fence() {
+        let md = "```\n| A | B | |---| | 1 | 2 |\n```";
+        assert_eq!(repair_pipe_tables(md), md);
+    }
+
+    #[test]
+    fn test_repair_data_row_padding_and_overflow() {
+        // 数据行列数不足补空；超出并入末列。
+        let md = "| K | V |\n| --- | --- |\n| only |\n| a | b | c |";
+        let r = repair_pipe_tables(md);
+        assert!(r.contains("| only |  |"));
+        assert!(r.contains("| a | b c |"));
     }
 
     // --- extract_recommends：追问建议块提取 ---

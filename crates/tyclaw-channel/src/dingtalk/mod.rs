@@ -22,6 +22,8 @@ pub use ai_card::{
 };
 pub use bot::DingTalkBot;
 pub use credential::{Credential, TokenManager};
+/// 表格修复：把畸形/单行拼接的管道表格修复为合法 GFM 表格（供出口与手动测试使用）。
+pub use sanitize::repair_pipe_tables;
 pub use gateway::GatewayClient;
 pub use handler::ChatbotHandler;
 pub use message::{AckMessage, CallbackMessage, ChatbotMessage};
