@@ -361,9 +361,10 @@ impl ChatbotHandler for DingTalkBot {
                 // （交给下方渲染成卡片按钮），并从展示正文中剥离，避免与按钮重复。
                 let (body_text, extracted_recommends) =
                     super::sanitize::extract_recommends(&response.text);
-                // 钉钉渲染不了 GFM 管道表格，统一转成 bullet list。
+                // 修复畸形/单行拼接的管道表格为合法 GFM 表格（保留表格结构，
+                // 钉钉桌面端可渲染；移动端仍不渲染，属已知限制）。
                 // 幂等——无表格时原样返回；置于长度截断之前，避免表格被切半。
-                let mut reply_text = super::sanitize::sanitize_pipe_tables(&body_text);
+                let mut reply_text = super::sanitize::repair_pipe_tables(&body_text);
                 // 空回复不发送（如消息注入到运行中的 agent loop 时）
                 if reply_text.trim().is_empty() {
                     info!("DingTalk: empty response, skipping reply");
