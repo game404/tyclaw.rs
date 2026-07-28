@@ -123,6 +123,8 @@ impl ToolRegistry {
         };
 
         let schema = tool.parameters();
+        // 参数别名归一化（如 file_path → path），避免 LLM 用错参数名陷入死循环
+        base::normalize_param_aliases(&mut params, &schema);
         // 自动类型转换（如字符串 "42" → 整数 42）
         base::cast_params(&mut params, &schema);
 
@@ -257,5 +259,28 @@ mod tests {
         params.insert("path".into(), json!("/tmp/__tyclaw_nonexistent_test__"));
         let result = reg.execute("read_file", params).await;
         assert!(result.output.contains("Error"));
+    }
+
+    /// 测试：LLM 用 file_path 别名调用 read_file 也能被归一化并正常读取，
+    /// 而非因缺少 path 陷入死循环。
+    #[tokio::test]
+    async fn test_read_file_accepts_file_path_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().to_path_buf();
+        std::fs::write(ws.join("note.txt"), "hello alias").unwrap();
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(ReadFileTool::new(Some(ws))));
+
+        let mut params = HashMap::new();
+        params.insert("file_path".into(), json!("note.txt"));
+        let result = reg.execute("read_file", params).await;
+
+        assert!(
+            result.output.contains("hello alias"),
+            "expected file contents, got: {}",
+            result.output
+        );
+        assert!(!result.output.contains("Missing"));
     }
 }
