@@ -217,6 +217,75 @@ pub fn cast_params(params: &mut HashMap<String, Value>, schema: &Value) {
     }
 }
 
+/// 常见参数别名 → 规范参数名映射表。
+///
+/// LLM 偶尔用近义词作为参数名（如用 `file_path` 代替 `path`），导致必填参数
+/// 校验失败并陷入「反复用错误参数名重试」的死循环。此表将这些别名归一化为
+/// Schema 声明的规范名。每组第一个元素为规范名，其余为可接受的别名。
+const PARAM_ALIAS_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "path",
+        &[
+            "file_path",
+            "filepath",
+            "filename",
+            "file_name",
+            "file",
+            "pathname",
+            "target_file",
+            "dir",
+            "directory",
+            "folder",
+        ],
+    ),
+    (
+        "content",
+        &["text", "data", "body", "file_content", "contents", "file_text"],
+    ),
+    (
+        "old_text",
+        &["old_string", "old_str", "old", "search", "find", "target_text"],
+    ),
+    (
+        "new_text",
+        &["new_string", "new_str", "new", "replacement", "replace_with"],
+    ),
+    ("command", &["cmd", "shell", "script", "bash"]),
+];
+
+/// 参数别名归一化：在类型转换与必填校验之前，把 LLM 常用的近义参数名
+/// 重命名为 Schema 声明的规范参数名。
+///
+/// 仅在以下条件全部满足时执行重命名：
+/// 1. 规范名在 `schema.properties` 中声明；
+/// 2. `params` 中尚不存在该规范名（不覆盖已有值）；
+/// 3. 别名本身不是该 Schema 声明的独立属性（避免抢占语义不同的字段）。
+///
+/// 这样即便某工具没有对应的规范参数，也不会误改无关字段。
+pub fn normalize_param_aliases(params: &mut HashMap<String, Value>, schema: &Value) {
+    let props = match schema.get("properties").and_then(|p| p.as_object()) {
+        Some(p) => p,
+        None => return,
+    };
+
+    for (canonical, aliases) in PARAM_ALIAS_GROUPS {
+        // 规范名必须在 Schema 中声明，且当前尚未提供。
+        if !props.contains_key(*canonical) || params.contains_key(*canonical) {
+            continue;
+        }
+        for alias in *aliases {
+            // 别名若本身是 Schema 声明的独立属性，则不抢占。
+            if props.contains_key(*alias) {
+                continue;
+            }
+            if let Some(val) = params.remove(*alias) {
+                params.insert((*canonical).to_string(), val);
+                break;
+            }
+        }
+    }
+}
+
 /// 验证必填参数是否都已提供。
 ///
 /// 检查 Schema 中 "required" 数组列出的所有参数名是否在 params 中存在。
@@ -276,6 +345,66 @@ mod tests {
         params.insert("path".into(), json!("/tmp/test"));
         let err = validate_params(&params, &schema);
         assert_eq!(err, Some("Missing required parameter: content".into()));
+    }
+
+    /// 测试：file_path 别名归一化为规范参数名 path
+    #[test]
+    fn test_normalize_alias_file_path_to_path() {
+        let schema = json!({
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"]
+        });
+        let mut params = HashMap::new();
+        params.insert("file_path".into(), json!("/workspace/a.md"));
+        normalize_param_aliases(&mut params, &schema);
+        assert_eq!(params.get("path"), Some(&json!("/workspace/a.md")));
+        assert!(!params.contains_key("file_path"));
+        // 归一化后必填校验应通过
+        assert_eq!(validate_params(&params, &schema), None);
+    }
+
+    /// 测试：已有规范名时不被别名覆盖
+    #[test]
+    fn test_normalize_alias_does_not_override_existing() {
+        let schema = json!({
+            "properties": { "path": { "type": "string" } }
+        });
+        let mut params = HashMap::new();
+        params.insert("path".into(), json!("real"));
+        params.insert("file_path".into(), json!("alias"));
+        normalize_param_aliases(&mut params, &schema);
+        assert_eq!(params.get("path"), Some(&json!("real")));
+    }
+
+    /// 测试：Schema 未声明规范名时不引入该字段
+    #[test]
+    fn test_normalize_alias_requires_schema_property() {
+        let schema = json!({
+            "properties": { "command": { "type": "string" } }
+        });
+        let mut params = HashMap::new();
+        params.insert("file_path".into(), json!("/tmp/x"));
+        normalize_param_aliases(&mut params, &schema);
+        // command 工具没有 path 属性，file_path 不应被改名为 path
+        assert!(!params.contains_key("path"));
+        assert_eq!(params.get("file_path"), Some(&json!("/tmp/x")));
+    }
+
+    /// 测试：别名本身是 Schema 声明的独立属性时不抢占
+    #[test]
+    fn test_normalize_alias_skips_declared_alias_property() {
+        let schema = json!({
+            "properties": {
+                "path": { "type": "string" },
+                "dir": { "type": "string" }
+            }
+        });
+        let mut params = HashMap::new();
+        params.insert("dir".into(), json!("/some/dir"));
+        normalize_param_aliases(&mut params, &schema);
+        // dir 是独立声明属性，不应被改名为 path
+        assert_eq!(params.get("dir"), Some(&json!("/some/dir")));
+        assert!(!params.contains_key("path"));
     }
 
     /// 测试：所有必填参数都存在时返回 None
