@@ -27,6 +27,13 @@ BINARY="$RUN_DIR/tyclaw"
 PID_FILE="$RUN_DIR/.tyclaw.pid"
 LOG_FILE="$RUN_DIR/logs/tyclaw.log"
 
+# 操作系统分流：Linux（线上）走 systemd user 服务实现自动守护；
+# macOS（本地）保留下面的 nohup + PID 逻辑。
+OS="$(uname)"
+SYSTEMD_HELPER="$SCRIPT_DIR/deploy/systemd.sh"
+
+is_linux() { [ "$OS" = "Linux" ]; }
+
 # 默认生产部署参数
 DEPLOY_WORKS_DIR=""
 DEPLOY_EXTRA_ARGS=""
@@ -38,8 +45,8 @@ print_usage() {
     echo ""
     echo "Commands:"
     echo "  start          开发模式启动（cargo run，前台运行）"
-    echo "  deploy         生产部署（release 二进制，后台运行）"
-    echo "  stop           停止后台进程"
+    echo "  deploy         生产部署（Linux=systemd user 服务/自动守护；macOS=nohup 后台）"
+    echo "  stop           停止服务（Linux=systemctl --user；macOS=PID kill）"
     echo "  status         查看运行状态"
     echo "  clean          清理运行时数据（保留 memory）"
     echo "  build          构建 release 二进制"
@@ -53,18 +60,29 @@ print_usage() {
     echo "Options (deploy):"
     echo "  --works-dir DIR  指定外挂 works 目录"
     echo "  --dingtalk       启动钉钉（默认启用）"
+    echo ""
+    echo "Linux 首次部署提示：如需登出后仍运行 / 开机自启，需一次性执行(需 root)："
+    echo "  sudo loginctl enable-linger \$(whoami)"
 }
 
 do_clean() {
     echo "=== TyClaw Clean ==="
 
     # 终止进程
-    if [ -f "$PID_FILE" ]; then
-        PID=$(cat "$PID_FILE")
-        kill "$PID" 2>/dev/null && echo "[ok] 进程已停止 (pid=$PID)" || true
-        rm -f "$PID_FILE"
+    if is_linux; then
+        # Linux：先停 systemd 服务（不能裸 kill，否则被 Restart=always 立即拉起）
+        # shellcheck source=deploy/systemd.sh
+        . "$SYSTEMD_HELPER"
+        systemd_pre_clean
+    else
+        # macOS：沿用 PID 文件 + killall
+        if [ -f "$PID_FILE" ]; then
+            PID=$(cat "$PID_FILE")
+            kill "$PID" 2>/dev/null && echo "[ok] 进程已停止 (pid=$PID)" || true
+            rm -f "$PID_FILE"
+        fi
+        killall -9 tyclaw 2>/dev/null || true
     fi
-    killall -9 tyclaw 2>/dev/null || true
 
     # 清空日志
     mkdir -p "$RUN_DIR/logs"
@@ -171,6 +189,12 @@ do_build_docker() {
 }
 
 do_status() {
+    if is_linux; then
+        # shellcheck source=deploy/systemd.sh
+        . "$SYSTEMD_HELPER"
+        systemd_status
+        return $?
+    fi
     if [ -f "$PID_FILE" ]; then
         PID=$(cat "$PID_FILE")
         if kill -0 "$PID" 2>/dev/null; then
@@ -215,7 +239,9 @@ case "$COMMAND" in
         ;;
 
     deploy)
-        # 生产部署：release 二进制，后台运行
+        # 生产部署：release 二进制
+        #   Linux（线上）：systemd user 服务，Restart=always 自动守护
+        #   macOS（本地）：nohup 后台运行 + PID 文件
         EXTRA_ARGS="--dingtalk"
         while [ $# -gt 0 ]; do
             case "$1" in
@@ -225,6 +251,21 @@ case "$COMMAND" in
             esac
         done
 
+        WORKS_ARGS=""
+        if [ -n "$DEPLOY_WORKS_DIR" ]; then
+            WORKS_ARGS="--works-dir $DEPLOY_WORKS_DIR"
+        fi
+
+        if is_linux; then
+            # Linux：委托给 systemd 帮助脚本
+            # shellcheck source=deploy/systemd.sh
+            . "$SYSTEMD_HELPER"
+            # 传给服务的完整额外参数：works + 其它（EXTRA_ARGS 已含 --dingtalk）
+            systemd_deploy "$(echo "$WORKS_ARGS $EXTRA_ARGS" | xargs)"
+            exit 0
+        fi
+
+        # macOS：nohup 后台运行
         if [ ! -x "$BUILD_BINARY" ]; then
             echo "Error: Release binary not found at $BUILD_BINARY"
             echo "Run './tyc build' first."
@@ -241,11 +282,6 @@ case "$COMMAND" in
 
         mkdir -p "$RUN_DIR/logs"
 
-        WORKS_ARGS=""
-        if [ -n "$DEPLOY_WORKS_DIR" ]; then
-            WORKS_ARGS="--works-dir $DEPLOY_WORKS_DIR"
-        fi
-
         echo "[$(date)] Starting TyClaw (deploy)..." >> "$LOG_FILE"
         nohup "$BINARY" \
             --run-dir "$RUN_DIR" \
@@ -260,6 +296,12 @@ case "$COMMAND" in
         ;;
 
     stop)
+        if is_linux; then
+            # shellcheck source=deploy/systemd.sh
+            . "$SYSTEMD_HELPER"
+            systemd_stop
+            exit 0
+        fi
         if [ ! -f "$PID_FILE" ]; then
             echo "No PID file found, TyClaw is not running"
             exit 0
