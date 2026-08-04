@@ -227,6 +227,37 @@ fn init_logging(workspace: &Path, logging: &LoggingConfig) -> WorkerGuard {
     guard
 }
 
+/// 安装全局 panic hook：把 panic 现场（消息 + 位置 + 调用栈）转发到 `tracing::error!`，
+/// 使其落进 `logs/tyclaw.log`，与业务日志同一时间线。跨平台生效（mac/Linux 都受益）。
+///
+/// 注意：只能捕获 Rust panic；进程被 OOM Killer(SIGKILL)、段错误(SIGSEGV) 等直接杀死时
+/// 不会触发本 hook，那类崩溃仍需查 `dmesg` / systemd journal。
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".into());
+        let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!(
+            panic.location = %location,
+            panic.message = %message,
+            panic.backtrace = %backtrace,
+            "thread panicked"
+        );
+        // 仍调用默认 hook，保留 stderr 输出（systemd journal 会捕获）。
+        default_hook(info);
+    }));
+}
+
 // ── 命令行参数定义 ──────────────────────────────────────────
 
 /// 命令行参数定义。
@@ -279,6 +310,7 @@ async fn main() {
     let cfg: BaseConfig = load_yaml(&config_path);
     let app_cfg: AppConfig = load_yaml(&config_path); // 同一文件，只解析 dingtalk 段
     let _log_guard = init_logging(&workspace_root, &cfg.logging);
+    install_panic_hook();
 
     info!(?config_path, "Loaded config (or defaults)");
 

@@ -78,7 +78,38 @@ cd $TEAM_DIR && /opt/tyclaw/shared/bin/tyclaw --dingtalk
 
 ## 进程管理
 
-使用 systemd **模板 service**，一个文件管理所有团队：
+### 推荐：通过 `./tyc deploy`（自动分流）
+
+日常部署统一用 `./tyc deploy`，脚本按操作系统自动选择进程管理方式：
+
+- **线上 Linux**：委托 [`deploy/systemd.sh`](../deploy/systemd.sh)，注册为**非 root 的 systemd user 服务**（`systemctl --user`），自动生成 `~/.config/systemd/user/tyclaw.service`（`Restart=always` 崩溃自动拉起，stdout/stderr 进 journal），无需 root 即可日常管理。
+- **本地 macOS**：保留 `nohup` + `.tyclaw.pid` 方式（macOS 无 systemd），行为不变。
+
+```bash
+./tyc deploy --works-dir /home/tuyoo/xxx/works   # 部署（Linux 自动走 systemd）
+./tyc stop                                       # 停止
+./tyc status                                     # 状态
+```
+
+首次在 Linux 上部署，需一次性 root 开启 linger（否则登出/重启后服务不自启）：
+
+```bash
+sudo loginctl enable-linger <user>     # 如 sudo loginctl enable-linger tuyoo
+```
+
+排查命令：
+
+```bash
+systemctl --user status tyclaw               # 运行状态
+journalctl --user -u tyclaw -f               # stderr / panic backtrace（RUST_BACKTRACE=full）
+tail -f workspace/logs/tyclaw.log            # 应用日志（含 panic hook 记录）
+```
+
+> 崩溃日志说明：进程内已安装 panic hook，Rust panic 会同时写入 `logs/tyclaw.log`（与业务日志同源）与 journal。被 OOM Killer(SIGKILL)/段错误等直接杀死的情况不触发 panic hook，需查 `dmesg -T | grep -i oom` 与 journal。
+
+### 备选：root 环境下的 systemd system 模板 service
+
+有 root 且按 `/opt/tyclaw` 多团队结构部署时，可用 systemd **模板 service**，一个文件管理所有团队：
 
 ```ini
 # /etc/systemd/system/tyclaw@.service
