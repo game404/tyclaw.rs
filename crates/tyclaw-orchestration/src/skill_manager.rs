@@ -570,11 +570,14 @@ mod tests {
         assert!(skills.len() >= 25, "expected at least 25 skills, got {}: {:?}",
             skills.len(), skills.iter().map(|s| &s.key).collect::<Vec<_>>());
 
-        // 验证 5 个 category
+        // 验证 6 个 category
         let mut cats: Vec<String> = skills.iter().map(|s| s.category.clone()).collect();
         cats.sort();
         cats.dedup();
-        assert_eq!(cats, vec!["data", "dingtalk", "meta", "office", "ops"]);
+        assert_eq!(
+            cats,
+            vec!["data", "dingtalk", "finance", "meta", "office", "ops"]
+        );
 
         // 验证所有 skill 都是 builtin 状态
         for s in &skills {

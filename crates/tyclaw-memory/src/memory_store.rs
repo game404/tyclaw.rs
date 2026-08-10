@@ -42,7 +42,7 @@ impl MemoryStore {
 
     /// 将无法合并入记忆、又即将从活动会话中移除的消息转储到恢复文件，避免静默丢失。
     ///
-    /// 用于强制重置（R3.5）时记忆合并失败的兜底：把被丢弃的消息以 JSONL 追加到
+    /// 用于强制重置或滚动截断时记忆合并失败的兜底：把被丢弃的消息以 JSONL 追加到
     /// `{memory_dir}/reset_dumps/{workspace_key}.jsonl`，便于事后人工恢复/排查。
     /// 返回写入的转储文件路径（失败返回 None 并已打日志）。
     pub fn dump_unrecoverable<T: serde::Serialize>(

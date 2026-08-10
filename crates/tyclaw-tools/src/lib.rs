@@ -35,6 +35,9 @@ pub mod web;
 /// 邮件发送工具 —— send_email 通过 SMTP 发送正文与附件
 pub mod email;
 
+/// 钉钉主动消息工具 —— 从固定配置读取收件人并批量发送 Markdown
+pub mod dingtalk;
+
 /// 步骤级 TTL 缓存 —— 长链路 Skill 可缓存中间结果的复用
 pub mod step_cache;
 
@@ -50,7 +53,8 @@ pub mod truncation;
 // 重新导出核心类型
 pub use base::{RiskLevel, Tool};
 pub use executor::{
-    DirectToolExecutor, FullToolExecutor, SandboxAwareToolExecutor, ToolExecutor, CURRENT_USER_ROLE,
+    current_user_id, current_user_name, DirectToolExecutor, FullToolExecutor,
+    SandboxAwareToolExecutor, ToolExecutor, CURRENT_USER_ID, CURRENT_USER_NAME, CURRENT_USER_ROLE,
 };
 pub use fileops::{CopyFileTool, GlobTool, GrepSearchTool, MkdirTool, MoveFileTool};
 pub use filesystem::{
@@ -70,6 +74,10 @@ pub use precheck::{
     config_missing_error, readonly_error, PrecheckState, CONFIG_MISSING_PREFIX, READONLY_PREFIX,
 };
 pub use email::{EmailConfig, SendEmailTool};
+pub use dingtalk::{
+    Credential as DingTalkCredential, DingTalkOutboundConfig, SendDingTalkMessageTool,
+    TokenManager as DingTalkTokenManager,
+};
 pub use timer::TimerTool;
 pub use tyclaw_tool_abi::{
     AllowAllGate, GatePolicy, PathMount, Sandbox, SandboxDirEntry, SandboxExecResult, SandboxPool,

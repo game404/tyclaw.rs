@@ -111,6 +111,9 @@ struct DingTalkConfig {
     /// AI 卡片模板 id（钉钉后台预建好模板后拿到）。
     /// 未配置时 bot 退化为纯文本回复，不展示思考中动画和工具行。
     card_template_id: Option<String>,
+    /// 主动发送消息 Tool；默认关闭，不影响正常钉钉回复链路。
+    #[serde(default)]
+    outbound: tyclaw_tools::DingTalkOutboundConfig,
 }
 
 fn format_effective_config(
@@ -156,6 +159,7 @@ fn format_effective_config(
         p!("dingtalk.client_id: {}", dingtalk.client_id.as_deref().map(mask_secret).unwrap_or_else(|| "<empty>".into()));
         p!("dingtalk.client_secret: {}", dingtalk.client_secret.as_deref().map(mask_secret).unwrap_or_else(|| "<empty>".into()));
         p!("dingtalk.gateway_url: {}", dingtalk.gateway_url.as_deref().unwrap_or("<none, direct stream>"));
+        p!("dingtalk.outbound.enabled: {}", dingtalk.outbound.enabled);
     }
     p!("subtasks.enabled: {}", subtasks.enabled);
     if subtasks.enabled {
@@ -546,8 +550,13 @@ impl RunConfig {
     fn build_orchestrator(
         self,
         timer_svc: Arc<tyclaw_tools::timer::TimerService>,
+        dingtalk_outbound: Option<(
+            tyclaw_tools::DingTalkOutboundConfig,
+            tyclaw_tools::DingTalkTokenManager,
+            String,
+        )>,
     ) -> Orchestrator {
-        let mut orch = Orchestrator::builder(self.provider, &self.workspace)
+        let mut builder = Orchestrator::builder(self.provider, &self.workspace)
             .with_model(self.model)
             .with_max_iterations(self.max_iterations)
             .with_context_window_tokens_opt(self.context_window)
@@ -559,8 +568,11 @@ impl RunConfig {
             .with_email(self.email_config)
             .with_control(self.control_config)
             .with_performance(self.performance)
-            .with_timer(timer_svc)
-            .build();
+            .with_timer(timer_svc);
+        if let Some((config, token_manager, robot_code)) = dingtalk_outbound {
+            builder = builder.with_dingtalk_outbound(config, token_manager, robot_code);
+        }
+        let mut orch = builder.build();
         if let Some(works_dir) = self.works_dir {
             orch.set_works_dir(works_dir);
         }
@@ -574,7 +586,7 @@ async fn run_cli(config: RunConfig, monitor_cfg: MonitorConfig) {
     let startup_lines = config.startup_lines.clone();
     let (timer_svc, timer_rx) = create_timer_service(&config.workspace);
 
-    let mut orchestrator = config.build_orchestrator(timer_svc.clone());
+    let mut orchestrator = config.build_orchestrator(timer_svc.clone(), None);
 
     // Docker Sandbox 初始化（CLI 模式下可选，无沙箱时工具直接在宿主机执行）
     let ws_root = orchestrator.app().workspace.clone();
@@ -886,6 +898,7 @@ async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig, monitor_cfg: M
         client_secret,
         gateway_url,
         card_template_id,
+        outbound,
     } = dt_config;
 
     let client_id = client_id.unwrap_or_else(|| {
@@ -905,7 +918,12 @@ async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig, monitor_cfg: M
 
     let startup_lines = config.startup_lines.clone();
     let (timer_svc, timer_rx) = create_timer_service(&config.workspace);
-    let mut orchestrator = config.build_orchestrator(timer_svc.clone());
+    let credential = Credential::new(&client_id, &client_secret);
+    let token_manager = TokenManager::new(credential.clone());
+    let mut orchestrator = config.build_orchestrator(
+        timer_svc.clone(),
+        Some((outbound, token_manager.clone(), client_id.clone())),
+    );
 
     // Docker Sandbox 初始化（DingTalk 多用户模式必须有沙箱隔离）
     let ws_root = orchestrator.app().workspace.clone();
@@ -924,9 +942,6 @@ async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig, monitor_cfg: M
             std::process::exit(1);
         }
     };
-
-    let credential = Credential::new(&client_id, &client_secret);
-    let token_manager = TokenManager::new(credential.clone());
 
     let workspace_path = orchestrator.app().workspace.clone();
 

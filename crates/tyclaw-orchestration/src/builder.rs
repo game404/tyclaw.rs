@@ -13,9 +13,10 @@ use tyclaw_provider::LLMProvider;
 use tyclaw_tools::ToolRuntime;
 use tyclaw_tools::{
     timer::TimerService, ApplyPatchTool, AskUserTool, CopyFileTool, DeleteFileTool, EditFileTool,
-    EmailConfig, ExecTool, GlobTool, GrepSearchTool, ListDirTool, MkdirTool, MoveFileTool,
-    PendingFileStore, PendingRecommendStore, ReadFileTool, SendEmailTool, SendFileTool, TimerTool,
-    ToolRegistry, WebFetchTool, WebSearchConfig, WebSearchTool, WriteFileTool,
+    DingTalkOutboundConfig, DingTalkTokenManager, EmailConfig, ExecTool, GlobTool, GrepSearchTool,
+    ListDirTool, MkdirTool, MoveFileTool, PendingFileStore, PendingRecommendStore, ReadFileTool,
+    SendDingTalkMessageTool, SendEmailTool, SendFileTool, TimerTool, ToolRegistry, WebFetchTool,
+    WebSearchConfig, WebSearchTool, WriteFileTool,
 };
 use tyclaw_types::constants::DEFAULT_CONTEXT_WINDOW;
 
@@ -41,6 +42,8 @@ pub struct OrchestratorBuilder {
     pub(crate) timer_service: Option<Arc<TimerService>>,
     pub(crate) web_search_config: Option<WebSearchConfig>,
     pub(crate) email_config: Option<EmailConfig>,
+    pub(crate) dingtalk_outbound:
+        Option<(DingTalkOutboundConfig, DingTalkTokenManager, String)>,
     pub(crate) control_config: Option<tyclaw_control::ControlConfig>,
     pub(crate) workspace_key_strategy: tyclaw_control::WorkspaceKeyStrategy,
     pub(crate) path_config: tyclaw_control::PathConfig,
@@ -63,6 +66,7 @@ impl OrchestratorBuilder {
             timer_service: None,
             web_search_config: None,
             email_config: None,
+            dingtalk_outbound: None,
             control_config: None,
             workspace_key_strategy: tyclaw_control::WorkspaceKeyStrategy::default(),
             path_config: tyclaw_control::PathConfig::default(),
@@ -184,6 +188,16 @@ impl OrchestratorBuilder {
         self
     }
 
+    pub fn with_dingtalk_outbound(
+        mut self,
+        config: DingTalkOutboundConfig,
+        token_manager: DingTalkTokenManager,
+        robot_code: impl Into<String>,
+    ) -> Self {
+        self.dingtalk_outbound = Some((config, token_manager, robot_code.into()));
+        self
+    }
+
     pub fn with_control(mut self, config: tyclaw_control::ControlConfig) -> Self {
         self.control_config = Some(config);
         self
@@ -213,6 +227,7 @@ impl OrchestratorBuilder {
             timer_service,
             web_search_config,
             email_config,
+            dingtalk_outbound,
             control_config,
             workspace_key_strategy,
             path_config,
@@ -298,6 +313,7 @@ impl OrchestratorBuilder {
             timer_service: timer_service.as_ref(),
             web_search_config: web_search_config.clone(),
             email_config: email_config.clone(),
+            dingtalk_outbound: dingtalk_outbound.clone(),
             subtasks_config: subtasks_config.clone(),
             provider: provider.clone(),
         };
@@ -380,6 +396,7 @@ struct ToolSurfaceConfig<'a> {
     timer_service: Option<&'a Arc<TimerService>>,
     web_search_config: Option<WebSearchConfig>,
     email_config: Option<EmailConfig>,
+    dingtalk_outbound: Option<(DingTalkOutboundConfig, DingTalkTokenManager, String)>,
     subtasks_config: Option<crate::subtasks::SubtasksConfig>,
     provider: Arc<dyn LLMProvider>,
 }
@@ -408,6 +425,7 @@ fn build_tool_surface_registry(
         config.timer_service,
         config.web_search_config.clone(),
         config.email_config.clone(),
+        config.dingtalk_outbound.clone(),
     );
 
     if let Some(st_config) = config.subtasks_config.clone().filter(|c| c.enabled) {
@@ -432,6 +450,7 @@ fn register_orchestration_tools(
     timer_service: Option<&Arc<TimerService>>,
     web_search_config: Option<WebSearchConfig>,
     email_config: Option<EmailConfig>,
+    dingtalk_outbound: Option<(DingTalkOutboundConfig, DingTalkTokenManager, String)>,
 ) {
     tools.register(Box::new(SendFileTool::new(
         Some(workspace.to_path_buf()),
@@ -443,6 +462,17 @@ fn register_orchestration_tools(
         Some(workspace.to_path_buf()),
     )));
     info!("Email tool registered (send_email)");
+
+    if let Some((config, token_manager, robot_code)) = dingtalk_outbound {
+        if config.enabled {
+            tools.register(Box::new(SendDingTalkMessageTool::new(
+                config,
+                token_manager,
+                robot_code,
+            )));
+            info!("DingTalk outbound tool registered (send_dingtalk_message)");
+        }
+    }
 
     // suggest_recommends 工具已停用：推荐问题改由 skill 写进正文末尾的「追问建议」块，
     // 再由渠道 egress（dingtalk::sanitize::extract_recommends）解析成卡片按钮。
@@ -465,3 +495,45 @@ fn register_orchestration_tools(
     info!("Web tools registered (provider={})", ws_config.provider);
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tyclaw_tools::DingTalkCredential;
+
+    fn registry_with_dingtalk(enabled: bool) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        let config = DingTalkOutboundConfig {
+            enabled,
+            ..Default::default()
+        };
+        register_orchestration_tools(
+            &mut registry,
+            Path::new("."),
+            Arc::new(PendingFileStore::new()),
+            Arc::new(PendingRecommendStore::new()),
+            None,
+            None,
+            None,
+            Some((
+                config,
+                DingTalkTokenManager::new(DingTalkCredential::new("app", "secret")),
+                "app".to_string(),
+            )),
+        );
+        registry
+    }
+
+    #[test]
+    fn dingtalk_outbound_tool_is_not_registered_when_disabled() {
+        assert!(registry_with_dingtalk(false)
+            .get("send_dingtalk_message")
+            .is_none());
+    }
+
+    #[test]
+    fn dingtalk_outbound_tool_is_registered_when_enabled() {
+        assert!(registry_with_dingtalk(true)
+            .get("send_dingtalk_message")
+            .is_some());
+    }
+}

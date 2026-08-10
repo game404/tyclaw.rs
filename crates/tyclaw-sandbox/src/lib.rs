@@ -16,7 +16,42 @@ pub use docker::{sanitize_container_name, DockerConfig, DockerPool, DockerSandbo
 pub use noop::{NoopPool, NoopSandbox};
 pub use types::*;
 
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use tyclaw_types::TyclawError;
+
+pub(crate) fn validate_workspace_relative_path(path: &str) -> Result<PathBuf, TyclawError> {
+    let path = Path::new(path);
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(workspace_read_error(
+            "Path must be relative to the workspace work directory",
+        ));
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(workspace_read_error(
+                    "Path must stay within the workspace work directory",
+                ));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(workspace_read_error("Path must identify a workspace file"));
+    }
+    Ok(normalized)
+}
+
+pub(crate) fn workspace_read_error(message: impl Into<String>) -> TyclawError {
+    TyclawError::Tool {
+        tool: "sandbox_read_workspace".into(),
+        message: message.into(),
+    }
+}
 
 tokio::task_local! {
     /// 当前请求关联的 Sandbox 实例（per-request，通过 .scope() 注入）。
