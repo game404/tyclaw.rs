@@ -1,6 +1,6 @@
-//! 使用统计：旁路记录请求生命周期，并维护可按日、周、月查询的 SQLite 聚合。
+//! 使用统计：旁路记录请求生命周期，并维护可按日期范围查询的 SQLite 日级聚合。
 
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use chrono_tz::Tz;
 use parking_lot::Mutex;
 use regex::Regex;
@@ -229,47 +229,8 @@ impl Default for UsageFinish {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AnalyticsGrain {
-    Day,
-    Week,
-    Month,
-}
-
-impl FromStr for AnalyticsGrain {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "day" => Ok(Self::Day),
-            "week" => Ok(Self::Week),
-            "month" => Ok(Self::Month),
-            _ => Err(format!("unsupported analytics grain: {value}")),
-        }
-    }
-}
-
-impl AnalyticsGrain {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Day => "day",
-            Self::Week => "week",
-            Self::Month => "month",
-        }
-    }
-
-    fn period_start(self, date: NaiveDate) -> NaiveDate {
-        match self {
-            Self::Day => date,
-            Self::Week => date - ChronoDuration::days(date.weekday().num_days_from_monday() as i64),
-            Self::Month => date.with_day(1).unwrap_or(date),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct AnalyticsQuery {
-    pub grain: AnalyticsGrain,
     pub from: NaiveDate,
     pub to: NaiveDate,
     pub workspace: Option<String>,
@@ -1343,7 +1304,7 @@ fn build_report(
     for row in &usage_rows {
         add_usage_to_summary(&mut summary, row);
         *channels.entry(row.channel.clone()).or_default() += row.requests;
-        let period = query.grain.period_start(row.date);
+        let period = row.date;
         let point = series
             .entry(period)
             .or_insert_with(|| AnalyticsSeriesPoint {
@@ -1375,7 +1336,7 @@ fn build_report(
         }
         unique_users.insert(row.user_id.clone());
         period_users
-            .entry(query.grain.period_start(row.date))
+            .entry(row.date)
             .or_default()
             .insert(row.user_id.clone());
         let entry = users
@@ -1451,7 +1412,7 @@ fn build_report(
 
     Ok(AnalyticsReport {
         timezone: inner.config.timezone.clone(),
-        grain: query.grain.as_str().into(),
+        grain: "day".into(),
         from: query.from.to_string(),
         to: query.to.to_string(),
         detail_retention_days: inner.config.detail_retention_days,
@@ -1787,19 +1748,6 @@ mod tests {
     }
 
     #[test]
-    fn grain_uses_monday_and_calendar_month() {
-        let date = NaiveDate::from_ymd_opt(2026, 8, 9).unwrap();
-        assert_eq!(
-            AnalyticsGrain::Week.period_start(date),
-            NaiveDate::from_ymd_opt(2026, 8, 3).unwrap()
-        );
-        assert_eq!(
-            AnalyticsGrain::Month.period_start(date),
-            NaiveDate::from_ymd_opt(2026, 8, 1).unwrap()
-        );
-    }
-
-    #[test]
     fn request_round_trip_aggregates_without_raw_content() {
         let temp = TempDir::new().unwrap();
         let analytics = UsageAnalytics::new(temp.path(), test_config());
@@ -1836,7 +1784,6 @@ mod tests {
         let today = analytics.today();
         let report = analytics
             .query(&AnalyticsQuery {
-                grain: AnalyticsGrain::Day,
                 from: today,
                 to: today,
                 workspace: None,
@@ -1886,7 +1833,6 @@ mod tests {
         let today = analytics.today();
         let report = analytics
             .query(&AnalyticsQuery {
-                grain: AnalyticsGrain::Day,
                 from: today,
                 to: today,
                 workspace: None,
@@ -1917,7 +1863,6 @@ mod tests {
         let today = analytics.today();
         let report = analytics
             .query(&AnalyticsQuery {
-                grain: AnalyticsGrain::Day,
                 from: today,
                 to: today,
                 workspace: None,
@@ -1958,7 +1903,6 @@ mod tests {
         let today = analytics.today();
         let report = analytics
             .query(&AnalyticsQuery {
-                grain: AnalyticsGrain::Day,
                 from: today,
                 to: today,
                 workspace: None,
@@ -1991,7 +1935,6 @@ mod tests {
         analytics.finish_request(&request, UsageFinish::default());
         assert!(analytics
             .query(&AnalyticsQuery {
-                grain: AnalyticsGrain::Day,
                 from: analytics.today(),
                 to: analytics.today(),
                 workspace: None,
@@ -2042,7 +1985,6 @@ mod tests {
         let today = analytics.today();
         let report = analytics
             .query(&AnalyticsQuery {
-                grain: AnalyticsGrain::Day,
                 from: today,
                 to: today,
                 workspace: None,
@@ -2172,7 +2114,6 @@ mod tests {
         let result = load_daily_usage(
             &connection,
             &AnalyticsQuery {
-                grain: AnalyticsGrain::Day,
                 from: today,
                 to: today,
                 workspace: None,
@@ -2181,6 +2122,40 @@ mod tests {
             },
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn range_queries_keep_daily_series_points() {
+        let temp = TempDir::new().unwrap();
+        let analytics = UsageAnalytics::new(temp.path(), test_config());
+        let today = analytics.today();
+        let yesterday = today - ChronoDuration::days(1);
+        let connection = Connection::open(&analytics.inner.db_path).unwrap();
+        for (date, requests) in [(yesterday, 2), (today, 3)] {
+            connection
+                .execute(
+                    "INSERT INTO daily_usage(
+                        local_date, workspace_key, channel, source, requests
+                     ) VALUES (?1, 'ws', 'cli', 'interactive', ?2)",
+                    params![date.to_string(), requests],
+                )
+                .unwrap();
+        }
+
+        let report = analytics
+            .query(&AnalyticsQuery {
+                from: yesterday,
+                to: today,
+                workspace: None,
+                channel: None,
+                source: None,
+            })
+            .unwrap();
+        assert_eq!(report.grain, "day");
+        assert_eq!(report.summary.requests, 5);
+        assert_eq!(report.series.len(), 2);
+        assert_eq!(report.series[0].period_start, yesterday.to_string());
+        assert_eq!(report.series[1].period_start, today.to_string());
     }
 
     #[test]

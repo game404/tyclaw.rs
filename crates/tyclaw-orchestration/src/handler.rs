@@ -1697,7 +1697,7 @@ mod analytics_lifecycle_tests {
     use super::*;
     use async_trait::async_trait;
     use crate::OrchestratorBuilder;
-    use tyclaw_control::{AnalyticsConfig, AnalyticsGrain, AnalyticsQuery};
+    use tyclaw_control::{AnalyticsConfig, AnalyticsQuery};
     use tyclaw_provider::types::{ChatRequest, LLMResponse};
     use tyclaw_provider::LLMProvider;
 
@@ -1751,7 +1751,6 @@ mod analytics_lifecycle_tests {
         let today = analytics.today();
         let report = analytics
             .query(&AnalyticsQuery {
-                grain: AnalyticsGrain::Day,
                 from: today,
                 to: today,
                 workspace: None,

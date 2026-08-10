@@ -34,8 +34,8 @@ pub use audit::{
     slow_request_reason_distribution, warn_max_iterations_reset,
 };
 pub use analytics::{
-    AnalyticsConfig, AnalyticsGrain, AnalyticsQuery, AnalyticsReport, InteractionKind,
-    UsageAnalytics, UsageFinish, UsageRequest, UsageSource, UsageStatus, UsageToolEvent,
+    AnalyticsConfig, AnalyticsQuery, AnalyticsReport, InteractionKind, UsageAnalytics,
+    UsageFinish, UsageRequest, UsageSource, UsageStatus, UsageToolEvent,
 };
 pub use config::ControlConfig;
 pub use gate::{ExecutionGate, Judgment, JudgmentAction};

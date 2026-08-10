@@ -2,12 +2,12 @@
 //!
 //! 端点：GET / HTML；GET /api/stats、GET /api/analytics JSON。
 
-use chrono::{Datelike, Duration, Months, NaiveDate};
+use chrono::{Datelike, Duration, NaiveDate};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tyclaw_control::{AnalyticsGrain, AnalyticsQuery, UsageSource, WorkspaceKeyStrategy};
+use tyclaw_control::{AnalyticsQuery, UsageSource, WorkspaceKeyStrategy};
 use tyclaw_orchestration::Orchestrator;
 
 #[derive(Clone)]
@@ -206,7 +206,7 @@ fn parse_analytics_query(
         let value = percent_decode(raw_value).ok_or("analytics_invalid_query_encoding")?;
         if !matches!(
             key.as_str(),
-            "grain" | "from" | "to" | "workspace" | "channel" | "source"
+            "range" | "from" | "to" | "workspace" | "channel" | "source"
         ) {
             return Err("analytics_unknown_query_parameter");
         }
@@ -215,34 +215,37 @@ fn parse_analytics_query(
         }
     }
 
-    let grain = params
-        .get("grain")
-        .map(|value| value.parse::<AnalyticsGrain>())
-        .transpose()
-        .map_err(|_| "analytics_invalid_grain")?
-        .unwrap_or(AnalyticsGrain::Day);
-    let to = params
-        .get("to")
-        .map(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d"))
-        .transpose()
-        .map_err(|_| "analytics_invalid_to_date")?
-        .unwrap_or(today);
-    let default_from = match grain {
-        AnalyticsGrain::Day => to - Duration::days(29),
-        AnalyticsGrain::Week => {
-            to - Duration::days(to.weekday().num_days_from_monday() as i64 + 11 * 7)
+    let range = params.get("range").map(String::as_str);
+    if range.is_some() && (params.contains_key("from") || params.contains_key("to")) {
+        return Err("analytics_ambiguous_date_range");
+    }
+    let (from, to) = match range {
+        Some("today") => (today, today),
+        Some("week") => (
+            today - Duration::days(today.weekday().num_days_from_monday() as i64),
+            today,
+        ),
+        Some("month") | None if !params.contains_key("from") && !params.contains_key("to") => (
+            today.with_day(1).ok_or("analytics_invalid_date_range")?,
+            today,
+        ),
+        Some(_) => return Err("analytics_invalid_range"),
+        None => {
+            let to = params
+                .get("to")
+                .map(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d"))
+                .transpose()
+                .map_err(|_| "analytics_invalid_to_date")?
+                .unwrap_or(today);
+            let from = params
+                .get("from")
+                .map(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d"))
+                .transpose()
+                .map_err(|_| "analytics_invalid_from_date")?
+                .unwrap_or_else(|| to.with_day(1).unwrap_or(to));
+            (from, to)
         }
-        AnalyticsGrain::Month => to
-            .with_day(1)
-            .and_then(|date| date.checked_sub_months(Months::new(11)))
-            .ok_or("analytics_invalid_date_range")?,
     };
-    let from = params
-        .get("from")
-        .map(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d"))
-        .transpose()
-        .map_err(|_| "analytics_invalid_from_date")?
-        .unwrap_or(default_from);
     let requested_days = (to - from).num_days() + 1;
     if from > to || requested_days > retention_days.min(400) as i64 {
         return Err("analytics_invalid_date_range");
@@ -264,7 +267,6 @@ fn parse_analytics_query(
         .map_err(|_| "analytics_invalid_source")?;
 
     Ok(AnalyticsQuery {
-        grain,
         from,
         to,
         workspace: optional_filter("workspace")?,
@@ -441,10 +443,10 @@ header{height:64px;background:var(--surface);border-bottom:1px solid var(--line)
 nav{background:var(--surface);border-bottom:1px solid var(--line);padding:0 28px;display:flex;gap:24px}.tab{border:0;border-bottom:2px solid transparent;background:transparent;padding:13px 2px 11px;color:var(--muted);font:inherit;font-weight:650;cursor:pointer}.tab[aria-selected="true"]{color:var(--ink);border-color:var(--green)}
 main{max-width:1440px;margin:0 auto;padding:22px 28px 48px}.view[hidden]{display:none}.section{margin:0 0 24px}.section-head{display:flex;align-items:end;justify-content:space-between;gap:14px;margin-bottom:10px}h1,h2,h3{margin:0;font-weight:700}h2{font-size:16px}h3{font-size:13px;color:var(--muted)}.muted{color:var(--muted);font-size:12px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.metric{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:14px;min-height:92px}.metric-label{color:var(--muted);font-size:12px}.metric-value{font-size:25px;line-height:1.2;font-weight:720;margin-top:10px;font-variant-numeric:tabular-nums}.metric-note{font-size:11px;color:var(--muted);margin-top:4px}
 .panel{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:14px;min-width:0}.split{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(320px,1fr);gap:10px}.stack{display:grid;gap:10px}.table-wrap{overflow:auto;max-width:100%}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:9px 8px;border-bottom:1px solid #edf0eb;text-align:left;vertical-align:top;white-space:nowrap}th{color:var(--muted);font-weight:650;background:#fafbf9;position:sticky;top:0}td.wrap{white-space:normal;min-width:180px;line-height:1.5}.empty{color:var(--muted);padding:22px 8px;text-align:center}
-.filters{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr)) auto;gap:8px;align-items:end;background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:12px;margin-bottom:10px}label{display:grid;gap:5px;color:var(--muted);font-size:11px}select,input{height:34px;border:1px solid #cfd5cc;border-radius:4px;background:#fff;color:var(--ink);padding:0 9px;font:inherit;min-width:0}.action{height:34px;border:0;border-radius:4px;background:var(--green);color:white;padding:0 15px;font:inherit;font-weight:650;cursor:pointer}.action:disabled{opacity:.55;cursor:wait}
+.filters{display:grid;grid-template-columns:minmax(250px,1.5fr) repeat(5,minmax(120px,1fr)) auto;gap:8px;align-items:end;background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:12px;margin-bottom:10px}label,.filter-field{display:grid;gap:5px;color:var(--muted);font-size:11px}.segmented{height:34px;display:grid;grid-template-columns:repeat(3,1fr);border:1px solid #cfd5cc;border-radius:4px;overflow:hidden}.range-option{border:0;border-right:1px solid #cfd5cc;background:#fff;color:var(--muted);font:inherit;font-weight:650;cursor:pointer}.range-option:last-child{border-right:0}.range-option[aria-pressed="true"]{background:var(--green);color:#fff}.range-option:disabled{opacity:.55;cursor:wait}select,input{height:34px;border:1px solid #cfd5cc;border-radius:4px;background:#fff;color:var(--ink);padding:0 9px;font:inherit;min-width:0}.action{height:34px;border:0;border-radius:4px;background:var(--green);color:white;padding:0 15px;font:inherit;font-weight:650;cursor:pointer}.action:disabled{opacity:.55;cursor:wait}
 .alert{border:1px solid #dfb9af;background:#fff4f1;color:#86351f;border-radius:5px;padding:10px 12px;margin-bottom:10px}.alert.ok{border-color:#b9d8c8;background:#f0f8f3;color:#17623f}.alert[hidden]{display:none}.legend{display:flex;gap:16px;color:var(--muted);font-size:11px}.key:before{content:"";display:inline-block;width:10px;height:3px;margin-right:5px;vertical-align:middle;background:var(--green)}.key.users:before{background:var(--coral)}.key.tools:before{background:var(--gold)}.chart{position:relative;height:280px}.chart canvas{width:100%;height:100%;display:block}.badge{display:inline-block;border:1px solid var(--line);border-radius:4px;padding:2px 5px;background:var(--soft);font-size:10px;color:#465048}.error-text{color:var(--coral)}
-@media(max-width:980px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.split{grid-template-columns:1fr}.filters{grid-template-columns:repeat(3,minmax(0,1fr))}.filters .action{grid-column:span 3}.chart{height:240px}}
-@media(max-width:620px){header{height:auto;min-height:58px;padding:12px 16px;align-items:flex-start;flex-wrap:wrap}#instance{order:3;max-width:100%;width:100%;margin-left:0}nav{padding:0 16px;gap:20px}main{padding:16px}.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.metric{padding:12px;min-height:82px}.metric-value{font-size:21px}.filters{grid-template-columns:repeat(2,minmax(0,1fr))}.filters .action{grid-column:span 2}.section-head{align-items:start;flex-direction:column}.chart{height:210px}}
+@media(max-width:980px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.split{grid-template-columns:1fr}.filters{grid-template-columns:repeat(3,minmax(0,1fr))}.quick-range{grid-column:span 2}.filters .action{grid-column:span 3}.chart{height:240px}}
+@media(max-width:620px){header{height:auto;min-height:58px;padding:12px 16px;align-items:flex-start;flex-wrap:wrap}#instance{order:3;max-width:100%;width:100%;margin-left:0}nav{padding:0 16px;gap:20px}main{padding:16px}.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.metric{padding:12px;min-height:82px}.metric-value{font-size:21px}.filters{grid-template-columns:repeat(2,minmax(0,1fr))}.quick-range{grid-column:span 2}.filters .action{grid-column:span 2}.section-head{align-items:start;flex-direction:column}.chart{height:210px}}
 </style>
 </head>
 <body>
@@ -458,7 +460,7 @@ main{max-width:1440px;margin:0 auto;padding:22px 28px 48px}.view[hidden]{display
 </section>
 <section id="analytics" class="view" hidden>
   <form id="filters" class="filters">
-    <label>时间粒度<select id="grain"><option value="day">日</option><option value="week">周</option><option value="month">月</option></select></label>
+    <div class="filter-field quick-range"><span>快捷范围</span><div class="segmented" role="group" aria-label="快捷范围"><button class="range-option" type="button" data-range="today" aria-pressed="false">本日</button><button class="range-option" type="button" data-range="week" aria-pressed="false">本周</button><button class="range-option" type="button" data-range="month" aria-pressed="true">本月</button></div></div>
     <label>开始日期<input id="from" type="date"></label><label>结束日期<input id="to" type="date"></label>
     <label>工作区<select id="workspace"><option value="">全部</option></select></label><label>渠道<select id="channel"><option value="">全部</option></select></label>
     <label>来源<select id="source"><option value="">全部</option><option value="interactive">人工</option><option value="automated">自动任务</option></select></label>
@@ -486,12 +488,15 @@ async function getJson(url){const response=await fetch(url,{headers:{Accept:'app
 async function loadOverview(){try{const data=await getJson('/api/stats');byId('instance').textContent=data.model+' | '+data.workspace+' | ctx '+data.context_window;byId('overview-updated').textContent=new Date().toLocaleTimeString('zh-CN');renderMetrics('overview-metrics',[['活跃任务',fmt(data.active_task_count)],['Skill',fmt(data.skill_count)],['工作区',fmt(data.works_stats?.workspaces_total)],['上下文窗口',fmt(data.context_window)]]);table('tasks',['工作区','用户','任务','运行秒数'],(data.active_tasks||[]).map(v=>[v.workspace,v.user_id,v.summary,fmt(v.elapsed_secs)]),[2]);const ws=data.works_stats||{};const workRows=Object.entries(ws.buckets||{});table('works',['类别','数量'],workRows);if(ws.note){byId('works').append(make('div','muted',ws.note))}table('skills',['名称','分类','状态'],(data.skills||[]).map(v=>[v.name,v.category,v.status]),[0]);table('audit',['时间','渠道','请求','工具','耗时'],(data.audit_recent||[]).map(v=>[v.time,v.channel,v.request,fmt(v.tools),v.duration||'']),[2])}catch(error){byId('instance').textContent='运行状态不可用';empty('tasks',error.message)}}
 document.querySelectorAll('.tab').forEach(button=>button.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(tab=>tab.setAttribute('aria-selected',String(tab===button)));document.querySelectorAll('.view').forEach(view=>view.hidden=view.id!==button.dataset.view);if(button.dataset.view==='analytics')loadAnalytics()}));
 function syncOptions(id,values){const select=byId(id);const current=select.value;while(select.options.length>1)select.remove(1);values.forEach(value=>{const option=make('option','',value);option.value=value;select.append(option)});if(values.includes(current))select.value=current}
-function analyticsUrl(){const params=new URLSearchParams();['grain','from','to','workspace','channel','source'].forEach(id=>{const value=byId(id).value;if(value)params.set(id,value)});return '/api/analytics?'+params.toString()}
+let activeRange='month';
+const rangeButtons=()=>Array.from(document.querySelectorAll('.range-option'));
+function setActiveRange(value){activeRange=value;rangeButtons().forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.range===value)))}
+function analyticsUrl(){const params=new URLSearchParams();if(activeRange){params.set('range',activeRange)}else{['from','to'].forEach(id=>{const value=byId(id).value;if(value)params.set(id,value)})}['workspace','channel','source'].forEach(id=>{const value=byId(id).value;if(value)params.set(id,value)});return '/api/analytics?'+params.toString()}
 let analyticsLoading=false;
-async function loadAnalytics(){if(analyticsLoading)return;analyticsLoading=true;byId('query').disabled=true;try{const data=await getJson(analyticsUrl());byId('from').value=data.from;byId('to').value=data.to;byId('range').textContent=data.from+' 至 '+data.to+' | '+data.timezone;byId('detail-range').textContent=data.health.earliest_detail_date?'可查询明细始于 '+data.health.earliest_detail_date:'当前范围无明细';syncOptions('workspace',data.filters.workspaces||[]);syncOptions('channel',data.filters.channels||[]);const s=data.summary;renderMetrics('analytics-metrics',[['活跃用户',fmt(s.active_users),'会话 '+fmt(s.sessions)],['请求',fmt(s.requests),'人工 '+fmt(s.interactive_requests)+' | 自动 '+fmt(s.automated_requests)],['问题',fmt(s.questions),'回答率 '+pct(s.answer_rate)],['错误率',pct(s.error_rate),fmt(s.errors)+' 次错误'],['平均耗时',fmt(s.average_duration_ms)+' ms'],['Prompt Token',fmt(s.prompt_tokens)],['Completion Token',fmt(s.completion_tokens)],['工具调用',fmt(s.tool_calls),'成功率 '+pct(s.tool_success_rate)]]);renderHealth(data.health);drawTrend(data.series||[]);table('tool-ranking',['范围','工具','调用','成功','失败','拒绝','平均耗时'],(data.tools||[]).map(v=>[v.scope,v.name,fmt(v.calls),fmt(v.successes),fmt(v.failures),fmt(v.denied),fmt(v.average_duration_ms)+' ms']));table('user-ranking',['用户','标识','请求','会话','问题','回答','错误','工具'],(data.users||[]).map(v=>[v.user_name||'未命名',v.masked_user_id,fmt(v.requests),fmt(v.sessions),fmt(v.questions),fmt(v.answers),fmt(v.errors),fmt(v.tool_calls)]));table('recent',['时间','用户','渠道','来源','状态','问题摘要','回答摘要','耗时','工具'],(data.recent||[]).map(v=>[v.started_at,v.user_name||v.masked_user_id,v.channel,v.source,v.status,v.request_preview,v.response_preview,fmt(v.duration_ms)+' ms',(v.tools||[]).map(t=>t.name).join(', ')]),[5,6,8])}catch(error){const alert=byId('analytics-alert');alert.hidden=false;alert.className='alert';alert.textContent='使用统计不可用：'+error.message;clear(byId('analytics-metrics'));drawTrend([])}finally{analyticsLoading=false;byId('query').disabled=false}}
+async function loadAnalytics(){if(analyticsLoading)return;analyticsLoading=true;byId('query').disabled=true;rangeButtons().forEach(button=>button.disabled=true);try{const data=await getJson(analyticsUrl());byId('from').value=data.from;byId('to').value=data.to;byId('range').textContent=data.from+' 至 '+data.to+' | 日统计 | '+data.timezone;byId('detail-range').textContent=data.health.earliest_detail_date?'可查询明细始于 '+data.health.earliest_detail_date:'当前范围无明细';syncOptions('workspace',data.filters.workspaces||[]);syncOptions('channel',data.filters.channels||[]);const s=data.summary;renderMetrics('analytics-metrics',[['活跃用户',fmt(s.active_users),'会话 '+fmt(s.sessions)],['请求',fmt(s.requests),'人工 '+fmt(s.interactive_requests)+' | 自动 '+fmt(s.automated_requests)],['问题',fmt(s.questions),'回答率 '+pct(s.answer_rate)],['错误率',pct(s.error_rate),fmt(s.errors)+' 次错误'],['平均耗时',fmt(s.average_duration_ms)+' ms'],['Prompt Token',fmt(s.prompt_tokens)],['Completion Token',fmt(s.completion_tokens)],['工具调用',fmt(s.tool_calls),'成功率 '+pct(s.tool_success_rate)]]);renderHealth(data.health);drawTrend(data.series||[]);table('tool-ranking',['范围','工具','调用','成功','失败','拒绝','平均耗时'],(data.tools||[]).map(v=>[v.scope,v.name,fmt(v.calls),fmt(v.successes),fmt(v.failures),fmt(v.denied),fmt(v.average_duration_ms)+' ms']));table('user-ranking',['用户','标识','请求','会话','问题','回答','错误','工具'],(data.users||[]).map(v=>[v.user_name||'未命名',v.masked_user_id,fmt(v.requests),fmt(v.sessions),fmt(v.questions),fmt(v.answers),fmt(v.errors),fmt(v.tool_calls)]));table('recent',['时间','用户','渠道','来源','状态','问题摘要','回答摘要','耗时','工具'],(data.recent||[]).map(v=>[v.started_at,v.user_name||v.masked_user_id,v.channel,v.source,v.status,v.request_preview,v.response_preview,fmt(v.duration_ms)+' ms',(v.tools||[]).map(t=>t.name).join(', ')]),[5,6,8])}catch(error){const alert=byId('analytics-alert');alert.hidden=false;alert.className='alert';alert.textContent='使用统计不可用：'+error.message;clear(byId('analytics-metrics'));drawTrend([])}finally{analyticsLoading=false;byId('query').disabled=false;rangeButtons().forEach(button=>button.disabled=false)}}
 function renderHealth(health){const alert=byId('analytics-alert');const issues=[];if(!health.available)issues.push('数据库不可用');if(health.dropped_events)issues.push('队列丢弃 '+fmt(health.dropped_events)+' 条事件');if(health.storage_warning)issues.push('数据库已达到容量告警线');if(health.detail_evictions)issues.push('已提前淘汰 '+fmt(health.detail_evictions)+' 条明细');if(health.last_error)issues.push('最近错误 '+health.last_error);alert.hidden=false;alert.className=issues.length?'alert':'alert ok';alert.textContent=issues.length?issues.join('；'):'统计服务正常 | 数据库 '+fmt(health.database_bytes)+' bytes'}
 function drawTrend(series){const canvas=byId('trend');const rect=canvas.getBoundingClientRect();const ratio=window.devicePixelRatio||1;canvas.width=Math.max(1,Math.floor(rect.width*ratio));canvas.height=Math.max(1,Math.floor(rect.height*ratio));const ctx=canvas.getContext('2d');ctx.scale(ratio,ratio);const width=rect.width,height=rect.height;ctx.clearRect(0,0,width,height);const pad={l:44,r:16,t:18,b:35};const chartW=width-pad.l-pad.r,chartH=height-pad.t-pad.b;if(!series.length){ctx.fillStyle='#697069';ctx.font='12px system-ui';ctx.textAlign='center';ctx.fillText('暂无趋势数据',width/2,height/2);return}const keys=[['requests','#16784b'],['active_users','#c84f35'],['tool_calls','#9a6a00']];const max=Math.max(1,...series.flatMap(point=>keys.map(([key])=>Number(point[key]||0))));ctx.strokeStyle='#e4e7e1';ctx.fillStyle='#697069';ctx.font='10px system-ui';ctx.textAlign='right';for(let i=0;i<=4;i++){const y=pad.t+chartH*i/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(width-pad.r,y);ctx.stroke();const label=max<4?(max*(4-i)/4).toFixed(1):String(Math.round(max*(4-i)/4));ctx.fillText(label,pad.l-7,y+3)}keys.forEach(([key,color])=>{const points=series.map((point,index)=>({x:pad.l+(series.length===1?chartW/2:chartW*index/(series.length-1)),y:pad.t+chartH*(1-Number(point[key]||0)/max)}));ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=2;ctx.beginPath();points.forEach((point,index)=>index?ctx.lineTo(point.x,point.y):ctx.moveTo(point.x,point.y));ctx.stroke();points.forEach(point=>{ctx.beginPath();ctx.arc(point.x,point.y,3,0,Math.PI*2);ctx.fill()})});ctx.fillStyle='#697069';ctx.textAlign='center';const step=Math.max(1,Math.ceil(series.length/6));series.forEach((point,index)=>{if(index%step===0||index===series.length-1){const x=pad.l+(series.length===1?chartW/2:chartW*index/(series.length-1));ctx.fillText(point.period_start.slice(5),x,height-10)}})}
-byId('grain').addEventListener('change',()=>{byId('from').value=''});byId('filters').addEventListener('submit',event=>{event.preventDefault();loadAnalytics()});window.addEventListener('resize',()=>{if(!byId('analytics').hidden)loadAnalytics()});loadOverview();setInterval(loadOverview,10000);
+rangeButtons().forEach(button=>button.addEventListener('click',()=>{setActiveRange(button.dataset.range);byId('from').value='';byId('to').value='';loadAnalytics()}));['from','to'].forEach(id=>byId(id).addEventListener('change',()=>setActiveRange(null)));byId('filters').addEventListener('submit',event=>{event.preventDefault();loadAnalytics()});window.addEventListener('resize',()=>{if(!byId('analytics').hidden)loadAnalytics()});loadOverview();setInterval(loadOverview,10000);
 </script>
 </body>
 </html>"##.to_string()
@@ -513,11 +518,11 @@ mod tests {
     #[test]
     fn parses_exact_http_method_target_and_headers() {
         let parsed = parse_http_request_headers(
-            "GET /api/analytics?grain=week HTTP/1.1\r\nAuthorization: Basic abc\r\n\r\n",
+            "GET /api/analytics?range=week HTTP/1.1\r\nAuthorization: Basic abc\r\n\r\n",
         )
         .unwrap();
         assert_eq!(parsed.0, "GET");
-        assert_eq!(parsed.1, "/api/analytics?grain=week");
+        assert_eq!(parsed.1, "/api/analytics?range=week");
         assert_eq!(parsed.2.get("authorization").unwrap(), "Basic abc");
     }
 
@@ -541,13 +546,12 @@ mod tests {
     fn analytics_query_defaults_and_decodes_filters() {
         let today = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
         let query = parse_analytics_query(
-            "grain=week&workspace=team%2Ffinance&channel=dingtalk+group&source=interactive",
+            "workspace=team%2Ffinance&channel=dingtalk+group&source=interactive",
             today,
             400,
         )
         .unwrap();
-        assert_eq!(query.grain, AnalyticsGrain::Week);
-        assert_eq!(query.from, NaiveDate::from_ymd_opt(2026, 5, 25).unwrap());
+        assert_eq!(query.from, NaiveDate::from_ymd_opt(2026, 8, 1).unwrap());
         assert_eq!(query.to, today);
         assert_eq!(query.workspace.as_deref(), Some("team/finance"));
         assert_eq!(query.channel.as_deref(), Some("dingtalk group"));
@@ -555,11 +559,31 @@ mod tests {
     }
 
     #[test]
-    fn analytics_query_rejects_invalid_and_oversized_ranges() {
+    fn analytics_query_supports_current_day_week_and_month() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 9).unwrap();
+        let day = parse_analytics_query("range=today", today, 400).unwrap();
+        assert_eq!(day.from, today);
+        assert_eq!(day.to, today);
+
+        let week = parse_analytics_query("range=week", today, 400).unwrap();
+        assert_eq!(week.from, NaiveDate::from_ymd_opt(2026, 8, 3).unwrap());
+        assert_eq!(week.to, today);
+
+        let month = parse_analytics_query("range=month", today, 400).unwrap();
+        assert_eq!(month.from, NaiveDate::from_ymd_opt(2026, 8, 1).unwrap());
+        assert_eq!(month.to, today);
+    }
+
+    #[test]
+    fn analytics_query_rejects_invalid_ambiguous_and_oversized_ranges() {
         let today = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
         assert_eq!(
-            parse_analytics_query("grain=year", today, 400).unwrap_err(),
-            "analytics_invalid_grain"
+            parse_analytics_query("range=quarter", today, 400).unwrap_err(),
+            "analytics_invalid_range"
+        );
+        assert_eq!(
+            parse_analytics_query("range=week&from=2026-08-01", today, 400).unwrap_err(),
+            "analytics_ambiguous_date_range"
         );
         assert_eq!(
             parse_analytics_query("unknown=value", today, 400).unwrap_err(),
@@ -577,6 +601,10 @@ mod tests {
         let page = build_html_page();
         assert!(page.contains("运行概览"));
         assert!(page.contains("使用分析"));
+        assert!(page.contains("本日"));
+        assert!(page.contains("本周"));
+        assert!(page.contains("本月"));
+        assert!(!page.contains("时间粒度"));
         assert!(page.contains("textContent"));
         assert!(!page.contains("innerHTML"));
         assert!(!page.contains("Access-Control-Allow-Origin"));
