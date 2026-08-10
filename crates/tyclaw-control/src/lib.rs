@@ -4,6 +4,7 @@
 //! - RBAC（基于角色的访问控制）：分层角色权限管理
 //! - 执行门禁（ExecutionGate）：判断工具调用是否被允许
 //! - 审计日志（AuditLog）：追加写入的操作记录
+//! - 使用统计（UsageAnalytics）：旁路采集请求、用户和工具聚合
 //! - 工作区管理（WorkspaceManager）：多租户隔离
 
 /// RBAC 模块 —— 角色层级和权限定义
@@ -14,6 +15,9 @@ pub mod gate;
 
 /// 审计日志模块 —— 按工作区追加记录所有操作
 pub mod audit;
+
+/// 使用统计模块 —— SQLite 明细、日级聚合与范围查询
+pub mod analytics;
 
 /// 工作区管理模块 —— 多租户工作区隔离和目录管理
 pub mod workspace;
@@ -28,6 +32,10 @@ pub mod config;
 pub use audit::{
     AuditEntry, AuditLog, FailureAuditEntry, FailureCode, resolve_priority,
     slow_request_reason_distribution, warn_max_iterations_reset,
+};
+pub use analytics::{
+    AnalyticsConfig, AnalyticsGrain, AnalyticsQuery, AnalyticsReport, InteractionKind,
+    UsageAnalytics, UsageFinish, UsageRequest, UsageSource, UsageStatus, UsageToolEvent,
 };
 pub use config::ControlConfig;
 pub use gate::{ExecutionGate, Judgment, JudgmentAction};

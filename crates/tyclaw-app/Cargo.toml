@@ -19,6 +19,7 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+chrono = { workspace = true }
 tyclaw-tools = { workspace = true }
 tyclaw-sandbox = { path = "../tyclaw-sandbox" }
 rustyline = "17.0.2"

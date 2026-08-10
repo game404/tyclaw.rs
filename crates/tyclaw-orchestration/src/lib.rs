@@ -53,6 +53,9 @@ pub(crate) mod memory_filter;
 /// 请求处理器 —— 14 步端到端消息处理流程
 mod handler;
 
+/// 请求级工具统计收集器（仅编排层内部使用）
+mod usage;
+
 /// Workspace 超时回收后台任务
 pub(crate) mod reaper;
 

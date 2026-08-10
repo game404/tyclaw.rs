@@ -17,6 +17,7 @@ use tyclaw_types::TyclawError;
 
 use crate::orchestrator::Orchestrator;
 use crate::types::{AgentResponse, RequestContext};
+use tyclaw_control::UsageSource;
 
 /// 入站消息 —— 来自任意通道或 Timer。
 pub struct InboundMessage {
@@ -148,7 +149,13 @@ impl MessageBus {
         let channel_owned = channel.clone();
         let chat_id_owned = chat_id.clone();
 
-        let run_future = orchestrator.handle_with_context(&msg.content, &req, Some(&progress_cb));
+        let source = if msg.is_timer {
+            UsageSource::Automated
+        } else {
+            UsageSource::Interactive
+        };
+        let run_future =
+            orchestrator.handle_with_source(&msg.content, &req, Some(&progress_cb), source);
 
         // 构建心跳发送器：子任务通过 task_local 转发 [heartbeat] 消息到消息总线
         let heartbeat_outbound = outbound_tx.clone();

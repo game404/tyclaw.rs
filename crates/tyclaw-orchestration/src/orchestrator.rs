@@ -45,6 +45,8 @@ pub struct Orchestrator {
     pub(crate) context: ContextBuilder,
     /// 有状态的持久化服务（会话/审计/案例/技能/合并/限流/工作区管理）
     pub(crate) persistence: PersistenceLayer,
+    /// 可选旁路统计；SDK 仅在 builder 显式注入后启用。
+    pub(crate) analytics: Option<tyclaw_control::UsageAnalytics>,
     pub(crate) pending_files: Arc<tyclaw_tools::PendingFileStore>,
     pub(crate) pending_recommends: Arc<tyclaw_tools::PendingRecommendStore>,
     pub(crate) pending_ask_user:
@@ -314,6 +316,11 @@ impl Orchestrator {
     /// 获取持久化层引用（审计、技能等，监控用）。
     pub fn persistence(&self) -> &PersistenceLayer {
         &self.persistence
+    }
+
+    /// 获取旁路使用统计（监控 API 用）。
+    pub fn analytics(&self) -> Option<&tyclaw_control::UsageAnalytics> {
+        self.analytics.as_ref()
     }
 
     /// 覆盖 works 目录路径（对应 --works-dir 命令行参数）。
@@ -620,4 +627,3 @@ mod tests {
         }
     }
 }
-

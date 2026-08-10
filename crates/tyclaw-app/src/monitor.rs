@@ -1,12 +1,13 @@
 //! 轻量监控 HTTP 服务 —— 可配置 bind/port，可选 Basic 认证。
 //!
-//! 端点：GET / HTML；GET /api/stats JSON
+//! 端点：GET / HTML；GET /api/stats、GET /api/analytics JSON。
 
+use chrono::{Datelike, Duration, Months, NaiveDate};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tyclaw_control::WorkspaceKeyStrategy;
+use tyclaw_control::{AnalyticsGrain, AnalyticsQuery, UsageSource, WorkspaceKeyStrategy};
 use tyclaw_orchestration::Orchestrator;
 
 #[derive(Clone)]
@@ -45,14 +46,13 @@ pub fn spawn_monitor(orchestrator: Arc<Orchestrator>, options: Option<MonitorOpt
                     Err(_) => return,
                 };
                 let request = String::from_utf8_lossy(&buf[..n]);
-                let Some((path, headers)) = parse_http_request_headers(&request) else {
+                let Some((method, target, headers)) = parse_http_request_headers(&request) else {
                     let _ = stream
                         .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
                         .await;
                     let _ = stream.shutdown().await;
                     return;
                 };
-                let path = path.split('?').next().unwrap_or(&path).to_string();
                 let need_auth = basic.is_some();
                 let authorized = if let Some((ref u, ref p)) = basic {
                     headers
@@ -71,19 +71,21 @@ pub fn spawn_monitor(orchestrator: Arc<Orchestrator>, options: Option<MonitorOpt
                     let _ = stream.shutdown().await;
                     return;
                 }
-                let response = match path.as_str() {
-                    "/api/stats" => {
-                        let json = build_stats_json(&orch);
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{json}"
-                        )
+                let (path, raw_query) = target
+                    .split_once('?')
+                    .unwrap_or((target.as_str(), ""));
+                let response = match (method.as_str(), path) {
+                    ("GET", "/api/stats") => http_response(
+                        "200 OK",
+                        "application/json; charset=utf-8",
+                        &build_stats_json(&orch),
+                    ),
+                    ("GET", "/api/analytics") => build_analytics_response(&orch, raw_query).await,
+                    ("GET", "/") => {
+                        http_response("200 OK", "text/html; charset=utf-8", &build_html_page())
                     }
-                    _ => {
-                        let html = build_html_page(&orch);
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{html}"
-                        )
-                    }
+                    ("GET", _) => http_json_error("404 Not Found", "not_found"),
+                    _ => http_json_error("405 Method Not Allowed", "method_not_allowed"),
                 };
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.shutdown().await;
@@ -92,13 +94,13 @@ pub fn spawn_monitor(orchestrator: Arc<Orchestrator>, options: Option<MonitorOpt
     });
 }
 
-fn parse_http_request_headers(raw: &str) -> Option<(String, HashMap<String, String>)> {
+fn parse_http_request_headers(raw: &str) -> Option<(String, String, HashMap<String, String>)> {
     let head_end = raw.find("\r\n\r\n").or_else(|| raw.find("\n\n"))?;
     let head = &raw[..head_end];
     let mut lines = head.lines();
     let first = lines.next()?;
     let mut parts = first.split_whitespace();
-    let _method = parts.next()?;
+    let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
     let mut headers = HashMap::new();
     for line in lines {
@@ -106,14 +108,30 @@ fn parse_http_request_headers(raw: &str) -> Option<(String, HashMap<String, Stri
             headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
         }
     }
-    Some((path, headers))
+    Some((method, path, headers))
+}
+
+fn http_response(status: &str, content_type: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn http_json_error(status: &str, code: &str) -> String {
+    let body = serde_json::json!({ "error": code }).to_string();
+    http_response(status, "application/json; charset=utf-8", &body)
 }
 
 fn check_basic_auth(header_value: &str, expect_user: &str, expect_password: &str) -> bool {
     check_basic_auth_inner(header_value, expect_user, expect_password).unwrap_or(false)
 }
 
-fn check_basic_auth_inner(header_value: &str, expect_user: &str, expect_password: &str) -> Option<bool> {
+fn check_basic_auth_inner(
+    header_value: &str,
+    expect_user: &str,
+    expect_password: &str,
+) -> Option<bool> {
     let rest = header_value
         .strip_prefix("Basic ")
         .or_else(|| header_value.strip_prefix("basic "))?;
@@ -125,7 +143,9 @@ fn check_basic_auth_inner(header_value: &str, expect_user: &str, expect_password
 
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     use base64::Engine;
-    base64::engine::general_purpose::STANDARD.decode(s.trim()).ok()
+    base64::engine::general_purpose::STANDARD
+        .decode(s.trim())
+        .ok()
 }
 
 fn split_basic_credentials(s: &str) -> Option<(&str, &str)> {
@@ -144,6 +164,143 @@ fn ct_eq_str(a: &str, b: &str) -> bool {
         d |= x ^ y;
     }
     d == 0
+}
+
+async fn build_analytics_response(orch: &Orchestrator, raw_query: &str) -> String {
+    let Some(analytics) = orch.analytics().cloned() else {
+        return http_json_error("503 Service Unavailable", "analytics_not_configured");
+    };
+    let query = match parse_analytics_query(
+        raw_query,
+        analytics.today(),
+        analytics.aggregate_retention_days(),
+    ) {
+        Ok(query) => query,
+        Err(error) => return http_json_error("400 Bad Request", error),
+    };
+    match tokio::task::spawn_blocking(move || analytics.query(&query)).await {
+        Ok(Ok(report)) => match serde_json::to_string(&report) {
+            Ok(body) => http_response("200 OK", "application/json; charset=utf-8", &body),
+            Err(_) => http_json_error("500 Internal Server Error", "analytics_encode_failed"),
+        },
+        Ok(Err(error)) if error == "analytics_disabled" || error.contains("unavailable") => {
+            http_json_error("503 Service Unavailable", &error)
+        }
+        Ok(Err(error)) => http_json_error("500 Internal Server Error", &error),
+        Err(_) => http_json_error("500 Internal Server Error", "analytics_query_task_failed"),
+    }
+}
+
+fn parse_analytics_query(
+    raw_query: &str,
+    today: NaiveDate,
+    retention_days: u32,
+) -> Result<AnalyticsQuery, &'static str> {
+    if raw_query.len() > 2048 {
+        return Err("analytics_query_too_long");
+    }
+    let mut params = HashMap::new();
+    for pair in raw_query.split('&').filter(|pair| !pair.is_empty()) {
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode(raw_key).ok_or("analytics_invalid_query_encoding")?;
+        let value = percent_decode(raw_value).ok_or("analytics_invalid_query_encoding")?;
+        if !matches!(
+            key.as_str(),
+            "grain" | "from" | "to" | "workspace" | "channel" | "source"
+        ) {
+            return Err("analytics_unknown_query_parameter");
+        }
+        if params.insert(key, value).is_some() {
+            return Err("analytics_duplicate_query_parameter");
+        }
+    }
+
+    let grain = params
+        .get("grain")
+        .map(|value| value.parse::<AnalyticsGrain>())
+        .transpose()
+        .map_err(|_| "analytics_invalid_grain")?
+        .unwrap_or(AnalyticsGrain::Day);
+    let to = params
+        .get("to")
+        .map(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d"))
+        .transpose()
+        .map_err(|_| "analytics_invalid_to_date")?
+        .unwrap_or(today);
+    let default_from = match grain {
+        AnalyticsGrain::Day => to - Duration::days(29),
+        AnalyticsGrain::Week => {
+            to - Duration::days(to.weekday().num_days_from_monday() as i64 + 11 * 7)
+        }
+        AnalyticsGrain::Month => to
+            .with_day(1)
+            .and_then(|date| date.checked_sub_months(Months::new(11)))
+            .ok_or("analytics_invalid_date_range")?,
+    };
+    let from = params
+        .get("from")
+        .map(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d"))
+        .transpose()
+        .map_err(|_| "analytics_invalid_from_date")?
+        .unwrap_or(default_from);
+    let requested_days = (to - from).num_days() + 1;
+    if from > to || requested_days > retention_days.min(400) as i64 {
+        return Err("analytics_invalid_date_range");
+    }
+
+    let optional_filter = |name: &str| -> Result<Option<String>, &'static str> {
+        match params.get(name).map(|value| value.trim()) {
+            Some(value) if value.is_empty() || value.chars().count() > 128 => {
+                Err("analytics_invalid_filter")
+            }
+            Some(value) => Ok(Some(value.to_string())),
+            None => Ok(None),
+        }
+    };
+    let source = params
+        .get("source")
+        .map(|value| value.parse::<UsageSource>())
+        .transpose()
+        .map_err(|_| "analytics_invalid_source")?;
+
+    Ok(AnalyticsQuery {
+        grain,
+        from,
+        to,
+        workspace: optional_filter("workspace")?,
+        channel: optional_filter("channel")?,
+        source,
+    })
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => decoded.push(b' '),
+            b'%' if index + 2 < bytes.len() => {
+                let high = hex_value(bytes[index + 1])?;
+                let low = hex_value(bytes[index + 2])?;
+                decoded.push(high * 16 + low);
+                index += 2;
+            }
+            b'%' => return None,
+            byte => decoded.push(byte),
+        }
+        index += 1;
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn build_stats_json(orch: &Orchestrator) -> String {
@@ -235,9 +392,7 @@ fn build_works_stats(orch: &Orchestrator) -> serde_json::Value {
             }
             let buckets: serde_json::Map<String, serde_json::Value> = counts
                 .into_iter()
-                .map(|(name, count)| {
-                    (name.to_string(), serde_json::json!(count))
-                })
+                .map(|(name, count)| (name.to_string(), serde_json::json!(count)))
                 .collect();
             serde_json::json!({
                 "workspaces_total": total,
@@ -272,43 +427,74 @@ fn classify_conversation_workspace_key(key: &str) -> &'static str {
     "other"
 }
 
-fn build_html_page(orch: &Orchestrator) -> String {
-    let stats = build_stats_json(orch);
-    format!(
-        r##"<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>TyClaw Monitor</title>
-<style>body{{font-family:system-ui;background:#0d1117;color:#c9d1d9;padding:16px;}}h1{{color:#58a6ff;}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin:12px 0;}}.card{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;}}.label{{color:#8b949e;font-size:0.75em;}}.value{{font-size:1.5em;font-weight:bold;color:#f0f6fc;}}.green{{color:#3fb950;}}.blue{{color:#58a6ff;}}.orange{{color:#d29922;}}h2{{color:#58a6ff;font-size:1em;margin-top:16px;}}table{{width:100%;font-size:0.85em;border-collapse:collapse;}}th,td{{padding:6px;border-bottom:1px solid #21262d;text-align:left;}}.small{{color:#8b949e;font-size:0.8em;}}</style></head><body>
-<h1>TyClaw.rs Monitor</h1><div id="sub" class="small"></div>
-<div class="grid" id="cards"></div>
-<h2>Works 目录（启发式）</h2><div id="works"></div>
-<h2>Active Tasks</h2><div id="tasks"></div>
-<h2>Skills</h2><div id="skills"></div>
-<h2>Recent Audit</h2><div id="audit"></div>
+fn build_html_page() -> String {
+    r##"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TyClaw 管理台</title>
+<style>
+:root{color-scheme:light;--bg:#f5f6f3;--surface:#fff;--ink:#20231f;--muted:#697069;--line:#dfe3dc;--green:#16784b;--coral:#c84f35;--gold:#9a6a00;--soft:#eef3ed}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;font-size:14px;letter-spacing:0}
+header{height:64px;background:var(--surface);border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 28px;gap:16px;position:sticky;top:0;z-index:5}.brand{font-size:18px;font-weight:720}.status-dot{width:8px;height:8px;border-radius:50%;background:var(--green)}#instance{color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-left:auto;max-width:55vw}
+nav{background:var(--surface);border-bottom:1px solid var(--line);padding:0 28px;display:flex;gap:24px}.tab{border:0;border-bottom:2px solid transparent;background:transparent;padding:13px 2px 11px;color:var(--muted);font:inherit;font-weight:650;cursor:pointer}.tab[aria-selected="true"]{color:var(--ink);border-color:var(--green)}
+main{max-width:1440px;margin:0 auto;padding:22px 28px 48px}.view[hidden]{display:none}.section{margin:0 0 24px}.section-head{display:flex;align-items:end;justify-content:space-between;gap:14px;margin-bottom:10px}h1,h2,h3{margin:0;font-weight:700}h2{font-size:16px}h3{font-size:13px;color:var(--muted)}.muted{color:var(--muted);font-size:12px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.metric{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:14px;min-height:92px}.metric-label{color:var(--muted);font-size:12px}.metric-value{font-size:25px;line-height:1.2;font-weight:720;margin-top:10px;font-variant-numeric:tabular-nums}.metric-note{font-size:11px;color:var(--muted);margin-top:4px}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:14px;min-width:0}.split{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(320px,1fr);gap:10px}.stack{display:grid;gap:10px}.table-wrap{overflow:auto;max-width:100%}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:9px 8px;border-bottom:1px solid #edf0eb;text-align:left;vertical-align:top;white-space:nowrap}th{color:var(--muted);font-weight:650;background:#fafbf9;position:sticky;top:0}td.wrap{white-space:normal;min-width:180px;line-height:1.5}.empty{color:var(--muted);padding:22px 8px;text-align:center}
+.filters{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr)) auto;gap:8px;align-items:end;background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:12px;margin-bottom:10px}label{display:grid;gap:5px;color:var(--muted);font-size:11px}select,input{height:34px;border:1px solid #cfd5cc;border-radius:4px;background:#fff;color:var(--ink);padding:0 9px;font:inherit;min-width:0}.action{height:34px;border:0;border-radius:4px;background:var(--green);color:white;padding:0 15px;font:inherit;font-weight:650;cursor:pointer}.action:disabled{opacity:.55;cursor:wait}
+.alert{border:1px solid #dfb9af;background:#fff4f1;color:#86351f;border-radius:5px;padding:10px 12px;margin-bottom:10px}.alert.ok{border-color:#b9d8c8;background:#f0f8f3;color:#17623f}.alert[hidden]{display:none}.legend{display:flex;gap:16px;color:var(--muted);font-size:11px}.key:before{content:"";display:inline-block;width:10px;height:3px;margin-right:5px;vertical-align:middle;background:var(--green)}.key.users:before{background:var(--coral)}.key.tools:before{background:var(--gold)}.chart{position:relative;height:280px}.chart canvas{width:100%;height:100%;display:block}.badge{display:inline-block;border:1px solid var(--line);border-radius:4px;padding:2px 5px;background:var(--soft);font-size:10px;color:#465048}.error-text{color:var(--coral)}
+@media(max-width:980px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.split{grid-template-columns:1fr}.filters{grid-template-columns:repeat(3,minmax(0,1fr))}.filters .action{grid-column:span 3}.chart{height:240px}}
+@media(max-width:620px){header{height:auto;min-height:58px;padding:12px 16px;align-items:flex-start;flex-wrap:wrap}#instance{order:3;max-width:100%;width:100%;margin-left:0}nav{padding:0 16px;gap:20px}main{padding:16px}.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.metric{padding:12px;min-height:82px}.metric-value{font-size:21px}.filters{grid-template-columns:repeat(2,minmax(0,1fr))}.filters .action{grid-column:span 2}.section-head{align-items:start;flex-direction:column}.chart{height:210px}}
+</style>
+</head>
+<body>
+<header><span class="status-dot"></span><div class="brand">TyClaw 管理台</div><div id="instance"></div></header>
+<nav aria-label="管理视图"><button class="tab" data-view="overview" aria-selected="true">运行概览</button><button class="tab" data-view="analytics" aria-selected="false">使用分析</button></nav>
+<main>
+<section id="overview" class="view">
+  <div class="section"><div class="section-head"><h2>运行状态</h2><span id="overview-updated" class="muted"></span></div><div id="overview-metrics" class="grid"></div></div>
+  <div class="split section"><div class="panel"><div class="section-head"><h2>当前任务</h2></div><div id="tasks" class="table-wrap"></div></div><div class="panel"><div class="section-head"><h2>工作区</h2></div><div id="works"></div></div></div>
+  <div class="split section"><div class="panel"><div class="section-head"><h2>最近审计</h2></div><div id="audit" class="table-wrap"></div></div><div class="panel"><div class="section-head"><h2>Skill</h2></div><div id="skills" class="table-wrap"></div></div></div>
+</section>
+<section id="analytics" class="view" hidden>
+  <form id="filters" class="filters">
+    <label>时间粒度<select id="grain"><option value="day">日</option><option value="week">周</option><option value="month">月</option></select></label>
+    <label>开始日期<input id="from" type="date"></label><label>结束日期<input id="to" type="date"></label>
+    <label>工作区<select id="workspace"><option value="">全部</option></select></label><label>渠道<select id="channel"><option value="">全部</option></select></label>
+    <label>来源<select id="source"><option value="">全部</option><option value="interactive">人工</option><option value="automated">自动任务</option></select></label>
+    <button id="query" class="action" type="submit">查询</button>
+  </form>
+  <div id="analytics-alert" class="alert" hidden></div>
+  <div id="analytics-metrics" class="grid section"></div>
+  <div class="panel section"><div class="section-head"><div><h2>使用趋势</h2><div id="range" class="muted"></div></div><div class="legend"><span class="key">请求</span><span class="key users">用户</span><span class="key tools">工具</span></div></div><div class="chart"><canvas id="trend"></canvas></div></div>
+  <div class="split section"><div class="panel"><div class="section-head"><h2>工具排行</h2></div><div id="tool-ranking" class="table-wrap"></div></div><div class="panel"><div class="section-head"><h2>用户排行</h2></div><div id="user-ranking" class="table-wrap"></div></div></div>
+  <div class="panel section"><div class="section-head"><div><h2>最近问答</h2><div id="detail-range" class="muted"></div></div></div><div id="recent" class="table-wrap"></div></div>
+</section>
+</main>
 <script>
-const data = {stats};
-document.getElementById('sub').textContent = data.model+' · '+data.workspace+' · ctx='+data.context_window;
-let c = '<div class="card"><span class="label">Active</span><div class="value green">'+data.active_task_count+'</div></div>';
-c += '<div class="card"><span class="label">Skills</span><div class="value blue">'+data.skill_count+'</div></div>';
-if(data.works_stats&&data.works_stats.workspaces_total!==undefined)
-  c += '<div class="card"><span class="label">Works 目录</span><div class="value orange">'+data.works_stats.workspaces_total+'</div><div class="small">'+(data.works_stats.workspace_key_strategy||'')+'</div></div>';
-document.getElementById('cards').innerHTML=c;
-const ws=data.works_stats;
-let wh=(ws&&ws.note)?'<p class="small">'+ws.note+'</p>':'';
-if(ws&&ws.buckets&&Object.keys(ws.buckets).length){{
-  wh+='<table><tr><th>类别</th><th>数量</th></tr>';
-  for(const[n,v] of Object.entries(ws.buckets)) wh+='<tr><td>'+n+'</td><td>'+v+'</td></tr>';
-  wh+='</table>';
-}}else wh+='<p class="small">无分桶</p>';
-document.getElementById('works').innerHTML=wh;
-if(!data.active_tasks.length)document.getElementById('tasks').innerHTML='<p class="small">无</p>';
-else{{let h='<table><tr><th>WS</th><th>User</th><th>Summary</th></tr>';data.active_tasks.forEach(t=>h+='<tr><td>'+t.workspace+'</td><td>'+t.user_id+'</td><td>'+t.summary+'</td></tr>');document.getElementById('tasks').innerHTML=h+'</table>';}}
-if(!data.skills.length)document.getElementById('skills').innerHTML='<p class="small">无</p>';
-else{{let h='<table><tr><th>Name</th><th>Cat</th></tr>';data.skills.forEach(s=>h+='<tr><td>'+s.name+'</td><td>'+s.category+'</td></tr>');document.getElementById('skills').innerHTML=h+'</table>';}}
-if(!data.audit_recent.length)document.getElementById('audit').innerHTML='<p class="small">无</p>';
-else{{let h='<table><tr><th>Time</th><th>Ch</th><th>Req</th></tr>';data.audit_recent.forEach(e=>h+='<tr><td>'+e.time+'</td><td>'+e.channel+'</td><td>'+e.request+'</td></tr>');document.getElementById('audit').innerHTML=h+'</table>';}}
-setTimeout(()=>location.reload(),5000);
-</script></body></html>"##,
-        stats = stats
-    )
+'use strict';
+const byId=id=>document.getElementById(id);
+const clear=node=>{while(node.firstChild)node.removeChild(node.firstChild)};
+const make=(tag,className,text)=>{const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=String(text);return node};
+const fmt=value=>new Intl.NumberFormat('zh-CN').format(Number(value||0));
+const pct=value=>Number(value||0).toFixed(1)+'%';
+function metric(label,value,note){const box=make('div','metric');box.append(make('div','metric-label',label),make('div','metric-value',value));if(note)box.append(make('div','metric-note',note));return box}
+function renderMetrics(target,items){const root=byId(target);clear(root);items.forEach(item=>root.append(metric(item[0],item[1],item[2])))}
+function empty(target,text='暂无数据'){const root=byId(target);clear(root);root.append(make('div','empty',text))}
+function table(target,headers,rows,wrapColumns=[]){const root=byId(target);clear(root);if(!rows.length){root.append(make('div','empty','暂无数据'));return}const t=make('table');const head=make('thead');const hr=make('tr');headers.forEach(h=>hr.append(make('th','',h)));head.append(hr);const body=make('tbody');rows.forEach(row=>{const tr=make('tr');row.forEach((value,index)=>tr.append(make('td',wrapColumns.includes(index)?'wrap':'',value)));body.append(tr)});t.append(head,body);root.append(t)}
+async function getJson(url){const response=await fetch(url,{headers:{Accept:'application/json'},cache:'no-store'});let body={};try{body=await response.json()}catch(_){}if(!response.ok)throw new Error(body.error||('HTTP '+response.status));return body}
+async function loadOverview(){try{const data=await getJson('/api/stats');byId('instance').textContent=data.model+' | '+data.workspace+' | ctx '+data.context_window;byId('overview-updated').textContent=new Date().toLocaleTimeString('zh-CN');renderMetrics('overview-metrics',[['活跃任务',fmt(data.active_task_count)],['Skill',fmt(data.skill_count)],['工作区',fmt(data.works_stats?.workspaces_total)],['上下文窗口',fmt(data.context_window)]]);table('tasks',['工作区','用户','任务','运行秒数'],(data.active_tasks||[]).map(v=>[v.workspace,v.user_id,v.summary,fmt(v.elapsed_secs)]),[2]);const ws=data.works_stats||{};const workRows=Object.entries(ws.buckets||{});table('works',['类别','数量'],workRows);if(ws.note){byId('works').append(make('div','muted',ws.note))}table('skills',['名称','分类','状态'],(data.skills||[]).map(v=>[v.name,v.category,v.status]),[0]);table('audit',['时间','渠道','请求','工具','耗时'],(data.audit_recent||[]).map(v=>[v.time,v.channel,v.request,fmt(v.tools),v.duration||'']),[2])}catch(error){byId('instance').textContent='运行状态不可用';empty('tasks',error.message)}}
+document.querySelectorAll('.tab').forEach(button=>button.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(tab=>tab.setAttribute('aria-selected',String(tab===button)));document.querySelectorAll('.view').forEach(view=>view.hidden=view.id!==button.dataset.view);if(button.dataset.view==='analytics')loadAnalytics()}));
+function syncOptions(id,values){const select=byId(id);const current=select.value;while(select.options.length>1)select.remove(1);values.forEach(value=>{const option=make('option','',value);option.value=value;select.append(option)});if(values.includes(current))select.value=current}
+function analyticsUrl(){const params=new URLSearchParams();['grain','from','to','workspace','channel','source'].forEach(id=>{const value=byId(id).value;if(value)params.set(id,value)});return '/api/analytics?'+params.toString()}
+let analyticsLoading=false;
+async function loadAnalytics(){if(analyticsLoading)return;analyticsLoading=true;byId('query').disabled=true;try{const data=await getJson(analyticsUrl());byId('from').value=data.from;byId('to').value=data.to;byId('range').textContent=data.from+' 至 '+data.to+' | '+data.timezone;byId('detail-range').textContent=data.health.earliest_detail_date?'可查询明细始于 '+data.health.earliest_detail_date:'当前范围无明细';syncOptions('workspace',data.filters.workspaces||[]);syncOptions('channel',data.filters.channels||[]);const s=data.summary;renderMetrics('analytics-metrics',[['活跃用户',fmt(s.active_users),'会话 '+fmt(s.sessions)],['请求',fmt(s.requests),'人工 '+fmt(s.interactive_requests)+' | 自动 '+fmt(s.automated_requests)],['问题',fmt(s.questions),'回答率 '+pct(s.answer_rate)],['错误率',pct(s.error_rate),fmt(s.errors)+' 次错误'],['平均耗时',fmt(s.average_duration_ms)+' ms'],['Prompt Token',fmt(s.prompt_tokens)],['Completion Token',fmt(s.completion_tokens)],['工具调用',fmt(s.tool_calls),'成功率 '+pct(s.tool_success_rate)]]);renderHealth(data.health);drawTrend(data.series||[]);table('tool-ranking',['范围','工具','调用','成功','失败','拒绝','平均耗时'],(data.tools||[]).map(v=>[v.scope,v.name,fmt(v.calls),fmt(v.successes),fmt(v.failures),fmt(v.denied),fmt(v.average_duration_ms)+' ms']));table('user-ranking',['用户','标识','请求','会话','问题','回答','错误','工具'],(data.users||[]).map(v=>[v.user_name||'未命名',v.masked_user_id,fmt(v.requests),fmt(v.sessions),fmt(v.questions),fmt(v.answers),fmt(v.errors),fmt(v.tool_calls)]));table('recent',['时间','用户','渠道','来源','状态','问题摘要','回答摘要','耗时','工具'],(data.recent||[]).map(v=>[v.started_at,v.user_name||v.masked_user_id,v.channel,v.source,v.status,v.request_preview,v.response_preview,fmt(v.duration_ms)+' ms',(v.tools||[]).map(t=>t.name).join(', ')]),[5,6,8])}catch(error){const alert=byId('analytics-alert');alert.hidden=false;alert.className='alert';alert.textContent='使用统计不可用：'+error.message;clear(byId('analytics-metrics'));drawTrend([])}finally{analyticsLoading=false;byId('query').disabled=false}}
+function renderHealth(health){const alert=byId('analytics-alert');const issues=[];if(!health.available)issues.push('数据库不可用');if(health.dropped_events)issues.push('队列丢弃 '+fmt(health.dropped_events)+' 条事件');if(health.storage_warning)issues.push('数据库已达到容量告警线');if(health.detail_evictions)issues.push('已提前淘汰 '+fmt(health.detail_evictions)+' 条明细');if(health.last_error)issues.push('最近错误 '+health.last_error);alert.hidden=false;alert.className=issues.length?'alert':'alert ok';alert.textContent=issues.length?issues.join('；'):'统计服务正常 | 数据库 '+fmt(health.database_bytes)+' bytes'}
+function drawTrend(series){const canvas=byId('trend');const rect=canvas.getBoundingClientRect();const ratio=window.devicePixelRatio||1;canvas.width=Math.max(1,Math.floor(rect.width*ratio));canvas.height=Math.max(1,Math.floor(rect.height*ratio));const ctx=canvas.getContext('2d');ctx.scale(ratio,ratio);const width=rect.width,height=rect.height;ctx.clearRect(0,0,width,height);const pad={l:44,r:16,t:18,b:35};const chartW=width-pad.l-pad.r,chartH=height-pad.t-pad.b;if(!series.length){ctx.fillStyle='#697069';ctx.font='12px system-ui';ctx.textAlign='center';ctx.fillText('暂无趋势数据',width/2,height/2);return}const keys=[['requests','#16784b'],['active_users','#c84f35'],['tool_calls','#9a6a00']];const max=Math.max(1,...series.flatMap(point=>keys.map(([key])=>Number(point[key]||0))));ctx.strokeStyle='#e4e7e1';ctx.fillStyle='#697069';ctx.font='10px system-ui';ctx.textAlign='right';for(let i=0;i<=4;i++){const y=pad.t+chartH*i/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(width-pad.r,y);ctx.stroke();const label=max<4?(max*(4-i)/4).toFixed(1):String(Math.round(max*(4-i)/4));ctx.fillText(label,pad.l-7,y+3)}keys.forEach(([key,color])=>{const points=series.map((point,index)=>({x:pad.l+(series.length===1?chartW/2:chartW*index/(series.length-1)),y:pad.t+chartH*(1-Number(point[key]||0)/max)}));ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=2;ctx.beginPath();points.forEach((point,index)=>index?ctx.lineTo(point.x,point.y):ctx.moveTo(point.x,point.y));ctx.stroke();points.forEach(point=>{ctx.beginPath();ctx.arc(point.x,point.y,3,0,Math.PI*2);ctx.fill()})});ctx.fillStyle='#697069';ctx.textAlign='center';const step=Math.max(1,Math.ceil(series.length/6));series.forEach((point,index)=>{if(index%step===0||index===series.length-1){const x=pad.l+(series.length===1?chartW/2:chartW*index/(series.length-1));ctx.fillText(point.period_start.slice(5),x,height-10)}})}
+byId('grain').addEventListener('change',()=>{byId('from').value=''});byId('filters').addEventListener('submit',event=>{event.preventDefault();loadAnalytics()});window.addEventListener('resize',()=>{if(!byId('analytics').hidden)loadAnalytics()});loadOverview();setInterval(loadOverview,10000);
+</script>
+</body>
+</html>"##.to_string()
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -317,5 +503,82 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let boundary = s.floor_char_boundary(max);
         format!("{}...", &s[..boundary])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_exact_http_method_target_and_headers() {
+        let parsed = parse_http_request_headers(
+            "GET /api/analytics?grain=week HTTP/1.1\r\nAuthorization: Basic abc\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.0, "GET");
+        assert_eq!(parsed.1, "/api/analytics?grain=week");
+        assert_eq!(parsed.2.get("authorization").unwrap(), "Basic abc");
+    }
+
+    #[test]
+    fn basic_auth_handles_password_colons_and_rejects_wrong_values() {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("admin:p:a:ss");
+        assert!(check_basic_auth(
+            &format!("Basic {encoded}"),
+            "admin",
+            "p:a:ss"
+        ));
+        assert!(!check_basic_auth(
+            &format!("Basic {encoded}"),
+            "admin",
+            "wrong"
+        ));
+    }
+
+    #[test]
+    fn analytics_query_defaults_and_decodes_filters() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let query = parse_analytics_query(
+            "grain=week&workspace=team%2Ffinance&channel=dingtalk+group&source=interactive",
+            today,
+            400,
+        )
+        .unwrap();
+        assert_eq!(query.grain, AnalyticsGrain::Week);
+        assert_eq!(query.from, NaiveDate::from_ymd_opt(2026, 5, 25).unwrap());
+        assert_eq!(query.to, today);
+        assert_eq!(query.workspace.as_deref(), Some("team/finance"));
+        assert_eq!(query.channel.as_deref(), Some("dingtalk group"));
+        assert_eq!(query.source, Some(UsageSource::Interactive));
+    }
+
+    #[test]
+    fn analytics_query_rejects_invalid_and_oversized_ranges() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        assert_eq!(
+            parse_analytics_query("grain=year", today, 400).unwrap_err(),
+            "analytics_invalid_grain"
+        );
+        assert_eq!(
+            parse_analytics_query("unknown=value", today, 400).unwrap_err(),
+            "analytics_unknown_query_parameter"
+        );
+        assert_eq!(
+            parse_analytics_query("from=2025-07-06&to=2026-08-10", today, 400).unwrap_err(),
+            "analytics_invalid_date_range"
+        );
+        assert!(parse_analytics_query("channel=%ZZ", today, 400).is_err());
+    }
+
+    #[test]
+    fn management_page_uses_text_nodes_for_dynamic_content() {
+        let page = build_html_page();
+        assert!(page.contains("运行概览"));
+        assert!(page.contains("使用分析"));
+        assert!(page.contains("textContent"));
+        assert!(!page.contains("innerHTML"));
+        assert!(!page.contains("Access-Control-Allow-Origin"));
     }
 }
