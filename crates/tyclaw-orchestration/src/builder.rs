@@ -45,6 +45,7 @@ pub struct OrchestratorBuilder {
     pub(crate) workspace_key_strategy: tyclaw_control::WorkspaceKeyStrategy,
     pub(crate) path_config: tyclaw_control::PathConfig,
     pub(crate) performance: Option<crate::config::PerformanceConfig>,
+    pub(crate) analytics_config: Option<tyclaw_control::AnalyticsConfig>,
 }
 
 impl OrchestratorBuilder {
@@ -67,6 +68,7 @@ impl OrchestratorBuilder {
             workspace_key_strategy: tyclaw_control::WorkspaceKeyStrategy::default(),
             path_config: tyclaw_control::PathConfig::default(),
             performance: None,
+            analytics_config: None,
         }
     }
 
@@ -198,6 +200,12 @@ impl OrchestratorBuilder {
         self
     }
 
+    /// 显式注入使用统计配置；未调用时嵌入式 SDK 不采集。
+    pub fn with_analytics(mut self, config: tyclaw_control::AnalyticsConfig) -> Self {
+        self.analytics_config = Some(config);
+        self
+    }
+
     pub fn build(self) -> Orchestrator {
         let Self {
             provider,
@@ -217,6 +225,7 @@ impl OrchestratorBuilder {
             workspace_key_strategy,
             path_config,
             performance,
+            analytics_config,
         } = self;
 
         // 初始化 nudge 提示词加载器（从 config/prompts/nudges/ 加载）
@@ -263,6 +272,8 @@ impl OrchestratorBuilder {
                 control.rate_limit.window_secs,
             ),
         };
+        let analytics = analytics_config
+            .map(|config| tyclaw_control::UsageAnalytics::new(&workspace, config));
 
         // 启动时清理上次残留的临时目录。
         let workspace_dispatches = workspace.join("dispatches");
@@ -324,6 +335,7 @@ impl OrchestratorBuilder {
             runtime: Box::new(runtime),
             context,
             persistence,
+            analytics,
             pending_files,
             pending_recommends,
             pending_ask_user: parking_lot::Mutex::new(HashMap::new()),
@@ -464,4 +476,3 @@ fn register_orchestration_tools(
     tools.register(Box::new(WebFetchTool::new(None, proxy)));
     info!("Web tools registered (provider={})", ws_config.provider);
 }
-

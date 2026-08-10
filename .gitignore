@@ -8,6 +8,7 @@ target/
 workspace/logs/
 workspace/works/
 workspace/audit/
+workspace/analytics/
 workspace/tmp/
 workspace/.active_tasks.json
 workspace/.dispatch-*

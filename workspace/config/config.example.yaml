@@ -302,6 +302,19 @@ subtasks:
 #     password: "change-me"
 
 # ============================================================================
+# 使用统计（默认开启，单实例 SQLite；统计故障不影响问答）
+# ============================================================================
+# analytics:
+#   enabled: true
+#   timezone: "Asia/Shanghai"
+#   detail_retention_days: 90
+#   aggregate_retention_days: 400
+#   session_timeout_minutes: 30
+#   max_storage_mb: 5120
+#   capture_content_preview: true           # false 时不保存问答摘要
+#   preview_max_chars: 120                  # 脱敏后按 Unicode 字符截断
+
+# ============================================================================
 # 日志
 # ============================================================================
 logging:
