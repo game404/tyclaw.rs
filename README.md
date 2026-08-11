@@ -440,6 +440,10 @@ subtasks:
 workspace:
   key_strategy: "user_id"       # user_id | conversation
   idle_timeout_secs: 1800       # 空闲 30 分钟后回收（0 = 不回收）
+
+# 默认不持久化或在管理台展示审计请求/回答及问答摘要
+privacy:
+  hide_content: true
 ```
 
 **配置优先级**：命令行参数 > 环境变量 > `providers[name]` > `llm` 内联字段 > 默认值
@@ -450,5 +454,7 @@ workspace:
 |------|--------|------|
 | `key_strategy` | `user_id` | `user_id`：按用户隔离（个人助理）；`conversation`：私聊跟人走，群聊跟群走 |
 | `idle_timeout_secs` | `1800` | workspace 空闲超时秒数。超时后自动 consolidate 对话到 memory、清理临时文件、销毁 Docker 容器。设为 0 禁用回收 |
+
+**内容隐私**：`privacy.hide_content` 默认 `true`。开启后，新审计记录和使用统计不再保存请求、回答及问答摘要，管理 API 也会过滤历史记录中的这些字段；已有审计文件和 SQLite 历史数据不会被删除。显式设为 `false` 后恢复既有审计内容行为，问答摘要是否采集继续由 `analytics.capture_content_preview` 控制。修改后需要重启 TyClaw。
 
 `workspace/config/prompts.yaml`：所有 LLM 提示词，中文，修改后重启生效。

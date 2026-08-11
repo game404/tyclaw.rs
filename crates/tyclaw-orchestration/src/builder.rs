@@ -49,6 +49,7 @@ pub struct OrchestratorBuilder {
     pub(crate) path_config: tyclaw_control::PathConfig,
     pub(crate) performance: Option<crate::config::PerformanceConfig>,
     pub(crate) analytics_config: Option<tyclaw_control::AnalyticsConfig>,
+    pub(crate) hide_content: bool,
 }
 
 impl OrchestratorBuilder {
@@ -73,6 +74,7 @@ impl OrchestratorBuilder {
             path_config: tyclaw_control::PathConfig::default(),
             performance: None,
             analytics_config: None,
+            hide_content: false,
         }
     }
 
@@ -220,6 +222,14 @@ impl OrchestratorBuilder {
         self
     }
 
+    /// 隐藏并停止持久化审计与使用统计中的问答内容。
+    ///
+    /// 未调用时保持嵌入式 SDK 的既有采集行为。
+    pub fn with_content_privacy(mut self, hide_content: bool) -> Self {
+        self.hide_content = hide_content;
+        self
+    }
+
     pub fn build(self) -> Orchestrator {
         let Self {
             provider,
@@ -241,6 +251,7 @@ impl OrchestratorBuilder {
             path_config,
             performance,
             analytics_config,
+            hide_content,
         } = self;
 
         // 初始化 nudge 提示词加载器（从 config/prompts/nudges/ 加载）
@@ -277,7 +288,9 @@ impl OrchestratorBuilder {
         let context = ContextBuilder::new(&workspace);
         let persistence = PersistenceLayer {
             workspace_mgr: WorkspaceManager::with_path_config(&workspace, workspace_key_strategy, workspaces_config, path_config),
-            audit: std::sync::Arc::new(AuditLog::new(workspace.join("audit"))),
+            audit: std::sync::Arc::new(
+                AuditLog::new(workspace.join("audit")).with_content_capture(!hide_content),
+            ),
             case_store: CaseStore::new(workspace.join("cases")),
             sessions: SessionManager::new(&workspace),
             skills: SkillManager::new(workspace.join("skills"), workspace.clone()),
@@ -287,8 +300,12 @@ impl OrchestratorBuilder {
                 control.rate_limit.window_secs,
             ),
         };
-        let analytics = analytics_config
-            .map(|config| tyclaw_control::UsageAnalytics::new(&workspace, config));
+        let analytics = analytics_config.map(|config| {
+            tyclaw_control::UsageAnalytics::new(
+                &workspace,
+                apply_content_privacy(config, hide_content),
+            )
+        });
 
         // 启动时清理上次残留的临时目录。
         let workspace_dispatches = workspace.join("dispatches");
@@ -364,6 +381,16 @@ impl OrchestratorBuilder {
             run_locks: parking_lot::Mutex::new(HashMap::new()),
         }
     }
+}
+
+fn apply_content_privacy(
+    mut config: tyclaw_control::AnalyticsConfig,
+    hide_content: bool,
+) -> tyclaw_control::AnalyticsConfig {
+    if hide_content {
+        config.capture_content_preview = false;
+    }
+    config
 }
 
 /// 注册核心文件操作工具集（主 agent 和 sub-agent 共用）。
@@ -547,5 +574,14 @@ mod tests {
         assert!(registry_with_dingtalk(true)
             .get("send_dingtalk_message")
             .is_some());
+    }
+
+    #[test]
+    fn content_privacy_overrides_analytics_preview_capture() {
+        let enabled = apply_content_privacy(tyclaw_control::AnalyticsConfig::default(), true);
+        assert!(!enabled.capture_content_preview);
+
+        let disabled = apply_content_privacy(tyclaw_control::AnalyticsConfig::default(), false);
+        assert!(disabled.capture_content_preview);
     }
 }

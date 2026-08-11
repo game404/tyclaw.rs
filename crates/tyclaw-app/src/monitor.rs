@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tyclaw_control::{AnalyticsQuery, UsageSource, WorkspaceKeyStrategy};
+use tyclaw_control::{AnalyticsQuery, AuditEntry, UsageSource, WorkspaceKeyStrategy};
 use tyclaw_orchestration::Orchestrator;
 
 #[derive(Clone)]
@@ -15,12 +15,14 @@ pub struct MonitorOptions {
     pub bind: String,
     pub port: u16,
     pub basic_auth: Option<(String, String)>,
+    pub hide_content: bool,
 }
 
 pub fn spawn_monitor(orchestrator: Arc<Orchestrator>, options: Option<MonitorOptions>) {
     let Some(opts) = options else { return };
     let addr = format!("{}:{}", opts.bind.trim(), opts.port);
     let basic = opts.basic_auth.clone();
+    let hide_content = opts.hide_content;
     tokio::spawn(async move {
         let listener = match TcpListener::bind(&addr).await {
             Ok(l) => {
@@ -39,6 +41,7 @@ pub fn spawn_monitor(orchestrator: Arc<Orchestrator>, options: Option<MonitorOpt
             };
             let orch = Arc::clone(&orchestrator);
             let basic = basic.clone();
+            let hide_content = hide_content;
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 16384];
                 let n = match stream.read(&mut buf).await {
@@ -78,9 +81,11 @@ pub fn spawn_monitor(orchestrator: Arc<Orchestrator>, options: Option<MonitorOpt
                     ("GET", "/api/stats") => http_response(
                         "200 OK",
                         "application/json; charset=utf-8",
-                        &build_stats_json(&orch),
+                        &build_stats_json(&orch, hide_content),
                     ),
-                    ("GET", "/api/analytics") => build_analytics_response(&orch, raw_query).await,
+                    ("GET", "/api/analytics") => {
+                        build_analytics_response(&orch, raw_query, hide_content).await
+                    }
                     ("GET", "/") => {
                         http_response("200 OK", "text/html; charset=utf-8", &build_html_page())
                     }
@@ -166,7 +171,11 @@ fn ct_eq_str(a: &str, b: &str) -> bool {
     d == 0
 }
 
-async fn build_analytics_response(orch: &Orchestrator, raw_query: &str) -> String {
+async fn build_analytics_response(
+    orch: &Orchestrator,
+    raw_query: &str,
+    hide_content: bool,
+) -> String {
     let Some(analytics) = orch.analytics().cloned() else {
         return http_json_error("503 Service Unavailable", "analytics_not_configured");
     };
@@ -179,7 +188,7 @@ async fn build_analytics_response(orch: &Orchestrator, raw_query: &str) -> Strin
         Err(error) => return http_json_error("400 Bad Request", error),
     };
     match tokio::task::spawn_blocking(move || analytics.query(&query)).await {
-        Ok(Ok(report)) => match serde_json::to_string(&report) {
+        Ok(Ok(report)) => match serialize_analytics_report(&report, hide_content) {
             Ok(body) => http_response("200 OK", "application/json; charset=utf-8", &body),
             Err(_) => http_json_error("500 Internal Server Error", "analytics_encode_failed"),
         },
@@ -189,6 +198,27 @@ async fn build_analytics_response(orch: &Orchestrator, raw_query: &str) -> Strin
         Ok(Err(error)) => http_json_error("500 Internal Server Error", &error),
         Err(_) => http_json_error("500 Internal Server Error", "analytics_query_task_failed"),
     }
+}
+
+fn serialize_analytics_report<T: serde::Serialize>(
+    report: &T,
+    hide_content: bool,
+) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(report)?;
+    if let Some(root) = value.as_object_mut() {
+        root.insert("privacy_mode".into(), serde_json::json!(hide_content));
+        if hide_content {
+            if let Some(recent) = root.get_mut("recent").and_then(|rows| rows.as_array_mut()) {
+                for row in recent {
+                    if let Some(fields) = row.as_object_mut() {
+                        fields.remove("request_preview");
+                        fields.remove("response_preview");
+                    }
+                }
+            }
+        }
+    }
+    serde_json::to_string(&value)
 }
 
 fn parse_analytics_query(
@@ -305,7 +335,7 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn build_stats_json(orch: &Orchestrator) -> String {
+fn build_stats_json(orch: &Orchestrator, hide_content: bool) -> String {
     let active_tasks = {
         let tasks = orch.active_tasks().lock();
         tasks
@@ -325,17 +355,7 @@ fn build_stats_json(orch: &Orchestrator) -> String {
         .audit
         .query(None, None, None, 20)
         .iter()
-        .map(|e| {
-            serde_json::json!({
-                "time": e.timestamp.format("%H:%M:%S").to_string(),
-                "user": e.user_name,
-                "channel": e.channel,
-                "request": truncate(&e.request, 80),
-                "tools": e.tool_calls.len(),
-                "duration": e.total_duration.map(|d| format!("{d:.1}s")),
-                "response": e.final_response.as_deref().map(|r| truncate(r, 100)),
-            })
-        })
+        .map(|e| audit_entry_json(e, hide_content))
         .collect::<Vec<_>>();
     let skills = {
         let metas = orch.persistence().skills.scan_builtin();
@@ -360,11 +380,38 @@ fn build_stats_json(orch: &Orchestrator) -> String {
         "active_tasks": active_tasks,
         "active_task_count": active_tasks.len(),
         "audit_recent": audit_entries,
+        "privacy_mode": hide_content,
         "skills": skills,
         "skill_count": skills.len(),
         "works_stats": works_stats,
     })
     .to_string()
+}
+
+fn audit_entry_json(entry: &AuditEntry, hide_content: bool) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "time": entry.timestamp.format("%H:%M:%S").to_string(),
+        "user": entry.user_name,
+        "channel": entry.channel,
+        "tools": entry.tool_calls.len(),
+        "duration": entry.total_duration.map(|duration| format!("{duration:.1}s")),
+    });
+    if !hide_content {
+        if let Some(fields) = value.as_object_mut() {
+            fields.insert(
+                "request".into(),
+                serde_json::json!(truncate(&entry.request, 80)),
+            );
+            fields.insert(
+                "response".into(),
+                serde_json::json!(entry
+                    .final_response
+                    .as_deref()
+                    .map(|response| truncate(response, 100))),
+            );
+        }
+    }
+    value
 }
 
 fn build_works_stats(orch: &Orchestrator) -> serde_json::Value {
@@ -485,7 +532,9 @@ function renderMetrics(target,items){const root=byId(target);clear(root);items.f
 function empty(target,text='暂无数据'){const root=byId(target);clear(root);root.append(make('div','empty',text))}
 function table(target,headers,rows,wrapColumns=[]){const root=byId(target);clear(root);if(!rows.length){root.append(make('div','empty','暂无数据'));return}const t=make('table');const head=make('thead');const hr=make('tr');headers.forEach(h=>hr.append(make('th','',h)));head.append(hr);const body=make('tbody');rows.forEach(row=>{const tr=make('tr');row.forEach((value,index)=>tr.append(make('td',wrapColumns.includes(index)?'wrap':'',value)));body.append(tr)});t.append(head,body);root.append(t)}
 async function getJson(url){const response=await fetch(url,{headers:{Accept:'application/json'},cache:'no-store'});let body={};try{body=await response.json()}catch(_){}if(!response.ok)throw new Error(body.error||('HTTP '+response.status));return body}
-async function loadOverview(){try{const data=await getJson('/api/stats');byId('instance').textContent=data.model+' | '+data.workspace+' | ctx '+data.context_window;byId('overview-updated').textContent=new Date().toLocaleTimeString('zh-CN');renderMetrics('overview-metrics',[['活跃任务',fmt(data.active_task_count)],['Skill',fmt(data.skill_count)],['工作区',fmt(data.works_stats?.workspaces_total)],['上下文窗口',fmt(data.context_window)]]);table('tasks',['工作区','用户','任务','运行秒数'],(data.active_tasks||[]).map(v=>[v.workspace,v.user_id,v.summary,fmt(v.elapsed_secs)]),[2]);const ws=data.works_stats||{};const workRows=Object.entries(ws.buckets||{});table('works',['类别','数量'],workRows);if(ws.note){byId('works').append(make('div','muted',ws.note))}table('skills',['名称','分类','状态'],(data.skills||[]).map(v=>[v.name,v.category,v.status]),[0]);table('audit',['时间','渠道','请求','工具','耗时'],(data.audit_recent||[]).map(v=>[v.time,v.channel,v.request,fmt(v.tools),v.duration||'']),[2])}catch(error){byId('instance').textContent='运行状态不可用';empty('tasks',error.message)}}
+function renderAudit(data){const rows=data.audit_recent||[];if(data.privacy_mode){table('audit',['时间','渠道','工具','耗时'],rows.map(v=>[v.time,v.channel,fmt(v.tools),v.duration||'']))}else{table('audit',['时间','渠道','请求','工具','耗时'],rows.map(v=>[v.time,v.channel,v.request,fmt(v.tools),v.duration||'']),[2])}}
+function renderRecent(data){const rows=data.recent||[];if(data.privacy_mode){table('recent',['时间','用户','渠道','来源','状态','耗时','工具'],rows.map(v=>[v.started_at,v.user_name||v.masked_user_id,v.channel,v.source,v.status,fmt(v.duration_ms)+' ms',(v.tools||[]).map(t=>t.name).join(', ')]),[6])}else{table('recent',['时间','用户','渠道','来源','状态','问题摘要','回答摘要','耗时','工具'],rows.map(v=>[v.started_at,v.user_name||v.masked_user_id,v.channel,v.source,v.status,v.request_preview,v.response_preview,fmt(v.duration_ms)+' ms',(v.tools||[]).map(t=>t.name).join(', ')]),[5,6,8])}}
+async function loadOverview(){try{const data=await getJson('/api/stats');byId('instance').textContent=data.model+' | '+data.workspace+' | ctx '+data.context_window;byId('overview-updated').textContent=new Date().toLocaleTimeString('zh-CN');renderMetrics('overview-metrics',[['活跃任务',fmt(data.active_task_count)],['Skill',fmt(data.skill_count)],['工作区',fmt(data.works_stats?.workspaces_total)],['上下文窗口',fmt(data.context_window)]]);table('tasks',['工作区','用户','任务','运行秒数'],(data.active_tasks||[]).map(v=>[v.workspace,v.user_id,v.summary,fmt(v.elapsed_secs)]),[2]);const ws=data.works_stats||{};const workRows=Object.entries(ws.buckets||{});table('works',['类别','数量'],workRows);if(ws.note){byId('works').append(make('div','muted',ws.note))}table('skills',['名称','分类','状态'],(data.skills||[]).map(v=>[v.name,v.category,v.status]),[0]);renderAudit(data)}catch(error){byId('instance').textContent='运行状态不可用';empty('tasks',error.message)}}
 document.querySelectorAll('.tab').forEach(button=>button.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(tab=>tab.setAttribute('aria-selected',String(tab===button)));document.querySelectorAll('.view').forEach(view=>view.hidden=view.id!==button.dataset.view);if(button.dataset.view==='analytics')loadAnalytics()}));
 function syncOptions(id,values){const select=byId(id);const current=select.value;while(select.options.length>1)select.remove(1);values.forEach(value=>{const option=make('option','',value);option.value=value;select.append(option)});if(values.includes(current))select.value=current}
 let activeRange='month';
@@ -493,7 +542,7 @@ const rangeButtons=()=>Array.from(document.querySelectorAll('.range-option'));
 function setActiveRange(value){activeRange=value;rangeButtons().forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.range===value)))}
 function analyticsUrl(){const params=new URLSearchParams();if(activeRange){params.set('range',activeRange)}else{['from','to'].forEach(id=>{const value=byId(id).value;if(value)params.set(id,value)})}['workspace','channel','source'].forEach(id=>{const value=byId(id).value;if(value)params.set(id,value)});return '/api/analytics?'+params.toString()}
 let analyticsLoading=false;
-async function loadAnalytics(){if(analyticsLoading)return;analyticsLoading=true;byId('query').disabled=true;rangeButtons().forEach(button=>button.disabled=true);try{const data=await getJson(analyticsUrl());byId('from').value=data.from;byId('to').value=data.to;byId('range').textContent=data.from+' 至 '+data.to+' | 日统计 | '+data.timezone;byId('detail-range').textContent=data.health.earliest_detail_date?'可查询明细始于 '+data.health.earliest_detail_date:'当前范围无明细';syncOptions('workspace',data.filters.workspaces||[]);syncOptions('channel',data.filters.channels||[]);const s=data.summary;renderMetrics('analytics-metrics',[['活跃用户',fmt(s.active_users),'会话 '+fmt(s.sessions)],['请求',fmt(s.requests),'人工 '+fmt(s.interactive_requests)+' | 自动 '+fmt(s.automated_requests)],['问题',fmt(s.questions),'回答率 '+pct(s.answer_rate)],['错误率',pct(s.error_rate),fmt(s.errors)+' 次错误'],['平均耗时',fmt(s.average_duration_ms)+' ms'],['Prompt Token',fmt(s.prompt_tokens)],['Completion Token',fmt(s.completion_tokens)],['工具调用',fmt(s.tool_calls),'成功率 '+pct(s.tool_success_rate)]]);renderHealth(data.health);drawTrend(data.series||[]);table('tool-ranking',['范围','工具','调用','成功','失败','拒绝','平均耗时'],(data.tools||[]).map(v=>[v.scope,v.name,fmt(v.calls),fmt(v.successes),fmt(v.failures),fmt(v.denied),fmt(v.average_duration_ms)+' ms']));table('user-ranking',['用户','标识','请求','会话','问题','回答','错误','工具'],(data.users||[]).map(v=>[v.user_name||'未命名',v.masked_user_id,fmt(v.requests),fmt(v.sessions),fmt(v.questions),fmt(v.answers),fmt(v.errors),fmt(v.tool_calls)]));table('recent',['时间','用户','渠道','来源','状态','问题摘要','回答摘要','耗时','工具'],(data.recent||[]).map(v=>[v.started_at,v.user_name||v.masked_user_id,v.channel,v.source,v.status,v.request_preview,v.response_preview,fmt(v.duration_ms)+' ms',(v.tools||[]).map(t=>t.name).join(', ')]),[5,6,8])}catch(error){const alert=byId('analytics-alert');alert.hidden=false;alert.className='alert';alert.textContent='使用统计不可用：'+error.message;clear(byId('analytics-metrics'));drawTrend([])}finally{analyticsLoading=false;byId('query').disabled=false;rangeButtons().forEach(button=>button.disabled=false)}}
+async function loadAnalytics(){if(analyticsLoading)return;analyticsLoading=true;byId('query').disabled=true;rangeButtons().forEach(button=>button.disabled=true);try{const data=await getJson(analyticsUrl());byId('from').value=data.from;byId('to').value=data.to;byId('range').textContent=data.from+' 至 '+data.to+' | 日统计 | '+data.timezone;byId('detail-range').textContent=data.health.earliest_detail_date?'可查询明细始于 '+data.health.earliest_detail_date:'当前范围无明细';syncOptions('workspace',data.filters.workspaces||[]);syncOptions('channel',data.filters.channels||[]);const s=data.summary;renderMetrics('analytics-metrics',[['活跃用户',fmt(s.active_users),'会话 '+fmt(s.sessions)],['请求',fmt(s.requests),'人工 '+fmt(s.interactive_requests)+' | 自动 '+fmt(s.automated_requests)],['问题',fmt(s.questions),'回答率 '+pct(s.answer_rate)],['错误率',pct(s.error_rate),fmt(s.errors)+' 次错误'],['平均耗时',fmt(s.average_duration_ms)+' ms'],['Prompt Token',fmt(s.prompt_tokens)],['Completion Token',fmt(s.completion_tokens)],['工具调用',fmt(s.tool_calls),'成功率 '+pct(s.tool_success_rate)]]);renderHealth(data.health);drawTrend(data.series||[]);table('tool-ranking',['范围','工具','调用','成功','失败','拒绝','平均耗时'],(data.tools||[]).map(v=>[v.scope,v.name,fmt(v.calls),fmt(v.successes),fmt(v.failures),fmt(v.denied),fmt(v.average_duration_ms)+' ms']));table('user-ranking',['用户','标识','请求','会话','问题','回答','错误','工具'],(data.users||[]).map(v=>[v.user_name||'未命名',v.masked_user_id,fmt(v.requests),fmt(v.sessions),fmt(v.questions),fmt(v.answers),fmt(v.errors),fmt(v.tool_calls)]));renderRecent(data)}catch(error){const alert=byId('analytics-alert');alert.hidden=false;alert.className='alert';alert.textContent='使用统计不可用：'+error.message;clear(byId('analytics-metrics'));drawTrend([])}finally{analyticsLoading=false;byId('query').disabled=false;rangeButtons().forEach(button=>button.disabled=false)}}
 function renderHealth(health){const alert=byId('analytics-alert');const issues=[];if(!health.available)issues.push('数据库不可用');if(health.dropped_events)issues.push('队列丢弃 '+fmt(health.dropped_events)+' 条事件');if(health.storage_warning)issues.push('数据库已达到容量告警线');if(health.detail_evictions)issues.push('已提前淘汰 '+fmt(health.detail_evictions)+' 条明细');if(health.last_error)issues.push('最近错误 '+health.last_error);alert.hidden=false;alert.className=issues.length?'alert':'alert ok';alert.textContent=issues.length?issues.join('；'):'统计服务正常 | 数据库 '+fmt(health.database_bytes)+' bytes'}
 function drawTrend(series){const canvas=byId('trend');const rect=canvas.getBoundingClientRect();const ratio=window.devicePixelRatio||1;canvas.width=Math.max(1,Math.floor(rect.width*ratio));canvas.height=Math.max(1,Math.floor(rect.height*ratio));const ctx=canvas.getContext('2d');ctx.scale(ratio,ratio);const width=rect.width,height=rect.height;ctx.clearRect(0,0,width,height);const pad={l:44,r:16,t:18,b:35};const chartW=width-pad.l-pad.r,chartH=height-pad.t-pad.b;if(!series.length){ctx.fillStyle='#697069';ctx.font='12px system-ui';ctx.textAlign='center';ctx.fillText('暂无趋势数据',width/2,height/2);return}const keys=[['requests','#16784b'],['active_users','#c84f35'],['tool_calls','#9a6a00']];const max=Math.max(1,...series.flatMap(point=>keys.map(([key])=>Number(point[key]||0))));ctx.strokeStyle='#e4e7e1';ctx.fillStyle='#697069';ctx.font='10px system-ui';ctx.textAlign='right';for(let i=0;i<=4;i++){const y=pad.t+chartH*i/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(width-pad.r,y);ctx.stroke();const label=max<4?(max*(4-i)/4).toFixed(1):String(Math.round(max*(4-i)/4));ctx.fillText(label,pad.l-7,y+3)}keys.forEach(([key,color])=>{const points=series.map((point,index)=>({x:pad.l+(series.length===1?chartW/2:chartW*index/(series.length-1)),y:pad.t+chartH*(1-Number(point[key]||0)/max)}));ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=2;ctx.beginPath();points.forEach((point,index)=>index?ctx.lineTo(point.x,point.y):ctx.moveTo(point.x,point.y));ctx.stroke();points.forEach(point=>{ctx.beginPath();ctx.arc(point.x,point.y,3,0,Math.PI*2);ctx.fill()})});ctx.fillStyle='#697069';ctx.textAlign='center';const step=Math.max(1,Math.ceil(series.length/6));series.forEach((point,index)=>{if(index%step===0||index===series.length-1){const x=pad.l+(series.length===1?chartW/2:chartW*index/(series.length-1));ctx.fillText(point.period_start.slice(5),x,height-10)}})}
 rangeButtons().forEach(button=>button.addEventListener('click',()=>{setActiveRange(button.dataset.range);byId('from').value='';byId('to').value='';loadAnalytics()}));['from','to'].forEach(id=>byId(id).addEventListener('change',()=>setActiveRange(null)));byId('filters').addEventListener('submit',event=>{event.preventDefault();loadAnalytics()});window.addEventListener('resize',()=>{if(!byId('analytics').hidden)loadAnalytics()});loadOverview();setInterval(loadOverview,10000);
@@ -540,6 +589,84 @@ mod tests {
             "admin",
             "wrong"
         ));
+    }
+
+    fn audit_fixture() -> AuditEntry {
+        AuditEntry {
+            timestamp: chrono::Utc::now(),
+            workspace_key: "workspace".into(),
+            session_id: "session".into(),
+            user_id: "user".into(),
+            user_name: "name".into(),
+            channel: "cli".into(),
+            request: "historical-request-secret".into(),
+            tool_calls: vec![serde_json::json!({ "name": "read_file" })],
+            skills_used: Vec::new(),
+            final_response: Some("historical-response-secret".into()),
+            total_duration: Some(1.25),
+            token_usage: None,
+        }
+    }
+
+    #[test]
+    fn audit_api_removes_historical_content_in_privacy_mode() {
+        let hidden = audit_entry_json(&audit_fixture(), true);
+        assert!(hidden.get("request").is_none());
+        assert!(hidden.get("response").is_none());
+        assert_eq!(
+            hidden.get("tools").and_then(|value| value.as_u64()),
+            Some(1)
+        );
+
+        let visible = audit_entry_json(&audit_fixture(), false);
+        assert_eq!(
+            visible.get("request").and_then(|value| value.as_str()),
+            Some("historical-request-secret")
+        );
+        assert_eq!(
+            visible.get("response").and_then(|value| value.as_str()),
+            Some("historical-response-secret")
+        );
+    }
+
+    #[test]
+    fn analytics_api_removes_historical_previews_in_privacy_mode() {
+        let fixture = serde_json::json!({
+            "summary": { "requests": 1 },
+            "recent": [{
+                "status": "success",
+                "request_preview": "historical-question-secret",
+                "response_preview": "historical-answer-secret"
+            }]
+        });
+        let hidden: serde_json::Value =
+            serde_json::from_str(&serialize_analytics_report(&fixture, true).unwrap()).unwrap();
+        assert_eq!(
+            hidden.get("privacy_mode").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        let hidden_row = &hidden["recent"][0];
+        assert!(hidden_row.get("request_preview").is_none());
+        assert!(hidden_row.get("response_preview").is_none());
+        assert_eq!(
+            hidden_row.get("status").and_then(|value| value.as_str()),
+            Some("success")
+        );
+
+        let visible: serde_json::Value =
+            serde_json::from_str(&serialize_analytics_report(&fixture, false).unwrap()).unwrap();
+        assert_eq!(
+            visible["recent"][0]
+                .get("request_preview")
+                .and_then(|value| value.as_str()),
+            Some("historical-question-secret")
+        );
+        assert_eq!(
+            visible
+                .get("privacy_mode")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
     }
 
     #[test]
@@ -604,6 +731,8 @@ mod tests {
         assert!(page.contains("本日"));
         assert!(page.contains("本周"));
         assert!(page.contains("本月"));
+        assert!(page.contains("if(data.privacy_mode){table('audit',['时间','渠道','工具','耗时']"));
+        assert!(page.contains("if(data.privacy_mode){table('recent',['时间','用户','渠道','来源','状态','耗时','工具']"));
         assert!(!page.contains("时间粒度"));
         assert!(page.contains("textContent"));
         assert!(!page.contains("innerHTML"));

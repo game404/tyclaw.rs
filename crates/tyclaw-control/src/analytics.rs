@@ -620,6 +620,7 @@ impl UsageAnalytics {
     pub fn finish_request(&self, request: &UsageRequest, mut finish: UsageFinish) {
         finish.error_kind = finish.error_kind.map(|value| truncate_chars(&value, 64));
         let response_preview = self.preview(&finish.response);
+        finish.response.clear();
         self.try_send(WriterMessage::Finish(FinishRecord {
             request_id: request.request_id.clone(),
             finished_at_ms: Utc::now().timestamp_millis(),
@@ -1797,6 +1798,65 @@ mod tests {
         assert_eq!(report.summary.tool_calls, 1);
         assert_eq!(report.recent.len(), 1);
         assert!(!report.recent[0].request_preview.contains("foo@example.com"));
+    }
+
+    #[test]
+    fn disabled_content_preview_persists_only_usage_metadata() {
+        let temp = TempDir::new().unwrap();
+        let analytics = UsageAnalytics::new(
+            temp.path(),
+            AnalyticsConfig {
+                capture_content_preview: false,
+                ..test_config()
+            },
+        );
+        let request = analytics.begin_request(
+            UsageSource::Interactive,
+            InteractionKind::Question,
+            "staff-private",
+            "测试用户",
+            "ws",
+            "cli",
+            "direct",
+            "analytics-request-secret",
+        );
+        analytics.finish_request(
+            &request,
+            UsageFinish {
+                response: "analytics-response-secret".into(),
+                has_response: true,
+                duration_ms: 25,
+                prompt_tokens: 10,
+                completion_tokens: 4,
+                ..UsageFinish::default()
+            },
+        );
+        wait_for_writer();
+
+        let connection = Connection::open(&analytics.inner.db_path).unwrap();
+        let previews: (String, String) = connection
+            .query_row(
+                "SELECT request_preview, response_preview FROM usage_requests LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(previews, (String::new(), String::new()));
+
+        let today = analytics.today();
+        let report = analytics
+            .query(&AnalyticsQuery {
+                from: today,
+                to: today,
+                workspace: None,
+                channel: None,
+                source: None,
+            })
+            .unwrap();
+        assert_eq!(report.summary.requests, 1);
+        assert_eq!(report.summary.answers, 1);
+        assert_eq!(report.summary.prompt_tokens, 10);
+        assert_eq!(report.summary.completion_tokens, 4);
     }
 
     #[test]
