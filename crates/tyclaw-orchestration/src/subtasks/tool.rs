@@ -408,6 +408,10 @@ impl Tool for DispatchSubtasksTool {
                 .executor()
                 .execute(&plan.nodes[0], &[], &dispatch_dir, main_context.as_deref())
                 .await;
+            crate::usage::collect_tool_events(
+                &format!("sub:{}", record.node_id),
+                &record.tool_events,
+            );
             let status_str = format!("{:?}", record.status);
             let output = record.output.clone().unwrap_or_default();
             let error = record.error.clone();
@@ -482,6 +486,12 @@ impl Tool for DispatchSubtasksTool {
             .scheduler
             .execute(&plan, &dispatch_dir, main_context.as_deref())
             .await;
+        for record in &records {
+            crate::usage::collect_tool_events(
+                &format!("sub:{}", record.node_id),
+                &record.tool_events,
+            );
+        }
 
         // 归并
         let report = self.reducer.reduce(&records).await;

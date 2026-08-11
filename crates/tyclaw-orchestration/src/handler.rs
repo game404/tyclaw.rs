@@ -10,6 +10,7 @@ use tyclaw_agent::runtime::{OnProgress, ProgressEvent};
 use tyclaw_agent::{RuntimeResult, RuntimeStatus};
 use tyclaw_control::{
     warn_max_iterations_reset, AuditEntry, AuditLog, FailureAuditEntry, FailureCode,
+    InteractionKind, UsageFinish, UsageSource, UsageStatus,
 };
 use tyclaw_memory::{extract_case, CaseRetriever};
 use tyclaw_prompt::{strip_non_task_user_message, PromptInputs, SkillContent};
@@ -133,6 +134,104 @@ impl Orchestrator {
         req: &RequestContext,
         on_progress: Option<&OnProgress>,
     ) -> Result<AgentResponse, TyclawError> {
+        self.handle_with_source(user_message, req, on_progress, UsageSource::Interactive)
+            .await
+    }
+
+    /// MessageBus 内部入口，用已有消息元数据区分人工请求与 Timer 自动任务。
+    pub(crate) async fn handle_with_source(
+        &self,
+        user_message: &str,
+        req: &RequestContext,
+        on_progress: Option<&OnProgress>,
+        source: UsageSource,
+    ) -> Result<AgentResponse, TyclawError> {
+        let Some(analytics) = self.analytics.as_ref() else {
+            return self
+                .handle_with_context_inner(user_message, req, on_progress)
+                .await;
+        };
+
+        let identity = tyclaw_control::RequestIdentity {
+            user_id: &req.user_id,
+            channel: &req.channel,
+            chat_id: &req.chat_id,
+            conversation_id: req.conversation_id.as_deref(),
+        };
+        let workspace_key = self.persistence.workspace_mgr.resolve_key(&identity);
+        let conversation_key = crate::orchestrator::conversation_key(
+            &workspace_key,
+            &req.channel,
+            &req.chat_id,
+        );
+        let interaction_kind = if self.persistence.sessions.busy_elapsed(&workspace_key).is_some()
+            && self.active_conversation_matches(&workspace_key, &conversation_key)
+        {
+            InteractionKind::Injected
+        } else if self.pending_ask_user.lock().contains_key(&conversation_key) {
+            InteractionKind::Resume
+        } else if user_message.trim_start().starts_with('/') {
+            InteractionKind::Command
+        } else {
+            InteractionKind::Question
+        };
+        let usage_request = analytics.begin_request(
+            source,
+            interaction_kind,
+            &req.user_id,
+            &req.user_name,
+            &workspace_key,
+            &req.channel,
+            &req.chat_id,
+            user_message,
+        );
+        let started = Instant::now();
+        let (result, tools) = crate::usage::collect_request_tools(
+            self.handle_with_context_inner(user_message, req, on_progress),
+        )
+        .await;
+
+        let finish = match &result {
+            Ok(response) => {
+                let status = match interaction_kind {
+                    InteractionKind::Injected => UsageStatus::Injected,
+                    InteractionKind::Command => UsageStatus::Command,
+                    _ if self.pending_ask_user.lock().contains_key(&conversation_key) => {
+                        UsageStatus::NeedsInput
+                    }
+                    _ => UsageStatus::Completed,
+                };
+                UsageFinish {
+                    status,
+                    interaction_kind,
+                    response: response.text.clone(),
+                    has_response: !response.text.is_empty(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    prompt_tokens: response.prompt_tokens,
+                    completion_tokens: response.completion_tokens,
+                    tools,
+                    error_kind: None,
+                }
+            }
+            Err(_) => UsageFinish {
+                status: UsageStatus::Error,
+                interaction_kind,
+                duration_ms: started.elapsed().as_millis() as u64,
+                tools,
+                error_kind: Some("request_failed".into()),
+                ..UsageFinish::default()
+            },
+        };
+        analytics.finish_request(&usage_request, finish);
+        result
+    }
+
+    async fn handle_with_context_inner(
+        &self,
+        user_message: &str,
+        req: &RequestContext,
+        on_progress: Option<&OnProgress>,
+    ) -> Result<AgentResponse, TyclawError> {
         let start = Instant::now();
         let user_id = req.user_id.as_str();
         let user_name = req.user_name.as_str();
@@ -222,6 +321,7 @@ impl Orchestrator {
                 .runtime
                 .run(saved_messages, &user_role, Some(&cache_scope), on_progress)
                 .await?;
+            crate::usage::collect_tool_events("main", &result.tool_events);
 
             // 检查是否又暂停了
             if let RuntimeStatus::NeedsInput {
@@ -983,6 +1083,7 @@ impl Orchestrator {
                 )
                 .await?
         };
+        crate::usage::collect_tool_events("main", &result.tool_events);
         // 任务结束（正常返回、错误、取消）都清理取消令牌。
         self.clear_cancellation(&ctx.conversation_key);
 
@@ -1721,5 +1822,87 @@ mod fresh_turn_gates_tests {
                 "active window must not start with an orphan tool_result"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod analytics_lifecycle_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use crate::OrchestratorBuilder;
+    use tyclaw_control::{AnalyticsConfig, AnalyticsQuery};
+    use tyclaw_provider::types::{ChatRequest, LLMResponse};
+    use tyclaw_provider::LLMProvider;
+
+    struct UnusedProvider;
+
+    fn prepare_workspace(path: &std::path::Path) {
+        let config_dir = path.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("prompts.yaml"),
+            "memory_consolidation_prompt: |\n  Summarize the conversation.\n",
+        )
+        .unwrap();
+    }
+
+    #[async_trait]
+    impl LLMProvider for UnusedProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<LLMResponse, TyclawError> {
+            panic!("slash command must not call the provider")
+        }
+
+        fn default_model(&self) -> &str {
+            "unused"
+        }
+    }
+
+    #[tokio::test]
+    async fn command_lifecycle_is_recorded_without_affecting_response() {
+        let temp = tempfile::TempDir::new().unwrap();
+        prepare_workspace(temp.path());
+        let orchestrator = OrchestratorBuilder::new(Arc::new(UnusedProvider), temp.path())
+            .enable_memory(false)
+            .with_analytics(AnalyticsConfig {
+                capture_content_preview: false,
+                max_storage_mb: 64,
+                ..AnalyticsConfig::default()
+            })
+            .build();
+        let response = orchestrator
+            .handle_with_context(
+                "/new",
+                &RequestContext::new("user", "default", "cli", "direct"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text, "New session started.");
+
+        tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+        let analytics = orchestrator.analytics().unwrap();
+        let today = analytics.today();
+        let report = analytics
+            .query(&AnalyticsQuery {
+                from: today,
+                to: today,
+                workspace: None,
+                channel: None,
+                source: None,
+            })
+            .unwrap();
+        assert_eq!(report.summary.requests, 1);
+        assert_eq!(report.summary.questions, 0);
+        assert_eq!(report.recent[0].status, "command");
+        assert!(report.recent[0].request_preview.is_empty());
+    }
+
+    #[test]
+    fn sdk_builder_does_not_enable_analytics_implicitly() {
+        let temp = tempfile::TempDir::new().unwrap();
+        prepare_workspace(temp.path());
+        let orchestrator = OrchestratorBuilder::new(Arc::new(UnusedProvider), temp.path()).build();
+        assert!(orchestrator.analytics().is_none());
+        assert!(!temp.path().join("analytics").exists());
     }
 }

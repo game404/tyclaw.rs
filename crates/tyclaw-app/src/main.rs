@@ -37,6 +37,8 @@ struct AppConfig {
     dingtalk: DingTalkConfig,
     #[serde(default)]
     monitor: MonitorConfig,
+    #[serde(default)]
+    analytics: tyclaw_control::AnalyticsConfig,
 }
 
 /// 监控 HTTP 服务配置。
@@ -131,6 +133,7 @@ fn format_effective_config(
     workspaces: &HashMap<String, WorkspaceConfig>,
     subtasks: &SubtasksConfig,
     monitor: &MonitorConfig,
+    analytics: &tyclaw_control::AnalyticsConfig,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     macro_rules! p {
@@ -176,6 +179,14 @@ fn format_effective_config(
     p!("monitor.bind: {}", monitor.bind);
     p!("monitor.port: {}", monitor.port);
     p!("monitor.basic_auth: {}", if monitor.basic_auth.is_some() { "configured" } else { "<none>" });
+    p!("analytics.enabled: {}", analytics.enabled);
+    p!("analytics.timezone: {}", analytics.timezone);
+    p!("analytics.detail_retention_days: {}", analytics.detail_retention_days);
+    p!("analytics.aggregate_retention_days: {}", analytics.aggregate_retention_days);
+    p!("analytics.session_timeout_minutes: {}", analytics.session_timeout_minutes);
+    p!("analytics.max_storage_mb: {}", analytics.max_storage_mb);
+    p!("analytics.capture_content_preview: {}", analytics.capture_content_preview);
+    p!("analytics.preview_max_chars: {}", analytics.preview_max_chars);
     p!("===============================");
     lines
 }
@@ -398,6 +409,7 @@ async fn main() {
         &cfg.workspaces,
         &cfg.subtasks,
         &app_cfg.monitor,
+        &app_cfg.analytics,
     );
 
     info!(
@@ -440,6 +452,7 @@ async fn main() {
         control_config: cfg.control,
         workspace_config: cfg.workspace,
         performance: cfg.performance,
+        analytics: app_cfg.analytics,
         startup_lines: config_lines,
     };
 
@@ -542,6 +555,7 @@ struct RunConfig {
     workspace_config: tyclaw_orchestration::WorkspaceRuntimeConfig,
     /// 统一性能治理配置（污染过滤 / 会话规模 / 截断 / 并发 / 超时 等）。
     performance: tyclaw_orchestration::PerformanceConfig,
+    analytics: tyclaw_control::AnalyticsConfig,
     /// 启动时的配置摘要（在 CLI 滚动区显示）
     startup_lines: Vec<String>,
 }
@@ -568,6 +582,7 @@ impl RunConfig {
             .with_email(self.email_config)
             .with_control(self.control_config)
             .with_performance(self.performance)
+            .with_analytics(self.analytics)
             .with_timer(timer_svc);
         if let Some((config, token_manager, robot_code)) = dingtalk_outbound {
             builder = builder.with_dingtalk_outbound(config, token_manager, robot_code);
