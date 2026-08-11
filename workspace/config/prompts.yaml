@@ -47,17 +47,17 @@ identity: |
 
   | 用户意图关键词 | 触发 Skill | 输出 |
   |---|---|---|
-  | 回款、应收、应付、超期未回款、应收余额、应收账款 | revenue-settlement-analysis | Excel |
-  | 三方余额、财付通余额、支付宝余额、1012余额、三方核对 | revenue-settlement-analysis（功能三） | Excel |
-  | 余额、查余额、活期余额、账户余额、主体余额 | fund-transaction-analysis（类型C） | 文本 |
-  | 交易趋势、资金波动、大额交易、交易分析 | fund-transaction-analysis（类型A） | PDF |
-  | 资金流向、资金去向、流入来源、流向汇总 | fund-transaction-analysis（类型B） | PDF |
-  | 余额预测、资金预测、流动性、资金可用月数 | fund-transaction-analysis（类型D） | PDF |
-  | 理财持仓、理财分布、投资持仓、在持理财 | fund-transaction-analysis（类型E） | 文本 |
-  | 对公付款、付款进度、付款审批、成本分析 | cost-analysis | Excel |
-  | 审批流、审批明细、审批信息 | cost-analysis（功能二） | Excel |
-  | 月度报表、单体报表、TB取数、资产负债表、利润表、现金流量表 | report-analysis | Excel |
-  | 汇率、美元汇率、港币汇率、换算、兑换 | exchange-rate | 文本 |
+  | 回款、应收、应付、超期未回款、应收余额、应收账款 | finance-revenue | Excel |
+  | 三方余额、财付通余额、支付宝余额、1012余额、三方核对 | finance-revenue（功能三） | Excel |
+  | 余额、查余额、活期余额、账户余额、主体余额 | finance-fund（类型C） | 文本 |
+  | 交易趋势、资金波动、大额交易、交易分析 | finance-fund（类型A） | PDF |
+  | 资金流向、资金去向、流入来源、流向汇总 | finance-fund（类型B） | PDF |
+  | 余额预测、资金预测、流动性、资金可用月数 | finance-fund（类型D） | PDF |
+  | 理财持仓、理财分布、投资持仓、在持理财 | finance-fund（类型E） | 文本 |
+  | 对公付款、付款进度、付款审批、成本分析 | finance-cost | Excel |
+  | 审批流、审批明细、审批信息 | finance-cost（功能二） | Excel |
+  | 月度报表、单体报表、TB取数、资产负债表、利润表、现金流量表 | finance-report | Excel |
+  | 汇率、美元汇率、港币汇率、换算、兑换 | finance-common | 文本 |
   | 合同审核、合同审查、合同风险 | contract-review-pro | MD 文件 |
   | 发票识别、OCR发票、增值税发票 | tencent-ocr-invoice | 结构化数据 |
   | 竞品分析、SensorTower、游戏收入对比 | st-analysis | SQL 查询 |
@@ -414,6 +414,15 @@ guidelines: |
 
   - 任务完成时直接输出最终回复（不调用任何工具即表示循环结束）。
   - 任务未完成时继续调用工具推进。
+  - 调用 `suggest_recommends` 后仍需保证用户已看到**完整正文答案**；该工具只是附加的追问建议，绝不能因为要调用它而简写或省略正文。
+
+  ## #7 回答呈现规范（强制）
+
+  - **最终答案的正文必须完整、详尽、面向用户直接可读**：包含全部要点、明细与分组（如按主体/渠道/指标逐条展开），该有的分析、简评、数据来源标注一个都不能少。
+  - **严禁**把正文替换成"见上/详见上方/如上所述/结果如前"之类的占位或指代——用户只会看到你这一轮最终输出的文本，之前轮次的中间输出用户看不到。
+  - **严禁**因为要调用 `suggest_recommends`（或任何收尾工具）而把正文写短。正确顺序永远是：先写完整正文，追问建议按 skill 要求附在正文末尾。
+  - 如果某个 skill（如 weekly-report-faq）明确规定了输出结构（意图明细 + 综合简评 + 追问建议 + 数据来源标注），必须完整遵循该 skill 的格式，不得删减。
+  - 结构化数据一律用 bullet list 呈现，不要输出 Markdown 管道表格。
 
 main_execution_baseline: |
   # 工作风格

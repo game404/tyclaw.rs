@@ -147,6 +147,8 @@ workspace:
 # 例如：--run-dir workspace --works-dir /data/works
 #   → host: /data/works/d8/0307663902380/ 挂载到容器 /workspace/
 #   → skills_dir: "skills" → host: .../0307663902380/skills/ → 容器: /workspace/skills/
+#   → 主动钉钉收件人配置仍位于该用户 workspace 根目录：
+#     /data/works/d8/0307663902380/.config/ty.config.toml
 #
 # 因为 per-user workspace 根目录通过 volume mount 映射，host 和容器内的相对路径完全一致。
 # 所以以下配置不区分 host 还是容器——写一份相对路径，两边通用。
@@ -183,6 +185,18 @@ workspace:
 #
 #   # Gateway 模式（可选）：通过 dingtalk-gateway 中转，不配则直连钉钉 Stream API。
 #   # gateway_url: "ws://gateway-host:9100"
+#
+#   # 主动发送 Markdown 单聊消息（默认关闭，不影响机器人正常回复）。
+#   # 收件人只从 ty.config.toml 的白名单配置节读取，Tool 参数不能临时覆盖。
+#   # outbound:
+#   #   enabled: false
+#   #   recipient_sections:
+#   #     - "finance-fund-daily-dingtalk"
+#   #   max_recipients: 20
+#   #   max_markdown_bytes: 20000
+#   #   timeout_secs: 15
+#   #   idempotency_ttl_secs: 600
+#   #   per_user_cooldown_secs: 60
 #
 #   # Workspace 路由：按会话 ID 路由到不同的 workspace。
 #   # 不配则所有会话使用 workspace.key_strategy 的默认策略。
@@ -289,6 +303,16 @@ subtasks:
 #     window_secs: 60
 #   audit:
 #     enabled: true
+
+# ============================================================================
+# 性能治理（可选）
+# 记忆合并是辅助流程，超时后会保存恢复副本并继续处理用户请求。
+# ============================================================================
+# performance:
+#   consolidation:
+#     max_messages_per_batch: 500
+#     max_rounds: 5
+#     timeout_secs: 30              # 总超时，运行时限制在 1-60 秒
 
 # ============================================================================
 # 监控 HTTP 服务（可选）

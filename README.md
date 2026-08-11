@@ -40,6 +40,7 @@
 - **内置监控面板** — 轻量 HTTP 监控页面（`127.0.0.1:9394`），实时查看活跃任务、Skills、审计日志，自动刷新
 - **ask_user 交互** — Agent 可在执行过程中暂停向用户提问，等待回复后从暂停处恢复；用户空回车则使用默认行为继续
 - **Skill创建管理** — 支持企业 Skill 统一管理，用户可灵活自定义 Skill，方便企业组织能力沉淀
+- **钉钉主动通知** — 可通过 Skill 向配置白名单中的一批用户发送 Markdown 单聊消息，与机器人正常回复共用 Token 缓存
 - **单二进制部署** — 小巧的单二进制可执行文件部署，还附带钉钉网关和独立 agent 命令行工具，符合企业业务场景
 
 ## 核心设计
@@ -161,7 +162,7 @@ tyclaw-types          基础类型、错误、token 估算
 tyclaw-tool-abi       工具 trait 定义（Tool / Sandbox / SandboxPool）
 tyclaw-provider       LLM 适配层（OpenAI 兼容 API + prompt cache）
 tyclaw-prompt         上下文构建 + prompts.yaml 加载
-tyclaw-tools          内置工具（文件/搜索/exec/定时器/web）
+tyclaw-tools          内置工具（文件/搜索/exec/定时器/web/邮件/钉钉主动消息）
 tyclaw-control        RBAC / 审计 / 限流 / WorkspaceManager
 tyclaw-memory         案例库 / 记忆存储 / consolidator / 检索
 tyclaw-sandbox        Docker 沙箱（per-workspace 容器池）

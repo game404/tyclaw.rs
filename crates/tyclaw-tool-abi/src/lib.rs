@@ -113,6 +113,21 @@ pub trait Sandbox: Send + Sync {
     async fn exec(&self, cmd: &str, timeout: Duration) -> Result<SandboxExecResult, TyclawError>;
     async fn stat(&self, path: &str) -> Result<SandboxFileStat, TyclawError>;
     async fn read_file(&self, path: &str) -> Result<Vec<u8>, TyclawError>;
+    /// 安全读取当前 workspace 工作目录内的文件。
+    ///
+    /// `path` 必须是相对于 [`Sandbox::workspace_root`] 的路径，实现必须在跟随
+    /// 符号链接后确认目标仍位于该目录，并在读取前执行大小限制。默认失败关闭，
+    /// 避免未适配的沙箱实现退化为不受控读取。
+    async fn read_workspace_file(
+        &self,
+        _path: &str,
+        _max_bytes: usize,
+    ) -> Result<Vec<u8>, TyclawError> {
+        Err(TyclawError::Tool {
+            tool: "sandbox_read_workspace".into(),
+            message: "Secure workspace file reads are not supported by this sandbox".into(),
+        })
+    }
     async fn write_file(&self, path: &str, content: &[u8]) -> Result<(), TyclawError>;
     async fn create_dir(&self, path: &str) -> Result<(), TyclawError>;
     async fn list_dir(&self, path: &str) -> Result<Vec<SandboxDirEntry>, TyclawError>;

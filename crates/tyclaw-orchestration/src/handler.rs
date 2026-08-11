@@ -3,7 +3,7 @@
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn, Level};
 
 use tyclaw_agent::runtime::{OnProgress, ProgressEvent};
@@ -61,6 +61,46 @@ struct HandlerContext<'a> {
     /// 忙碌归属、注入判定、取消令牌、ask_user 暂停状态。
     conversation_key: String,
     on_progress: Option<&'a OnProgress>,
+}
+
+/// 在用户请求允许的时间内归档活动历史；失败时先写恢复文件，避免清空会话造成静默丢失。
+async fn archive_or_dump_unconsolidated(
+    consolidator: &tyclaw_memory::MemoryConsolidator,
+    messages: &[HashMap<String, Value>],
+    last_consolidated: usize,
+    workspace_key: &str,
+    provider: &dyn tyclaw_provider::LLMProvider,
+    model: &str,
+    timeout_secs: u64,
+) -> bool {
+    let start = last_consolidated.min(messages.len());
+    let pending = &messages[start..];
+    if pending.is_empty() {
+        return true;
+    }
+
+    match tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        consolidator.archive_unconsolidated(messages, start, provider, model),
+    )
+    .await
+    {
+        Ok(true) => return true,
+        Ok(false) => warn!(
+            pending_messages = pending.len(),
+            "Memory archive failed; writing recovery dump"
+        ),
+        Err(_) => warn!(
+            pending_messages = pending.len(),
+            timeout_secs,
+            "Memory archive timed out; writing recovery dump"
+        ),
+    }
+
+    consolidator
+        .store
+        .dump_unrecoverable(workspace_key, pending)
+        .is_some()
 }
 
 impl Orchestrator {
@@ -517,15 +557,31 @@ impl Orchestrator {
             let last_consolidated = session.last_consolidated;
             if self.app.features.enable_memory {
                 let mem_dir = self.persistence.workspace_mgr.memory_dir(&ctx.workspace_key);
-                let consolidator = tyclaw_memory::MemoryConsolidator::new(&mem_dir, self.app.context_window_tokens);
-                consolidator
-                    .archive_unconsolidated(
-                        &messages,
-                        last_consolidated,
-                        self.provider.as_ref(),
-                        &self.app.model,
-                    )
-                    .await;
+                let consolidator = tyclaw_memory::MemoryConsolidator::new(
+                    &mem_dir,
+                    self.app.context_window_tokens,
+                );
+                let safe_to_clear = archive_or_dump_unconsolidated(
+                    &consolidator,
+                    &messages,
+                    last_consolidated,
+                    &ctx.workspace_key,
+                    self.provider.as_ref(),
+                    &self.app.model,
+                    self.app.performance.consolidation.timeout_secs,
+                )
+                .await;
+                if !safe_to_clear {
+                    return Ok(Some(AgentResponse {
+                        text: "记忆整理失败且无法写入恢复文件，会话未清空。请检查 workspace 写入权限后重试。".into(),
+                        tools_used: Vec::new(),
+                        duration_seconds: ctx.start.elapsed().as_secs_f64(),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        output_files: Vec::new(),
+                        recommends: Vec::new(),
+                    }));
+                }
             }
             let mut session = self.persistence.sessions.get_or_create_clone(&ctx.workspace_key);
             session.clear();
@@ -895,6 +951,7 @@ impl Orchestrator {
         let channel_owned = ctx.channel.to_string();
         let chat_id_owned = ctx.chat_id.to_string();
         let user_id_owned = ctx.user_id.to_string();
+        let user_name_owned = ctx.user_name.to_string();
         // 供 provider 并发控制器申请 per-user 许可（R6.2/R6.5）。与 TIMER 用途不同、
         // 消费者也不同（provider crate 的 task-local），故单独克隆一份。
         let user_id_for_provider = ctx.user_id.to_string();
@@ -951,64 +1008,78 @@ impl Orchestrator {
             tyclaw_agent::runtime::CANCEL_TOKEN
                 .scope(
                     cancel_token.clone(),
-            tyclaw_tools::CURRENT_USER_ROLE
-                .scope(
-                    user_role_owned,
-                    tyclaw_tools::CURRENT_REQUEST_ID.scope(
-                        request_id,
-                        tyclaw_tools::timer::TIMER_CURRENT_CHANNEL.scope(
-                            channel_owned,
-                            tyclaw_tools::timer::TIMER_CURRENT_CHAT_ID.scope(
-                                chat_id_owned,
-                                tyclaw_tools::timer::TIMER_CURRENT_USER_ID.scope(
-                                    user_id_owned,
-                                    tyclaw_tools::timer::TIMER_CURRENT_CONVERSATION_ID.scope(
-                                        conversation_id_owned,
-                                        tyclaw_sandbox::CURRENT_SANDBOX.scope(
-                            sb_clone,
-                            tyclaw_provider::CURRENT_USER_ID.scope(
-                                user_id_for_provider.clone(),
-                                tyclaw_agent::runtime::INJECTION_QUEUE
-                                    .scope(injection_queue.clone(), run_future),
-                            ),
-                        ),
+                    tyclaw_tools::CURRENT_USER_ROLE.scope(
+                        user_role_owned,
+                        tyclaw_tools::CURRENT_USER_ID.scope(
+                            user_id_owned.clone(),
+                            tyclaw_tools::CURRENT_USER_NAME.scope(
+                                user_name_owned,
+                                tyclaw_tools::CURRENT_REQUEST_ID.scope(
+                                    request_id,
+                                    tyclaw_tools::timer::TIMER_CURRENT_CHANNEL.scope(
+                                        channel_owned,
+                                        tyclaw_tools::timer::TIMER_CURRENT_CHAT_ID.scope(
+                                            chat_id_owned,
+                                            tyclaw_tools::timer::TIMER_CURRENT_USER_ID.scope(
+                                                user_id_owned,
+                                                tyclaw_tools::timer::TIMER_CURRENT_CONVERSATION_ID
+                                                    .scope(
+                                                        conversation_id_owned,
+                                                        tyclaw_sandbox::CURRENT_SANDBOX.scope(
+                                                            sb_clone,
+                                                            tyclaw_provider::CURRENT_USER_ID.scope(
+                                                                user_id_for_provider.clone(),
+                                                                tyclaw_agent::runtime::INJECTION_QUEUE
+                                                                    .scope(
+                                                                        injection_queue.clone(),
+                                                                        run_future,
+                                                                    ),
+                                                            ),
+                                                        ),
+                                                    ),
+                                            ),
+                                        ),
                                     ),
                                 ),
                             ),
                         ),
                     ),
-                ),
                 )
                 .await?
         } else {
             tyclaw_agent::runtime::CANCEL_TOKEN
                 .scope(
                     cancel_token.clone(),
-            tyclaw_tools::CURRENT_USER_ROLE
-                .scope(
-                    user_role_owned,
-                    tyclaw_tools::CURRENT_REQUEST_ID.scope(
-                        request_id,
-                        tyclaw_tools::timer::TIMER_CURRENT_CHANNEL.scope(
-                            channel_owned,
-                            tyclaw_tools::timer::TIMER_CURRENT_CHAT_ID.scope(
-                                chat_id_owned,
-                                tyclaw_tools::timer::TIMER_CURRENT_USER_ID.scope(
-                                    user_id_owned,
-                                    tyclaw_tools::timer::TIMER_CURRENT_CONVERSATION_ID
-                                        .scope(
-                                            conversation_id_owned,
-                                            tyclaw_provider::CURRENT_USER_ID.scope(
-                                                user_id_for_provider.clone(),
-                                                tyclaw_agent::runtime::INJECTION_QUEUE
-                                                    .scope(injection_queue, run_future),
+                    tyclaw_tools::CURRENT_USER_ROLE.scope(
+                        user_role_owned,
+                        tyclaw_tools::CURRENT_USER_ID.scope(
+                            user_id_owned.clone(),
+                            tyclaw_tools::CURRENT_USER_NAME.scope(
+                                user_name_owned,
+                                tyclaw_tools::CURRENT_REQUEST_ID.scope(
+                                    request_id,
+                                    tyclaw_tools::timer::TIMER_CURRENT_CHANNEL.scope(
+                                        channel_owned,
+                                        tyclaw_tools::timer::TIMER_CURRENT_CHAT_ID.scope(
+                                            chat_id_owned,
+                                            tyclaw_tools::timer::TIMER_CURRENT_USER_ID.scope(
+                                                user_id_owned,
+                                                tyclaw_tools::timer::TIMER_CURRENT_CONVERSATION_ID
+                                                    .scope(
+                                                        conversation_id_owned,
+                                                        tyclaw_provider::CURRENT_USER_ID.scope(
+                                                            user_id_for_provider.clone(),
+                                                            tyclaw_agent::runtime::INJECTION_QUEUE
+                                                                .scope(injection_queue, run_future),
+                                                        ),
+                                                    ),
                                             ),
                                         ),
+                                    ),
                                 ),
                             ),
                         ),
                     ),
-                ),
                 )
                 .await?
         };
@@ -1167,24 +1238,38 @@ impl Orchestrator {
                     &mem_dir,
                     self.app.context_window_tokens,
                 );
-                consolidator
-                    .archive_unconsolidated(
-                        &session.messages,
-                        session.last_consolidated,
-                        self.provider.as_ref(),
-                        &self.app.model,
-                    )
-                    .await;
+                let safe_to_clear = archive_or_dump_unconsolidated(
+                    &consolidator,
+                    &session.messages,
+                    session.last_consolidated,
+                    &ctx.workspace_key,
+                    self.provider.as_ref(),
+                    &self.app.model,
+                    self.app.performance.consolidation.timeout_secs,
+                )
+                .await;
 
-                let mut session = self.persistence.sessions.get_or_create_clone(&ctx.workspace_key);
-                session.clear();
-                self.persistence.sessions.save(&session).ok();
-                self.persistence.sessions.invalidate(&ctx.workspace_key);
+                if safe_to_clear {
+                    let mut session = self
+                        .persistence
+                        .sessions
+                        .get_or_create_clone(&ctx.workspace_key);
+                    session.clear();
+                    self.persistence.sessions.save(&session).ok();
+                    self.persistence.sessions.invalidate(&ctx.workspace_key);
 
-                if let Some(cb) = ctx.on_progress {
-                    cb(ProgressEvent::Status("[记忆整理完成，历史已清空]".into())).await;
+                    if let Some(cb) = ctx.on_progress {
+                        cb(ProgressEvent::Status("[记忆整理完成，历史已清空]".into())).await;
+                    }
+                    info!("Step 11: consolidation done, session cleared");
+                } else {
+                    warn!(
+                        "Step 11: memory archive and recovery dump failed; session retained"
+                    );
+                    if let Some(cb) = ctx.on_progress {
+                        cb(ProgressEvent::Status("[记忆整理失败，历史已保留]".into())).await;
+                    }
                 }
-                info!("Step 11: consolidation done, session cleared");
             }
         }
 
@@ -1487,6 +1572,19 @@ mod fresh_turn_gates_tests {
         }
     }
 
+    struct PendingProvider;
+
+    #[async_trait]
+    impl LLMProvider for PendingProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<LLMResponse, TyclawError> {
+            std::future::pending().await
+        }
+
+        fn default_model(&self) -> &str {
+            "pending-model"
+        }
+    }
+
     fn umsg(content: &str) -> HashMap<String, Value> {
         let mut m = HashMap::new();
         m.insert("role".into(), json!("user"));
@@ -1542,6 +1640,41 @@ mod fresh_turn_gates_tests {
                 _ => {}
             }
         }
+    }
+
+    #[tokio::test]
+    async fn archive_timeout_writes_recovery_dump_within_bound() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg_dir = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("prompts.yaml"),
+            "memory_consolidation_prompt: |\n  Summarize and call save_memory.\n",
+        )
+        .unwrap();
+        tyclaw_prompt::prompt_store::init(tmp.path());
+
+        let mem_dir = tmp.path().join("memory");
+        let consolidator = tyclaw_memory::MemoryConsolidator::new(&mem_dir, 200_000);
+        let messages = vec![umsg("需要保留的历史")];
+        let started = Instant::now();
+
+        let safe_to_clear = archive_or_dump_unconsolidated(
+            &consolidator,
+            &messages,
+            0,
+            "archive_ws",
+            &PendingProvider,
+            "pending-model",
+            1,
+        )
+        .await;
+
+        assert!(safe_to_clear);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let dump =
+            std::fs::read_to_string(mem_dir.join("reset_dumps/archive_ws.jsonl")).unwrap();
+        assert_eq!(dump.lines().count(), 1);
     }
 
     /// 端到端：污染剔除 + 配对修复 + 规模限制在单回合内协同工作（R1.1/R1.2/R3.6）。

@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -725,16 +725,22 @@ impl SessionManager {
             // ≤ max_rounds 批）避免整段一次性交给 LLM 超上下文（R4）；分批未覆盖到 boundary 的残余
             // （失败批/达轮次上限）在 drain 前转储到恢复文件，避免静默数据丢失。
             if boundary > session.last_consolidated {
+                let previous_last_consolidated = session.last_consolidated;
                 let run = consolidator
                     .consolidate_in_batches(
                         &session.messages[..boundary],
                         session.last_consolidated,
                         consolidation.max_messages_per_batch,
                         consolidation.max_rounds,
+                        Duration::from_secs(consolidation.timeout_secs),
                         provider,
                         model,
                     )
                     .await;
+                if run.last_consolidated > session.last_consolidated {
+                    session.last_consolidated = run.last_consolidated;
+                    session.updated_at = Utc::now();
+                }
                 if run.last_consolidated < boundary {
                     let dropped = session.messages[run.last_consolidated..boundary].to_vec();
                     let dump = consolidator
@@ -746,6 +752,19 @@ impl SessionManager {
                         dump = ?dump,
                         "Forced reset: partial consolidation, remaining messages dumped for recovery"
                     );
+                    if dump.is_none() {
+                        warn!(
+                            "Forced reset aborted because recovery dump could not be written"
+                        );
+                        let merged = run
+                            .last_consolidated
+                            .saturating_sub(previous_last_consolidated);
+                        return if merged > 0 {
+                            SizeLimitAction::ForcedConsolidation { merged }
+                        } else {
+                            SizeLimitAction::None
+                        };
+                    }
                 }
             }
             session.messages.drain(..boundary);
@@ -791,6 +810,7 @@ impl SessionManager {
                     session.last_consolidated,
                     consolidation.max_messages_per_batch,
                     consolidation.max_rounds,
+                    Duration::from_secs(consolidation.timeout_secs),
                     provider,
                     model,
                 )
@@ -819,6 +839,19 @@ impl SessionManager {
             let abs_start = session.last_consolidated + rel_start;
             // adjust 兜底保证配对完整（R3.6/R3.7）；干净边界为 no-op。
             let abs_start = adjust_truncation_boundary(&session.messages, abs_start);
+            let dropped = session.messages[session.last_consolidated..abs_start].to_vec();
+            if !dropped.is_empty()
+                && consolidator
+                    .store
+                    .dump_unrecoverable(&session.workspace_key, &dropped)
+                    .is_none()
+            {
+                warn!(
+                    dropped = dropped.len(),
+                    "Rolling truncation aborted because recovery dump could not be written"
+                );
+                return action;
+            }
             session.messages.drain(..abs_start);
             session.last_consolidated = 0;
             session.updated_at = Utc::now();
@@ -1178,6 +1211,19 @@ mod size_limit_tests {
         }
     }
 
+    struct PendingProvider;
+
+    #[async_trait]
+    impl LLMProvider for PendingProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<LLMResponse, TyclawError> {
+            std::future::pending().await
+        }
+
+        fn default_model(&self) -> &str {
+            "pending-model"
+        }
+    }
+
     fn small_cfg() -> SizeLimitConfig {
         // 小阈值便于触发：硬上限 6，目标水位 3。
         SizeLimitConfig {
@@ -1262,6 +1308,82 @@ mod size_limit_tests {
             SizeLimitAction::RollingTruncation { kept } => assert!(kept <= cfg.rolling_target),
             other => panic!("unexpected action {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn consolidation_timeout_dumps_then_truncates() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let consolidator = MemoryConsolidator::new(tmp.path(), 200_000);
+        let provider = PendingProvider;
+        ensure_prompt_store();
+
+        let mut session = Session::new("timeout_ws".into());
+        session.messages = turns(10); // 30 条 >> 上限 6
+        let original_len = session.messages.len();
+        let cfg = small_cfg();
+        let consolidation = ConsolidationConfig {
+            timeout_secs: 1,
+            ..ConsolidationConfig::default()
+        };
+        let started = Instant::now();
+
+        let action = SessionManager::enforce_size_limits(
+            &mut session,
+            0,
+            &cfg,
+            &consolidation,
+            &consolidator,
+            &provider,
+            "pending-model",
+        )
+        .await;
+
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(
+            action,
+            SizeLimitAction::RollingTruncation {
+                kept: cfg.rolling_target
+            }
+        );
+        assert_eq!(session.messages.len(), cfg.rolling_target);
+        assert_eq!(role_at(&session.messages, 0), "user");
+
+        let dump_path = tmp.path().join("reset_dumps/timeout_ws.jsonl");
+        let dump = std::fs::read_to_string(dump_path).unwrap();
+        assert_eq!(dump.lines().count(), original_len - cfg.rolling_target);
+    }
+
+    #[tokio::test]
+    async fn consolidation_timeout_keeps_history_when_recovery_dump_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocked_path = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked_path, "blocked").unwrap();
+        let consolidator = MemoryConsolidator::new(&blocked_path, 200_000);
+        let provider = PendingProvider;
+        ensure_prompt_store();
+
+        let mut session = Session::new("timeout_ws".into());
+        session.messages = turns(10);
+        let original = session.messages.clone();
+        let consolidation = ConsolidationConfig {
+            timeout_secs: 1,
+            ..ConsolidationConfig::default()
+        };
+
+        let action = SessionManager::enforce_size_limits(
+            &mut session,
+            0,
+            &small_cfg(),
+            &consolidation,
+            &consolidator,
+            &provider,
+            "pending-model",
+        )
+        .await;
+
+        assert_eq!(action, SizeLimitAction::None);
+        assert_eq!(session.messages, original);
+        assert_eq!(session.last_consolidated, 0);
     }
 
     #[tokio::test]

@@ -11,6 +11,10 @@ use crate::base::Tool;
 tokio::task_local! {
     /// 当前请求的用户角色（per-request，通过 .scope() 注入）。
     pub static CURRENT_USER_ROLE: String;
+    /// 当前请求的用户 ID。工具只能读取，不能由模型参数覆盖。
+    pub static CURRENT_USER_ID: String;
+    /// 当前请求的用户显示名。工具只能读取，不能由模型参数覆盖。
+    pub static CURRENT_USER_NAME: String;
 }
 
 /// 获取当前上下文的用户角色，默认 "admin"。
@@ -18,6 +22,14 @@ pub fn current_user_role() -> String {
     CURRENT_USER_ROLE
         .try_with(|r| r.clone())
         .unwrap_or_else(|_| "admin".into())
+}
+
+pub fn current_user_id() -> String {
+    CURRENT_USER_ID.try_with(Clone::clone).unwrap_or_default()
+}
+
+pub fn current_user_name() -> String {
+    CURRENT_USER_NAME.try_with(Clone::clone).unwrap_or_default()
 }
 
 #[async_trait]

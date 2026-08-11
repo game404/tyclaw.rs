@@ -7,10 +7,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tyclaw_types::TyclawError;
 
 use crate::types::*;
+use crate::{validate_workspace_relative_path, workspace_read_error};
 
 /// Noop 沙箱：直接在 host 上执行，无隔离。
 pub struct NoopSandbox {
@@ -79,6 +81,51 @@ impl Sandbox for NoopSandbox {
             tool: "sandbox_read".into(),
             message: format!("Read failed: {e}"),
         })
+    }
+
+    async fn read_workspace_file(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, TyclawError> {
+        let relative = validate_workspace_relative_path(path)?;
+        let root = tokio::fs::canonicalize(&self.workspace)
+            .await
+            .map_err(|_| workspace_read_error("Workspace work directory is not accessible"))?;
+        let target = tokio::fs::canonicalize(root.join(relative))
+            .await
+            .map_err(|_| workspace_read_error("Workspace file was not found"))?;
+        if !target.starts_with(&root) {
+            return Err(workspace_read_error(
+                "Workspace file resolves outside the work directory",
+            ));
+        }
+        let file = tokio::fs::File::open(&target)
+            .await
+            .map_err(|_| workspace_read_error("Workspace file could not be read"))?;
+        let metadata = file
+            .metadata()
+            .await
+            .map_err(|_| workspace_read_error("Workspace file metadata is not accessible"))?;
+        if !metadata.is_file() {
+            return Err(workspace_read_error("Workspace path is not a regular file"));
+        }
+        if metadata.len() > max_bytes as u64 {
+            return Err(workspace_read_error(
+                "Workspace file exceeds the size limit",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+        file.take(max_bytes.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| workspace_read_error("Workspace file could not be read"))?;
+        if bytes.len() > max_bytes {
+            return Err(workspace_read_error(
+                "Workspace file exceeds the size limit",
+            ));
+        }
+        Ok(bytes)
     }
 
     async fn write_file(&self, path: &str, content: &[u8]) -> Result<(), TyclawError> {
@@ -367,5 +414,85 @@ impl SandboxPool for NoopPool {
 
     async fn is_available(&self) -> bool {
         true // 永远可用
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn sandbox(root: &Path) -> NoopSandbox {
+        NoopSandbox {
+            workspace: root.to_path_buf(),
+            id: "test".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn secure_workspace_read_accepts_regular_file() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("reports")).unwrap();
+        std::fs::write(directory.path().join("reports/daily.md"), "日报").unwrap();
+
+        let bytes = sandbox(directory.path())
+            .read_workspace_file("reports/daily.md", 100)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "日报");
+    }
+
+    #[tokio::test]
+    async fn secure_workspace_read_rejects_absolute_parent_and_oversize_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("large.md"), b"12345").unwrap();
+        let sandbox = sandbox(directory.path());
+
+        for path in ["/etc/passwd", "../outside.md", "reports/../../outside.md"] {
+            let error = sandbox.read_workspace_file(path, 100).await.unwrap_err();
+            assert!(!error
+                .to_string()
+                .contains(&directory.path().display().to_string()));
+        }
+        let error = sandbox
+            .read_workspace_file("large.md", 4)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("size limit"));
+        assert!(!error
+            .to_string()
+            .contains(&directory.path().display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn secure_workspace_read_allows_internal_symlink_and_rejects_external_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("inside.md"), "inside").unwrap();
+        std::fs::write(outside.path().join("outside.md"), "outside").unwrap();
+        symlink("inside.md", directory.path().join("inside-link.md")).unwrap();
+        symlink(
+            outside.path().join("outside.md"),
+            directory.path().join("outside-link.md"),
+        )
+        .unwrap();
+        let sandbox = sandbox(directory.path());
+
+        let bytes = sandbox
+            .read_workspace_file("inside-link.md", 100)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"inside");
+        let error = sandbox
+            .read_workspace_file("outside-link.md", 100)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("outside the work directory"));
+        assert!(!error
+            .to_string()
+            .contains(&outside.path().display().to_string()));
     }
 }

@@ -6,6 +6,7 @@
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 use tracing::{info, warn};
 
 use tyclaw_provider::LLMProvider;
@@ -274,6 +275,7 @@ impl MemoryConsolidator {
     /// [`run_consolidation_batches`] 完全一致（复用 [`plan_next_batch`]）：
     ///
     /// - 单次调用最多处理 `max_rounds`（默认 5）个批次（R4.3）；
+    /// - 所有批次共享 `timeout` 总预算，超时批次不推进边界；
     /// - 达上限后剩余消息保留为未合并、不推进边界（R4.5）；
     /// - 某批失败则停止后续批次、保留失败批及之后为未合并，并记录失败批次
     ///   序号与原因（R4.6）；
@@ -286,6 +288,7 @@ impl MemoryConsolidator {
         last_consolidated: usize,
         max_messages_per_batch: usize,
         max_rounds: usize,
+        timeout: Duration,
         provider: &dyn LLMProvider,
         model: &str,
     ) -> ConsolidationRunResult {
@@ -293,6 +296,7 @@ impl MemoryConsolidator {
         let mut batches_processed = 0usize;
         let mut messages_processed = 0usize;
         let mut failed_batch: Option<(usize, String)> = None;
+        let deadline = tokio::time::Instant::now() + timeout;
 
         while let Some((start, end)) = plan_next_batch(
             messages,
@@ -312,21 +316,58 @@ impl MemoryConsolidator {
                 "Memory consolidation batch start"
             );
 
-            if consolidate_with_provider(&self.store, batch, provider, model).await {
-                batches_processed += 1;
-                messages_processed += batch.len();
-                current = end;
-            } else {
-                // R4.6：失败批不推进边界，停止后续批次，记录序号与原因。
-                let reason = "consolidate_with_provider returned false".to_string();
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                let reason = format!(
+                    "memory consolidation timed out after {} seconds",
+                    timeout.as_secs()
+                );
                 warn!(
                     batch_index,
                     batch_len = batch.len(),
                     reason = %reason,
-                    "Memory consolidation batch failed; stopping further batches"
+                    "Memory consolidation batch timed out; stopping further batches"
                 );
                 failed_batch = Some((batch_index, reason));
                 break;
+            }
+            let outcome = tokio::time::timeout(
+                remaining,
+                consolidate_with_provider(&self.store, batch, provider, model),
+            )
+            .await;
+
+            match outcome {
+                Ok(true) => {
+                    batches_processed += 1;
+                    messages_processed += batch.len();
+                    current = end;
+                }
+                Ok(false) => {
+                    let reason = "consolidate_with_provider returned false".to_string();
+                    warn!(
+                        batch_index,
+                        batch_len = batch.len(),
+                        reason = %reason,
+                        "Memory consolidation batch failed; stopping further batches"
+                    );
+                    failed_batch = Some((batch_index, reason));
+                    break;
+                }
+                Err(_) => {
+                    let reason = format!(
+                        "memory consolidation timed out after {} seconds",
+                        timeout.as_secs()
+                    );
+                    warn!(
+                        batch_index,
+                        batch_len = batch.len(),
+                        reason = %reason,
+                        "Memory consolidation batch timed out; stopping further batches"
+                    );
+                    failed_batch = Some((batch_index, reason));
+                    break;
+                }
             }
         }
 

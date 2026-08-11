@@ -172,6 +172,8 @@ pub fn mask_secret(secret: &str) -> String {
 pub const TRUNCATE_FLOOR_CHARS: usize = 8000;
 /// 单个 Node 最大执行时间上限（秒）：node 超时不得超过 5 分钟。
 pub const NODE_TIMEOUT_CEIL_SECS: u64 = 300;
+/// 记忆合并属于辅助流程，不得长期阻塞用户请求。
+pub const CONSOLIDATION_TIMEOUT_CEIL_SECS: u64 = 60;
 
 /// 污染识别配置（R1 / R2）。
 #[derive(Debug, Clone, Deserialize)]
@@ -234,6 +236,8 @@ pub struct ConsolidationConfig {
     pub max_messages_per_batch: usize,
     /// 单次合并调用最多处理的分片批次数，默认 5。
     pub max_rounds: usize,
+    /// 单次记忆合并流程的总超时（秒），默认 30，上限 60。
+    pub timeout_secs: u64,
 }
 
 impl Default for ConsolidationConfig {
@@ -241,6 +245,7 @@ impl Default for ConsolidationConfig {
         Self {
             max_messages_per_batch: 500,
             max_rounds: 5,
+            timeout_secs: 30,
         }
     }
 }
@@ -397,6 +402,10 @@ impl PerformanceConfig {
             .subtask_timeout
             .node_max_duration_secs
             .min(NODE_TIMEOUT_CEIL_SECS);
+        self.consolidation.timeout_secs = self
+            .consolidation
+            .timeout_secs
+            .clamp(1, CONSOLIDATION_TIMEOUT_CEIL_SECS);
 
         // ── 字段间关系约束 ──
         // tail_ratio 必须落在 [0, 1]；NaN/越界回退默认 0.25。
@@ -503,6 +512,7 @@ mod perf_config_default_tests {
         let cfg = ConsolidationConfig::default();
         assert_eq!(cfg.max_messages_per_batch, 500);
         assert_eq!(cfg.max_rounds, 5);
+        assert_eq!(cfg.timeout_secs, 30);
     }
 
     #[test]
@@ -588,5 +598,20 @@ mod perf_config_default_tests {
 
         assert!(cfg.subtask_timeout.node_max_duration_secs <= NODE_TIMEOUT_CEIL_SECS);
         assert_eq!(cfg.subtask_timeout.node_max_duration_secs, 300);
+    }
+
+    #[test]
+    fn clamp_bounds_consolidation_timeout() {
+        let mut cfg = PerformanceConfig::default();
+        cfg.consolidation.timeout_secs = 0;
+        cfg.clamp();
+        assert_eq!(cfg.consolidation.timeout_secs, 1);
+
+        cfg.consolidation.timeout_secs = 999;
+        cfg.clamp();
+        assert_eq!(
+            cfg.consolidation.timeout_secs,
+            CONSOLIDATION_TIMEOUT_CEIL_SECS
+        );
     }
 }

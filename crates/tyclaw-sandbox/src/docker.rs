@@ -16,6 +16,7 @@ use tracing::{info, warn};
 use tyclaw_types::TyclawError;
 
 use crate::types::*;
+use crate::{validate_workspace_relative_path, workspace_read_error};
 
 /// 将 workspace_key 转换为 Docker 合法容器名。
 ///
@@ -235,6 +236,67 @@ impl Sandbox for DockerSandbox {
             });
         }
         Ok(output.stdout)
+    }
+
+    async fn read_workspace_file(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, TyclawError> {
+        let relative = validate_workspace_relative_path(path)?;
+        let root = self.workspace_root().to_string();
+        let target = Path::new(&root)
+            .join(relative)
+            .to_string_lossy()
+            .into_owned();
+        let max_bytes_value = max_bytes;
+        let max_bytes = max_bytes.to_string();
+        let read_limit = max_bytes_value.saturating_add(1).to_string();
+        let script = r#"
+root=$(readlink -f -- "$1") || exit 65
+target=$(readlink -f -- "$2") || exit 66
+case "$target" in
+  "$root"/*) ;;
+  *) exit 67 ;;
+esac
+[ -f "$target" ] || exit 68
+size=$(wc -c < "$target") || exit 69
+[ "$size" -le "$3" ] || exit 70
+head -c "$4" -- "$target"
+"#;
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                &self.container_name,
+                "sh",
+                "-c",
+                script,
+                "_",
+                &root,
+                &target,
+                &max_bytes,
+                &read_limit,
+            ])
+            .output()
+            .await
+            .map_err(|_| workspace_read_error("Workspace file could not be read"))?;
+
+        if output.status.success() {
+            if output.stdout.len() <= max_bytes_value {
+                return Ok(output.stdout);
+            }
+            return Err(workspace_read_error(
+                "Workspace file exceeds the size limit",
+            ));
+        }
+        let message = match output.status.code() {
+            Some(66) => "Workspace file was not found",
+            Some(67) => "Workspace file resolves outside the work directory",
+            Some(68) => "Workspace path is not a regular file",
+            Some(70) => "Workspace file exceeds the size limit",
+            _ => "Workspace file could not be read",
+        };
+        Err(workspace_read_error(message))
     }
 
     async fn write_file(&self, path: &str, content: &[u8]) -> Result<(), TyclawError> {
@@ -593,14 +655,27 @@ pub struct DockerPool {
     root: PathBuf,
 }
 
+#[derive(Clone)]
 struct WorkspaceContainer {
     container_name: String,
+    workspace_root: PathBuf,
 }
 
-/// 计算 workspace 路径——直接复用 [`tyclaw_control::workspace_path`]，
-/// 保证「Docker 挂载路径 ≡ persistence 路径」，避免算法漂移。
-fn workspace_path(root: &Path, workspace_key: &str) -> PathBuf {
-    tyclaw_control::workspace_path(root, workspace_key)
+struct ContainerInspection {
+    running: bool,
+    workspace_root: Option<PathBuf>,
+}
+
+fn task_workspace_root(task_workspace: &Path) -> Result<PathBuf, TyclawError> {
+    if task_workspace.file_name().and_then(|name| name.to_str()) != Some("work") {
+        return Err(TyclawError::Other(
+            "Sandbox task workspace must identify the workspace work directory".into(),
+        ));
+    }
+    task_workspace
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| TyclawError::Other("Sandbox task workspace has no workspace root".into()))
 }
 
 /// 生成 Docker `--mount type=bind` spec 字符串。
@@ -613,7 +688,12 @@ fn workspace_path(root: &Path, workspace_key: &str) -> PathBuf {
 /// 仍可能误解析。本项目场景下 host 路径不含逗号；如有需要可在此处扩展转义。
 fn bind_mount(source: &Path, target: &str, readonly: bool) -> String {
     let ro = if readonly { ",readonly" } else { "" };
-    format!("type=bind,source={},target={}{}", source.display(), target, ro)
+    format!(
+        "type=bind,source={},target={}{}",
+        source.display(),
+        target,
+        ro
+    )
 }
 
 impl DockerPool {
@@ -648,65 +728,108 @@ impl DockerPool {
 
     /// 为 workspace 创建容器，volume mount workspace 目录 → /user。
     /// 返回容器名（所有后续 Docker 操作均使用容器名而非 ID）。
-    async fn create_workspace_container(&self, workspace_key: &str) -> Result<String, TyclawError> {
-        let name = sanitize_container_name(workspace_key);
-
-        // 检查是否有同名容器残留
-        let inspect = Command::new("docker")
-            .args(["inspect", "--format", "{{.State.Running}}", &name])
+    async fn inspect_container(
+        &self,
+        name: &str,
+        mount_root: &str,
+    ) -> Result<Option<ContainerInspection>, TyclawError> {
+        let output = Command::new("docker")
+            .args(["inspect", name])
             .output()
-            .await;
-        if let Ok(output) = inspect {
-            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if status == "true" {
-                info!(name = %name, "Reusing existing container for workspace");
-                return Ok(name);
-            } else if output.status.success() {
-                let _ = Command::new("docker")
-                    .args(["rm", "-f", &name])
-                    .output()
-                    .await;
-            }
+            .await
+            .map_err(|_| TyclawError::Other("Failed to inspect sandbox container".into()))?;
+        if !output.status.success() {
+            return Ok(None);
         }
 
-        let ws_root = workspace_path(&self.root, workspace_key);
-        let ws_work = ws_root.join("work");
-        tokio::fs::create_dir_all(&ws_work).await.ok();
-        tokio::fs::create_dir_all(ws_root.join("skills"))
-            .await
-            .ok();
-        let ws_root_abs = std::fs::canonicalize(&ws_root).unwrap_or_else(|_| ws_root.clone());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|_| TyclawError::Other("Sandbox container metadata is invalid".into()))?;
+        let container = value
+            .as_array()
+            .and_then(|items| items.first())
+            .ok_or_else(|| TyclawError::Other("Sandbox container metadata is invalid".into()))?;
+        let running = container
+            .pointer("/State/Running")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let workspace_root = container
+            .get("Mounts")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|mounts| {
+                mounts.iter().find(|mount| {
+                    mount.get("Destination").and_then(serde_json::Value::as_str) == Some(mount_root)
+                })
+            })
+            .and_then(|mount| mount.get("Source"))
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+            .map(|path| std::fs::canonicalize(&path).unwrap_or(path));
+        Ok(Some(ContainerInspection {
+            running,
+            workspace_root,
+        }))
+    }
 
+    async fn remove_container(&self, name: &str) -> Result<(), TyclawError> {
+        let output = Command::new("docker")
+            .args(["rm", "-f", name])
+            .output()
+            .await
+            .map_err(|_| TyclawError::Other("Failed to remove stale sandbox container".into()))?;
+        if !output.status.success() {
+            return Err(TyclawError::Other(
+                "Failed to remove stale sandbox container".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn create_workspace_container(
+        &self,
+        workspace_key: &str,
+        ws_root_abs: &Path,
+    ) -> Result<String, TyclawError> {
+        let name = sanitize_container_name(workspace_key);
         let mount_root = user_mount_root(&self.config.work_dir);
+
+        if let Some(inspect) = self.inspect_container(&name, &mount_root).await? {
+            if inspect.running && inspect.workspace_root.as_deref() == Some(ws_root_abs) {
+                info!(name = %name, "Reusing existing container for workspace");
+                return Ok(name);
+            }
+            warn!(name = %name, "Removing sandbox container with stale workspace mount");
+            self.remove_container(&name).await?;
+        }
+
+        tokio::fs::create_dir_all(ws_root_abs.join("work"))
+            .await
+            .map_err(|_| TyclawError::Other("Failed to prepare sandbox work directory".into()))?;
+        tokio::fs::create_dir_all(ws_root_abs.join("skills"))
+            .await
+            .map_err(|_| TyclawError::Other("Failed to prepare sandbox skills directory".into()))?;
 
         // 全局 skills 目录只读挂载到容器内 {mount_root}/skills
         let global_skills = self.root.join("skills");
-        let global_skills_abs = std::fs::canonicalize(&global_skills)
-            .unwrap_or_else(|_| global_skills.clone());
+        let global_skills_abs =
+            std::fs::canonicalize(&global_skills).unwrap_or_else(|_| global_skills.clone());
 
         // 全局 tools 目录只读挂载到容器内 {mount_root}/tools
         let global_tools = self.root.join("tools");
-        let global_tools_abs = std::fs::canonicalize(&global_tools)
-            .unwrap_or_else(|_| global_tools.clone());
+        let global_tools_abs =
+            std::fs::canonicalize(&global_tools).unwrap_or_else(|_| global_tools.clone());
 
         // defaults.py 挂载到容器根目录（tools/ 下的脚本通过 from defaults import 引用）
         let defaults_py = self.root.join("defaults.py");
-        let defaults_py_abs = std::fs::canonicalize(&defaults_py)
-            .unwrap_or_else(|_| defaults_py.clone());
+        let defaults_py_abs =
+            std::fs::canonicalize(&defaults_py).unwrap_or_else(|_| defaults_py.clone());
 
         // 用 `--mount type=bind` 而非 `-v`，避免 host 路径含 `:` 时被 Docker
         // 拆分器误判（曾导致 `invalid mode: /workspace`）。
-        let mount_arg = bind_mount(&ws_root_abs, &mount_root, false);
-        let global_skills_mount = bind_mount(
-            &global_skills_abs,
-            &format!("{}/skills", mount_root),
-            true,
-        );
-        let global_tools_mount = bind_mount(
-            &global_tools_abs,
-            &format!("{}/tools", mount_root),
-            true,
-        );
+        let mount_arg = bind_mount(ws_root_abs, &mount_root, false);
+        let global_skills_mount =
+            bind_mount(&global_skills_abs, &format!("{}/skills", mount_root), true);
+        let global_tools_mount =
+            bind_mount(&global_tools_abs, &format!("{}/tools", mount_root), true);
         let defaults_mount = bind_mount(
             &defaults_py_abs,
             &format!("{}/defaults.py", mount_root),
@@ -760,21 +883,14 @@ impl DockerPool {
         if self.config.run_as_host_user {
             let uid_gid = detect_host_uid_gid().await;
             info!(uid_gid = %uid_gid, "Running container as host user");
-            run_args.extend([
-                "--user".to_string(),
-                uid_gid,
-            ]);
+            run_args.extend(["--user".to_string(), uid_gid]);
         }
 
         // 挂载主机 /etc/localtime 使容器时区与主机一致（文件存在时才挂载）
         if Path::new("/etc/localtime").exists() {
             run_args.extend([
                 "--mount".to_string(),
-                bind_mount(
-                    Path::new("/etc/localtime"),
-                    "/etc/localtime",
-                    true,
-                ),
+                bind_mount(Path::new("/etc/localtime"), "/etc/localtime", true),
             ]);
         }
 
@@ -782,11 +898,7 @@ impl DockerPool {
         if Path::new("/etc/hosts").exists() {
             run_args.extend([
                 "--mount".to_string(),
-                bind_mount(
-                    Path::new("/etc/hosts"),
-                    "/etc/hosts",
-                    true,
-                ),
+                bind_mount(Path::new("/etc/hosts"), "/etc/hosts", true),
             ]);
         }
 
@@ -820,7 +932,13 @@ impl DockerPool {
 
         // 确保容器内 work/tmp 目录存在（TMPDIR 指向此处）
         let _ = Command::new("docker")
-            .args(["exec", &name, "mkdir", "-p", &format!("{}/work/tmp", self.config.work_dir)])
+            .args([
+                "exec",
+                &name,
+                "mkdir",
+                "-p",
+                &format!("{}/work/tmp", self.config.work_dir),
+            ])
             .output()
             .await;
 
@@ -834,26 +952,34 @@ impl SandboxPool for DockerPool {
     async fn acquire(
         &self,
         workspace_key: &str,
-        _task_workspace: &PathBuf,
+        task_workspace: &PathBuf,
         _data_mounts: &[PathMount],
     ) -> Result<Arc<dyn Sandbox>, TyclawError> {
         // 语义 workspace_key 由调用方显式传入；不再从 task_workspace 反推目录名，
         // 避免「目录名清洗后 md5(语义key) ≠ md5(leaf)」导致挂载/缓存漂移。
         let workspace_key = workspace_key.to_string();
+        tokio::fs::create_dir_all(task_workspace)
+            .await
+            .map_err(|_| TyclawError::Other("Failed to prepare sandbox work directory".into()))?;
+        let expected_root = task_workspace_root(task_workspace)?;
+        let expected_root = tokio::fs::canonicalize(&expected_root)
+            .await
+            .map_err(|_| TyclawError::Other("Sandbox workspace root is not accessible".into()))?;
+        let mount_root = user_mount_root(&self.config.work_dir);
 
         let containers = self.containers.lock().await;
 
         if let Some(entry) = containers.get(&workspace_key) {
-            // 验证容器是否仍存活（可能被 reaper 或外部删除）
-            let check = Command::new("docker")
-                .args(["inspect", "--format", "{{.State.Running}}", &entry.container_name])
-                .output()
-                .await;
-            let alive = check
-                .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
-                .unwrap_or(false);
+            let inspect = self
+                .inspect_container(&entry.container_name, &mount_root)
+                .await?;
+            let reusable = entry.workspace_root == expected_root
+                && inspect.as_ref().is_some_and(|inspect| {
+                    inspect.running
+                        && inspect.workspace_root.as_deref() == Some(expected_root.as_path())
+                });
 
-            if alive {
+            if reusable {
                 return Ok(Arc::new(DockerSandbox {
                     container_name: entry.container_name.clone(),
                     mount_root: user_mount_root(&self.config.work_dir),
@@ -861,15 +987,16 @@ impl SandboxPool for DockerPool {
                     workspace_key: workspace_key.clone(),
                 }));
             }
-            // 容器已不存在，清除缓存，走重建流程
-            info!(name = %entry.container_name, "Cached container no longer alive, recreating");
+            info!(name = %entry.container_name, "Cached container is stale, recreating");
         }
         drop(containers);
 
         // 清除旧缓存条目
         self.containers.lock().await.remove(&workspace_key);
 
-        let name = self.create_workspace_container(&workspace_key).await?;
+        let name = self
+            .create_workspace_container(&workspace_key, &expected_root)
+            .await?;
 
         let mut containers = self.containers.lock().await;
         let ws_key = workspace_key.clone();
@@ -877,6 +1004,7 @@ impl SandboxPool for DockerPool {
             workspace_key,
             WorkspaceContainer {
                 container_name: name.clone(),
+                workspace_root: expected_root,
             },
         );
 

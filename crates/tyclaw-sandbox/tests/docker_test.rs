@@ -3,13 +3,23 @@
 //! 运行：cargo test -p tyclaw-sandbox --test docker_test
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tyclaw_sandbox::*;
 
+static TEMP_DIR_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
 /// 创建临时 users 目录（DockerPool 的 per-user 根目录）。
 fn temp_users_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("tyclaw-sandbox-test-{}", std::process::id()));
+    let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "tyclaw-sandbox-test-{}-{sequence}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).ok();
+    std::fs::create_dir_all(dir.join("skills")).ok();
+    std::fs::create_dir_all(dir.join("tools")).ok();
+    std::fs::write(dir.join("defaults.py"), "").ok();
     dir
 }
 
@@ -104,16 +114,19 @@ async fn test_docker_write_read() {
 
     // 写文件
     sandbox
-        .write_file("test.txt", b"hello sandbox")
+        .write_file("work/test.txt", b"hello sandbox")
         .await
         .expect("Write failed");
 
     // 读文件
-    let content = sandbox.read_file("test.txt").await.expect("Read failed");
+    let content = sandbox
+        .read_file("work/test.txt")
+        .await
+        .expect("Read failed");
     assert_eq!(String::from_utf8_lossy(&content), "hello sandbox");
 
     // 文件存在
-    assert!(sandbox.file_exists("test.txt").await);
+    assert!(sandbox.file_exists("work/test.txt").await);
     assert!(!sandbox.file_exists("nonexistent.txt").await);
 
     // release 后 workspace 应该同步回 host
@@ -203,9 +216,15 @@ async fn test_docker_host_isolation() {
 #[tokio::test]
 async fn test_docker_file_ownership() {
     let config = DockerConfig::default();
-    assert!(config.run_as_host_user, "run_as_host_user should default to true");
+    assert!(
+        config.run_as_host_user,
+        "run_as_host_user should default to true"
+    );
     assert_eq!(config.memory, "2g", "memory should default to 2g");
-    assert_eq!(config.memory_swap, "2g", "memory_swap should equal memory (swap disabled)");
+    assert_eq!(
+        config.memory_swap, "2g",
+        "memory_swap should equal memory (swap disabled)"
+    );
     assert_eq!(config.cpus, "2", "cpus should default to 2");
     assert_eq!(config.shm_size, "512m", "shm_size should default to 512m");
 
@@ -221,11 +240,14 @@ async fn test_docker_file_ownership() {
         .expect("Acquire failed");
 
     sandbox
-        .write_file("owned.txt", b"host-deletable")
+        .write_file("work/owned.txt", b"host-deletable")
         .await
         .expect("Write failed");
     sandbox
-        .exec("mkdir -p work/tmp/subdir && echo data > work/tmp/subdir/deep.txt", Duration::from_secs(5))
+        .exec(
+            "mkdir -p work/tmp/subdir && echo data > work/tmp/subdir/deep.txt",
+            Duration::from_secs(5),
+        )
         .await
         .expect("Exec via shell failed");
 
@@ -233,7 +255,8 @@ async fn test_docker_file_ownership() {
 
     let host_file = ws.join("owned.txt");
     assert!(host_file.exists(), "File should exist on host");
-    std::fs::remove_file(&host_file).expect("Host user should be able to delete container-created file");
+    std::fs::remove_file(&host_file)
+        .expect("Host user should be able to delete container-created file");
 
     let tmp_subdir = ws.join("tmp/subdir");
     if tmp_subdir.exists() {
@@ -293,9 +316,8 @@ async fn test_docker_acquire_with_base64_chat_id_key() {
         .await
         .expect("Pool creation failed");
 
-    // 直接走标准路径 —— DockerPool 内部 workspace_path 会用 control 的清洗算法
-    // 落到 {users_dir}/works/{bucket}/{leaf}/work，确保 disk 与挂载一致。
-    let task_workspace = users_dir.clone(); // 占位；acquire 不再据此反推 key
+    // workspace_key 只用于容器名和缓存键；实际挂载源始终由 task_workspace 决定。
+    let task_workspace = user_workspace(&users_dir, &leaf);
     let sandbox = pool
         .acquire(workspace_key, &task_workspace, &[])
         .await
@@ -320,8 +342,88 @@ async fn test_docker_acquire_with_base64_chat_id_key() {
     pool.release(sandbox, &task_workspace).await.ok();
     // 用名称兜底删除（防止 leak）
     let _ = tokio::process::Command::new("docker")
-        .args(["rm", "-f", &tyclaw_sandbox::sanitize_container_name(workspace_key)])
+        .args([
+            "rm",
+            "-f",
+            &tyclaw_sandbox::sanitize_container_name(workspace_key),
+        ])
         .output()
         .await;
     cleanup(&users_dir);
+}
+
+/// 回归测试：自定义 works 目录必须作为实际挂载源，且同一 key 改变挂载源时重建容器。
+#[tokio::test]
+async fn test_docker_uses_task_workspace_and_rebuilds_stale_mount() {
+    let config = DockerConfig::default();
+    let run_dir = temp_users_dir().join("run-dir");
+    let custom_works = temp_users_dir().join("custom-works");
+    std::fs::create_dir_all(run_dir.join("skills")).ok();
+    std::fs::create_dir_all(run_dir.join("tools")).ok();
+    std::fs::write(run_dir.join("defaults.py"), "").ok();
+    let pool = DockerPool::new(config, run_dir.clone())
+        .await
+        .expect("Pool creation failed");
+    let workspace_key = "test_custom_works_mount";
+    let first_work = user_workspace(&custom_works, "first");
+    let second_work = user_workspace(&custom_works, "second");
+    std::fs::write(first_work.join("mount-marker.txt"), "first").unwrap();
+    std::fs::write(second_work.join("mount-marker.txt"), "second").unwrap();
+
+    let first = pool
+        .acquire(workspace_key, &first_work, &[])
+        .await
+        .expect("First acquire failed");
+    assert_eq!(
+        String::from_utf8(
+            first
+                .read_workspace_file("mount-marker.txt", 100)
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        "first"
+    );
+    first
+        .exec(
+            "printf reused > /tmp/tyclaw-mount-reuse-marker",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    pool.release(first, &first_work).await.unwrap();
+
+    let reused = pool
+        .acquire(workspace_key, &first_work, &[])
+        .await
+        .expect("Acquire with unchanged mount failed");
+    let marker = reused
+        .exec("cat /tmp/tyclaw-mount-reuse-marker", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(marker.stdout, "reused");
+    pool.release(reused, &first_work).await.unwrap();
+
+    let second = pool
+        .acquire(workspace_key, &second_work, &[])
+        .await
+        .expect("Acquire with changed mount failed");
+    assert_eq!(
+        String::from_utf8(
+            second
+                .read_workspace_file("mount-marker.txt", 100)
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        "second"
+    );
+    pool.release(second, &second_work).await.ok();
+
+    let _ = tokio::process::Command::new("docker")
+        .args(["rm", "-f", &sanitize_container_name(workspace_key)])
+        .output()
+        .await;
+    cleanup(&run_dir);
+    cleanup(&custom_works);
 }

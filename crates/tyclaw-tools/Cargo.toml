@@ -9,6 +9,7 @@ tyclaw-tool-abi = { workspace = true }
 tyclaw-control = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -32,3 +33,4 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1", "to
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
+tyclaw-sandbox = { path = "../tyclaw-sandbox" }
