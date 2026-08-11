@@ -147,6 +147,7 @@ pub fn warn_max_iterations_reset(workspace_key: &str) {
 /// 存储结构：`{audit_dir}/YYYY-MM-DD.jsonl`
 pub struct AuditLog {
     audit_dir: PathBuf,
+    capture_content: bool,
     /// 进程内写锁：串行化追加写，避免多线程并发写时 line 与换行被拆成两次
     /// write() 系统调用而交错，产生损坏（非法 JSON）的行。
     write_lock: Mutex<()>,
@@ -156,8 +157,15 @@ impl AuditLog {
     pub fn new(audit_dir: impl AsRef<Path>) -> Self {
         Self {
             audit_dir: audit_dir.as_ref().to_path_buf(),
+            capture_content: true,
             write_lock: Mutex::new(()),
         }
+    }
+
+    /// 配置是否持久化请求与最终回答正文；默认保持开启以兼容现有 SDK。
+    pub fn with_content_capture(mut self, enabled: bool) -> Self {
+        self.capture_content = enabled;
+        self
     }
 
     /// 将单条记录序列化为「JSON + 换行」并以单次 `write_all` 原子追加。
@@ -192,7 +200,13 @@ impl AuditLog {
     /// 追加一条审计日志。
     pub fn log(&self, entry: &AuditEntry) -> Result<(), std::io::Error> {
         let path = self.today_file();
-        self.append_line(&path, entry)
+        if self.capture_content {
+            return self.append_line(&path, entry);
+        }
+        let mut redacted = entry.clone();
+        redacted.request.clear();
+        redacted.final_response = None;
+        self.append_line(&path, &redacted)
     }
 
     /// 查询审计日志。
@@ -351,6 +365,40 @@ mod tests {
         // 组合过滤
         let alice_a = log.query(None, Some("alice"), Some("user_a"), 100);
         assert_eq!(alice_a.len(), 1);
+    }
+
+    #[test]
+    fn content_capture_can_be_disabled_without_dropping_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let log = AuditLog::new(tmp.path()).with_content_capture(false);
+        let mut entry = make_entry("private-workspace", "private-user");
+        entry.request = "audit-request-secret".into();
+        entry.final_response = Some("audit-response-secret".into());
+        entry.tool_calls = vec![serde_json::json!({ "name": "read_file" })];
+        log.log(&entry).unwrap();
+
+        let raw = std::fs::read_to_string(log.today_file()).unwrap();
+        assert!(!raw.contains("audit-request-secret"));
+        assert!(!raw.contains("audit-response-secret"));
+
+        let stored = log.query(None, None, None, 1);
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].request.is_empty());
+        assert!(stored[0].final_response.is_none());
+        assert_eq!(stored[0].workspace_key, "private-workspace");
+        assert_eq!(stored[0].tool_calls.len(), 1);
+        assert_eq!(stored[0].total_duration, Some(1.5));
+    }
+
+    #[test]
+    fn content_capture_remains_enabled_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let log = AuditLog::new(tmp.path());
+        log.log(&make_entry("workspace", "user")).unwrap();
+
+        let stored = log.query(None, None, None, 1);
+        assert_eq!(stored[0].request, "test request");
+        assert_eq!(stored[0].final_response.as_deref(), Some("done"));
     }
 
     #[test]

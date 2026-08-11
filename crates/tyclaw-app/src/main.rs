@@ -39,6 +39,21 @@ struct AppConfig {
     monitor: MonitorConfig,
     #[serde(default)]
     analytics: tyclaw_control::AnalyticsConfig,
+    #[serde(default)]
+    privacy: PrivacyConfig,
+}
+
+/// 内容隐私配置；默认不采集或展示问答正文。
+#[derive(Debug, Clone, Deserialize)]
+struct PrivacyConfig {
+    #[serde(default = "default_true")]
+    hide_content: bool,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self { hide_content: true }
+    }
 }
 
 /// 监控 HTTP 服务配置。
@@ -75,8 +90,28 @@ fn default_true() -> bool { true }
 fn default_monitor_bind() -> String { "127.0.0.1".into() }
 fn default_monitor_port() -> u16 { 9394 }
 
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn privacy_hides_content_by_default() {
+        let config: AppConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(config.privacy.hide_content);
+    }
+
+    #[test]
+    fn privacy_can_be_disabled_explicitly() {
+        let config: AppConfig = serde_yaml::from_str("privacy:\n  hide_content: false\n").unwrap();
+        assert!(!config.privacy.hide_content);
+    }
+}
+
 /// 将配置转为 `MonitorOptions`；非 loopback 且无 basic_auth 时返回 `None`（拒绝裸奔）。
-fn resolve_monitor_options(cfg: &MonitorConfig) -> Option<monitor::MonitorOptions> {
+fn resolve_monitor_options(
+    cfg: &MonitorConfig,
+    hide_content: bool,
+) -> Option<monitor::MonitorOptions> {
     if !cfg.enabled {
         tracing::info!("Monitor disabled by config");
         return None;
@@ -100,6 +135,7 @@ fn resolve_monitor_options(cfg: &MonitorConfig) -> Option<monitor::MonitorOption
         bind: cfg.bind.clone(),
         port: cfg.port,
         basic_auth: basic,
+        hide_content,
     })
 }
 
@@ -134,6 +170,7 @@ fn format_effective_config(
     subtasks: &SubtasksConfig,
     monitor: &MonitorConfig,
     analytics: &tyclaw_control::AnalyticsConfig,
+    privacy: &PrivacyConfig,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     macro_rules! p {
@@ -179,13 +216,14 @@ fn format_effective_config(
     p!("monitor.bind: {}", monitor.bind);
     p!("monitor.port: {}", monitor.port);
     p!("monitor.basic_auth: {}", if monitor.basic_auth.is_some() { "configured" } else { "<none>" });
+    p!("privacy.hide_content: {}", privacy.hide_content);
     p!("analytics.enabled: {}", analytics.enabled);
     p!("analytics.timezone: {}", analytics.timezone);
     p!("analytics.detail_retention_days: {}", analytics.detail_retention_days);
     p!("analytics.aggregate_retention_days: {}", analytics.aggregate_retention_days);
     p!("analytics.session_timeout_minutes: {}", analytics.session_timeout_minutes);
     p!("analytics.max_storage_mb: {}", analytics.max_storage_mb);
-    p!("analytics.capture_content_preview: {}", analytics.capture_content_preview);
+    p!("analytics.capture_content_preview: {}", analytics.capture_content_preview && !privacy.hide_content);
     p!("analytics.preview_max_chars: {}", analytics.preview_max_chars);
     p!("===============================");
     lines
@@ -410,6 +448,7 @@ async fn main() {
         &cfg.subtasks,
         &app_cfg.monitor,
         &app_cfg.analytics,
+        &app_cfg.privacy,
     );
 
     info!(
@@ -453,6 +492,7 @@ async fn main() {
         workspace_config: cfg.workspace,
         performance: cfg.performance,
         analytics: app_cfg.analytics,
+        hide_content: app_cfg.privacy.hide_content,
         startup_lines: config_lines,
     };
 
@@ -556,6 +596,7 @@ struct RunConfig {
     /// 统一性能治理配置（污染过滤 / 会话规模 / 截断 / 并发 / 超时 等）。
     performance: tyclaw_orchestration::PerformanceConfig,
     analytics: tyclaw_control::AnalyticsConfig,
+    hide_content: bool,
     /// 启动时的配置摘要（在 CLI 滚动区显示）
     startup_lines: Vec<String>,
 }
@@ -583,6 +624,7 @@ impl RunConfig {
             .with_control(self.control_config)
             .with_performance(self.performance)
             .with_analytics(self.analytics)
+            .with_content_privacy(self.hide_content)
             .with_timer(timer_svc);
         if let Some((config, token_manager, robot_code)) = dingtalk_outbound {
             builder = builder.with_dingtalk_outbound(config, token_manager, robot_code);
@@ -599,6 +641,7 @@ impl RunConfig {
 async fn run_cli(config: RunConfig, monitor_cfg: MonitorConfig) {
     let idle_timeout_secs = config.workspace_config.idle_timeout_secs;
     let startup_lines = config.startup_lines.clone();
+    let hide_content = config.hide_content;
     let (timer_svc, timer_rx) = create_timer_service(&config.workspace);
 
     let mut orchestrator = config.build_orchestrator(timer_svc.clone(), None);
@@ -621,7 +664,10 @@ async fn run_cli(config: RunConfig, monitor_cfg: MonitorConfig) {
     let orchestrator = Arc::new(orchestrator);
 
     // 监控 HTTP 服务
-    monitor::spawn_monitor(Arc::clone(&orchestrator), resolve_monitor_options(&monitor_cfg));
+    monitor::spawn_monitor(
+        Arc::clone(&orchestrator),
+        resolve_monitor_options(&monitor_cfg, hide_content),
+    );
 
     // 启动 workspace 超时回收后台任务
     if idle_timeout_secs > 0 {
@@ -908,6 +954,7 @@ fn spawn_timer_consumer(
 /// CLI 退出时整个进程退出。
 async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig, monitor_cfg: MonitorConfig) {
     let idle_timeout_secs = config.workspace_config.idle_timeout_secs;
+    let hide_content = config.hide_content;
     let DingTalkConfig {
         client_id,
         client_secret,
@@ -965,7 +1012,10 @@ async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig, monitor_cfg: M
     let orchestrator = Arc::new(orchestrator);
 
     // 监控 HTTP 服务
-    monitor::spawn_monitor(Arc::clone(&orchestrator), resolve_monitor_options(&monitor_cfg));
+    monitor::spawn_monitor(
+        Arc::clone(&orchestrator),
+        resolve_monitor_options(&monitor_cfg, hide_content),
+    );
 
     // 启动 workspace 超时回收后台任务
     if idle_timeout_secs > 0 {
