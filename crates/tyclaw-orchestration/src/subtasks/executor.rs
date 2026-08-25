@@ -363,7 +363,7 @@ impl NodeExecutor {
             std::sync::Arc::new(tyclaw_tools::AllowAllGate),
             Some(tyclaw_sandbox::current_sandbox),
         )));
-        register_core_tools(&mut tools, &self.app.workspace);
+        register_core_tools(&mut tools, &self.app.workspace, &self.app.skill_execution);
         // Web 工具：sub agent（尤其是 search 类型）也需要搜索和抓取能力
         let ws_config = tyclaw_tools::WebSearchConfig::default();
         tools.register(Box::new(tyclaw_tools::WebSearchTool::new(ws_config)));

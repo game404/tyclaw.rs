@@ -37,6 +37,8 @@ pub struct BaseConfig {
     pub email: tyclaw_tools::EmailConfig,
     #[serde(default)]
     pub control: tyclaw_control::ControlConfig,
+    #[serde(default)]
+    pub skill_execution: tyclaw_tools::SkillExecutionConfig,
     /// 统一性能治理配置（污染过滤 / 会话规模 / 截断 / 并发 / 超时 等）。
     #[serde(default)]
     pub performance: PerformanceConfig,
@@ -475,6 +477,30 @@ mod perf_config_property_tests {
 #[cfg(test)]
 mod perf_config_default_tests {
     use super::*;
+
+    #[test]
+    fn base_config_loads_skill_execution_overrides() {
+        let yaml = concat!(
+            "skill_execution:\n",
+            "  default_timeout_secs: 1800\n",
+            "  skills:\n",
+            "    finance-payment:\n",
+            "      timeout_secs: 2700\n",
+        );
+        let cfg: BaseConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.skill_execution.timeout_for("finance-payment"), 2700);
+        assert_eq!(cfg.skill_execution.timeout_for("other"), 1800);
+    }
+
+    #[test]
+    fn example_config_contains_valid_skill_execution_policy() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../workspace/config/config.example.yaml");
+        let text = std::fs::read_to_string(path).unwrap();
+        let cfg: BaseConfig = serde_yaml::from_str(&text).unwrap();
+        assert_eq!(cfg.skill_execution.timeout_for("finance-payment"), 2700);
+        assert_eq!(cfg.skill_execution.timeout_for("unlisted"), 1800);
+    }
 
     // 验证各子结构 Default 值与需求一致。
 

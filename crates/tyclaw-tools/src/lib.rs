@@ -50,6 +50,9 @@ pub mod precheck;
 /// 工具输出截断限制配置 —— exec / grep_search 头尾双段截断的可配置上限
 pub mod truncation;
 
+/// Skill 执行识别与超时策略。
+pub mod skill_execution;
+
 // 重新导出核心类型
 pub use base::{RiskLevel, Tool};
 pub use executor::{
@@ -64,6 +67,11 @@ pub use filesystem::{
 pub use interaction::{AskUserTool, PendingRecommendStore, SuggestRecommendsTool};
 pub use registry::ToolRegistry;
 pub use shell::ExecTool;
+pub use skill_execution::{
+    identify_skill, identify_skill_in_workspace, validate_foreground_skill_command,
+    validate_foreground_skill_command_in_workspace, ResolvedSkillExecution, SkillExecutionConfig,
+    SkillTimeoutOverride, DEFAULT_SKILL_TIMEOUT_SECS, FOREGROUND_REQUIRED_ERROR,
+};
 pub use step_cache::{CachedValue, StepCache};
 pub use truncation::{
     current_truncation_limits, init_truncation_limits, TruncationLimits, DEFAULT_TAIL_RATIO,

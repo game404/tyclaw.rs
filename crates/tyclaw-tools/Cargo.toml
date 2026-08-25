@@ -19,6 +19,7 @@ uuid = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
 shellexpand = "3"
+shlex = { workspace = true }
 parking_lot = { workspace = true }
 glob = "0.3"
 urlencoding = { workspace = true }
@@ -33,4 +34,5 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1", "to
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
+serde_yaml = { workspace = true }
 tyclaw-sandbox = { path = "../tyclaw-sandbox" }

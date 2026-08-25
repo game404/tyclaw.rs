@@ -144,6 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_context_window_tokens_opt(context_window)
         .with_write_snapshot(snapshot)
         .with_workspaces_config(cfg.workspaces)
+        .with_skill_execution(cfg.skill_execution)
         .with_subtasks(cfg.subtasks)
         .with_web_search(cfg.web_search)
         .with_control(cfg.control)

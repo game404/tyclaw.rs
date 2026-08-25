@@ -102,6 +102,7 @@ fn make_executor(providers: HashMap<String, Arc<dyn LLMProvider>>, routing: Rout
         0,
         Default::default(),
         Default::default(),
+        Default::default(),
     );
     Arc::new(NodeExecutor::new(providers, routing, app))
 }
