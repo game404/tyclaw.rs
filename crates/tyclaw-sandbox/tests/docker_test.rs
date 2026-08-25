@@ -291,6 +291,30 @@ async fn test_docker_exec_timeout() {
     cleanup(&users_dir);
 }
 
+#[tokio::test]
+async fn test_timeout_does_not_kill_unrelated_process_group() {
+    let users_dir = temp_users_dir();
+    let pool = DockerPool::new(DockerConfig::default(), users_dir.clone())
+        .await.expect("Pool creation failed");
+    let ws = user_workspace(&users_dir, "test_targeted_timeout");
+    let sandbox = pool.acquire("test_targeted_timeout", &ws, &[])
+        .await.expect("Acquire failed");
+    let started = tokio::process::Command::new("docker").args([
+        "exec", sandbox.id(), "sh", "-c",
+        "setsid sleep 30 >/dev/null 2>&1 & echo $! > /workspace/work/tmp/unrelated.pid",
+    ]).output().await.expect("Failed to start unrelated process");
+    assert!(started.status.success());
+
+    let result = sandbox.exec("sleep 30", Duration::from_secs(1)).await.expect("Exec failed");
+    assert!(result.timed_out);
+    let check = sandbox.exec("kill -0 $(cat work/tmp/unrelated.pid)", Duration::from_secs(5))
+        .await.expect("Failed to inspect unrelated process");
+    assert_eq!(check.exit_code, 0, "unrelated process was terminated");
+    let _ = sandbox.exec("kill $(cat work/tmp/unrelated.pid) 2>/dev/null || true", Duration::from_secs(5)).await;
+    pool.release(sandbox, &ws).await.expect("Release failed");
+    cleanup(&users_dir);
+}
+
 /// 回归测试：曾经触发 `invalid mode: /workspace` 的 workspace_key 现在能正常 acquire+exec。
 ///
 /// 关键路径：

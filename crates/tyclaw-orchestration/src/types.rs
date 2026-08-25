@@ -42,6 +42,7 @@ pub struct RequestContext {
     /// 钉钉 conversation_id（群聊时为群 ID，私聊时可为空）。
     /// 用于 WorkspaceKeyStrategy::Conversation 模式。
     pub conversation_id: Option<String>,
+    pub timer_job_id: Option<String>,
     /// 用户发送的图片 data URI 列表（`data:image/...;base64,...`）。
     /// 非空时构建多模态消息。
     pub image_data_uris: Vec<String>,
@@ -59,6 +60,7 @@ impl Default for RequestContext {
             channel: "api".into(),
             chat_id: "direct".into(),
             conversation_id: None,
+            timer_job_id: None,
             image_data_uris: Vec::new(),
             file_attachments: Vec::new(),
         }
@@ -79,6 +81,7 @@ impl RequestContext {
             channel: channel.into(),
             chat_id: chat_id.into(),
             conversation_id: None,
+            timer_job_id: None,
             image_data_uris: Vec::new(),
             file_attachments: Vec::new(),
         }
@@ -107,6 +110,16 @@ impl RequestContext {
     pub fn with_files(mut self, files: Vec<(String, String)>) -> Self {
         self.file_attachments = files;
         self
+    }
+}
+
+#[cfg(test)]
+mod request_context_tests {
+    use super::*;
+    #[test]
+    fn ordinary_request_has_no_timer_job_id() {
+        assert!(RequestContext::default().timer_job_id.is_none());
+        assert!(RequestContext::new("u", "w", "cli", "direct").timer_job_id.is_none());
     }
 }
 

@@ -221,6 +221,7 @@ impl ChatbotHandler for DingTalkBot {
                 files: vec![],
                 reply_tx: None,
                 is_timer: false,
+                timer_job_id: None,
                 emotion_context: None,
             };
             match self.bus_handle.send_and_wait(msg).await {
@@ -350,6 +351,7 @@ impl ChatbotHandler for DingTalkBot {
                 .collect(),
             reply_tx: None,
             is_timer: false,
+            timer_job_id: None,
             emotion_context: Some((message.msg_id.clone(), message.conversation_id.clone())),
         };
 

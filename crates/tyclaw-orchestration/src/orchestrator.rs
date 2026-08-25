@@ -17,7 +17,7 @@
 //! 14. 自动提取案例记录（若本次使用了工具）
 
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -72,6 +72,23 @@ pub struct Orchestrator {
     /// 一个会话运行，不同会话在此排队，避免并发写同一份历史造成串扰。
     pub(crate) run_locks:
         parking_lot::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    pub(crate) active_timer_jobs: ActiveTimerRegistry,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ActiveTimerRegistry {
+    keys: Arc<parking_lot::Mutex<HashSet<(String, String)>>>,
+}
+pub(crate) struct ActiveTimerGuard { registry: ActiveTimerRegistry, key: (String, String) }
+impl ActiveTimerRegistry {
+    pub(crate) fn try_acquire(&self, workspace: &str, job: &str) -> Result<ActiveTimerGuard, ()> {
+        let key = (workspace.to_string(), job.to_string());
+        if !self.keys.lock().insert(key.clone()) { return Err(()); }
+        Ok(ActiveTimerGuard { registry: self.clone(), key })
+    }
+}
+impl Drop for ActiveTimerGuard {
+    fn drop(&mut self) { self.registry.keys.lock().remove(&self.key); }
 }
 
 /// 运行态会话键分隔符——控制字符 `\u{1}`，用户输入不会包含，避免与 channel/chat_id
@@ -340,6 +357,16 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_timer_job_is_mutually_exclusive() {
+        let registry = ActiveTimerRegistry::default();
+        let guard = registry.try_acquire("workspace", "job").unwrap();
+        assert!(registry.try_acquire("workspace", "job").is_err());
+        assert!(registry.try_acquire("workspace", "other").is_ok());
+        drop(guard);
+        assert!(registry.try_acquire("workspace", "job").is_ok());
+    }
     use serde_json::json;
 
     #[test]

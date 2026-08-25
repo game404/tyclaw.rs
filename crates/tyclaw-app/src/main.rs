@@ -919,6 +919,14 @@ async fn run_outbound_dispatcher(
 }
 
 /// 统一 Timer 消费 task：将 TimerJob 转换为 InboundMessage 推入 Bus。
+fn timer_execution_instruction(job_id: &str) -> &'static str {
+    match job_id {
+        "7f088316" | "addad09e" | "c9cd54b0" =>
+            "\n\n[运行时强制约束] 正式财务脚本必须在单次前台 exec 中运行并等待退出；禁止 setsid、nohup、尾部 &，禁止 sleep/ps/tail 轮询。脚本成功退出并校验产物后再执行后续步骤。",
+        _ => "",
+    }
+}
+
 fn spawn_timer_consumer(
     mut timer_rx: tokio::sync::mpsc::Receiver<tyclaw_tools::timer::TimerJob>,
     bus_handle: BusHandle,
@@ -927,7 +935,7 @@ fn spawn_timer_consumer(
         while let Some(job) = timer_rx.recv().await {
             info!(job_id = %job.id, name = %job.name, "Timer: dispatching job to bus");
             let msg = InboundMessage {
-                content: format!("[Scheduled Task: {}] {}", job.name, job.payload.message),
+                content: format!("[Scheduled Task: {}] {}{}", job.name, job.payload.message, timer_execution_instruction(&job.id)),
                 user_id: job.payload.user_id.clone(),
                 user_name: "timer".into(),
                 emotion_context: None,
@@ -939,6 +947,7 @@ fn spawn_timer_consumer(
                 files: vec![],
                 reply_tx: None,
                 is_timer: true,
+                timer_job_id: Some(job.id.clone()),
             };
             if let Err(e) = bus_handle.send(msg).await {
                 tracing::error!(job_id = %job.id, error = %e, "Timer: failed to send to bus");

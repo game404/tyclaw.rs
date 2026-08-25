@@ -3,8 +3,8 @@ pub mod tool;
 pub mod types;
 
 pub use service::{
-    TimerService, TIMER_CURRENT_CHANNEL, TIMER_CURRENT_CHAT_ID, TIMER_CURRENT_CONVERSATION_ID,
-    TIMER_CURRENT_USER_ID, TIMER_IN_CONTEXT,
+    current_timer_job_id, TimerService, TIMER_CURRENT_CHANNEL, TIMER_CURRENT_CHAT_ID,
+    TIMER_CURRENT_CONVERSATION_ID, TIMER_CURRENT_JOB_ID, TIMER_CURRENT_USER_ID, TIMER_IN_CONTEXT,
 };
 pub use tool::TimerTool;
 pub use types::{TimerJob, TimerSchedule, TimerStore};

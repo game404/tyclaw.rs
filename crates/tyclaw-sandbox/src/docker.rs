@@ -4,10 +4,11 @@
 //! 容器常驻（`--restart=unless-stopped`），release 时只杀残留进程。
 //! 所有工具操作都通过 docker exec 执行，确保在容器安全边界内。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use tokio::process::Command;
@@ -82,7 +83,56 @@ pub struct DockerSandbox {
     work_dir: String,
     /// workspace key（通常等于 user_id），注入为环境变量供 skill 脚本使用。
     workspace_key: String,
+    active_runs: ActiveRunRegistry,
 }
+
+#[derive(Clone, Default)]
+struct ActiveRunRegistry(Arc<StdMutex<HashMap<String, HashSet<String>>>>);
+struct ActiveRunGuard { registry: ActiveRunRegistry, workspace: String, run: String }
+impl ActiveRunRegistry {
+    fn start(&self, workspace: &str, run: &str) -> ActiveRunGuard {
+        self.0.lock().unwrap().entry(workspace.into()).or_default().insert(run.into());
+        ActiveRunGuard { registry: self.clone(), workspace: workspace.into(), run: run.into() }
+    }
+    fn active(&self, workspace: &str) -> bool {
+        self.0.lock().unwrap().get(workspace).is_some_and(|runs| !runs.is_empty())
+    }
+}
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        let mut all = self.registry.0.lock().unwrap();
+        if let Some(runs) = all.get_mut(&self.workspace) {
+            runs.remove(&self.run);
+            if runs.is_empty() { all.remove(&self.workspace); }
+        }
+    }
+}
+static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+fn next_run_id() -> String {
+    format!("{}-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
+        RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed))
+}
+const PROCESS_WRAPPER: &str = r#"
+run_id=$1; timer_job_id=$2; marker=$3; command=$4
+mkdir -p "$(dirname "$marker")"
+setsid sh -c "$command" & child=$!
+printf 'run_id=%s\npid=%s\npgid=%s\ntimer_job_id=%s\nstarted_at=%s\n' \
+  "$run_id" "$child" "$child" "$timer_job_id" "$(date +%s)" > "$marker"
+trap 'rm -f "$marker"' EXIT
+wait "$child"; status=$?
+kill -TERM -- "-$child" 2>/dev/null || true; sleep 0.1
+kill -KILL -- "-$child" 2>/dev/null || true
+exit "$status"
+"#;
+const TERMINATE_GROUP: &str = r#"
+marker=$1; attempt=0
+while [ ! -f "$marker" ] && [ "$attempt" -lt 50 ]; do sleep 0.1; attempt=$((attempt+1)); done
+[ -f "$marker" ] || exit 0
+pgid=$(sed -n 's/^pgid=//p' "$marker")
+case "$pgid" in (*[!0-9]*|'') exit 0;; esac
+kill -TERM -- "-$pgid" 2>/dev/null || true; sleep 2
+kill -KILL -- "-$pgid" 2>/dev/null || true; rm -f "$marker"
+"#;
 
 impl DockerSandbox {
     /// 将路径解析为容器内绝对路径。
@@ -100,10 +150,14 @@ impl DockerSandbox {
 #[async_trait]
 impl Sandbox for DockerSandbox {
     async fn exec(&self, cmd: &str, timeout: Duration) -> Result<SandboxExecResult, TyclawError> {
+        self.exec_with_context(cmd, timeout, SandboxExecContext::default()).await
+    }
+    async fn exec_with_context(&self, cmd: &str, timeout: Duration, context: SandboxExecContext) -> Result<SandboxExecResult, TyclawError> {
         let tmpdir = format!("{}/work/tmp", self.work_dir);
-        let result = tokio::time::timeout(
-            timeout,
-            Command::new("docker")
+        let run_id = next_run_id();
+        let marker = format!("{tmpdir}/.tyclaw-runs/{run_id}.run");
+        let _guard = self.active_runs.start(&self.workspace_key, &run_id);
+        let result = Command::new("docker")
                 .args([
                     "exec",
                     "-e",
@@ -115,36 +169,50 @@ impl Sandbox for DockerSandbox {
                     &self.container_name,
                     "sh",
                     "-c",
-                    cmd,
-                ])
-                .output(),
-        )
-        .await;
+                    PROCESS_WRAPPER, "tyclaw-exec", &run_id,
+                    context.timer_job_id.as_deref().unwrap_or(""), &marker, cmd,
+                ]).output();
+        tokio::pin!(result);
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        enum Finish { Output(std::io::Result<std::process::Output>), Timeout, Cancelled }
+        let finish = if let Some(token) = context.cancellation {
+            tokio::select! {
+                output = &mut result => Finish::Output(output),
+                _ = &mut deadline => Finish::Timeout,
+                _ = token.cancelled() => Finish::Cancelled,
+            }
+        } else {
+            tokio::select! {
+                output = &mut result => Finish::Output(output),
+                _ = &mut deadline => Finish::Timeout,
+            }
+        };
 
-        match result {
-            Err(_) => {
+        match finish {
+            Finish::Timeout | Finish::Cancelled => {
                 let _ = Command::new("docker")
                     .args([
                         "exec",
                         &self.container_name,
                         "sh",
                         "-c",
-                        "kill -9 -1 2>/dev/null; true",
+                        TERMINATE_GROUP, "tyclaw-terminate", &marker,
                     ])
                     .output()
                     .await;
                 Ok(SandboxExecResult {
                     stdout: String::new(),
-                    stderr: String::new(),
+                    stderr: if matches!(finish, Finish::Cancelled) { "Command cancelled".into() } else { String::new() },
                     exit_code: -1,
-                    timed_out: true,
+                    timed_out: matches!(finish, Finish::Timeout),
                 })
             }
-            Ok(Err(e)) => Err(TyclawError::Tool {
+            Finish::Output(Err(e)) => Err(TyclawError::Tool {
                 tool: "docker_exec".into(),
                 message: format!("docker exec failed: {e}"),
             }),
-            Ok(Ok(output)) => Ok(SandboxExecResult {
+            Finish::Output(Ok(output)) => Ok(SandboxExecResult {
                 stdout: String::from_utf8_lossy(&output.stdout).to_string(),
                 stderr: String::from_utf8_lossy(&output.stderr).to_string(),
                 exit_code: output.status.code().unwrap_or(-1),
@@ -653,6 +721,7 @@ pub struct DockerPool {
     containers: Mutex<HashMap<String, WorkspaceContainer>>,
     /// 顶层 workspace 根目录（命令行 --workspace）
     root: PathBuf,
+    active_runs: ActiveRunRegistry,
 }
 
 #[derive(Clone)]
@@ -723,6 +792,7 @@ impl DockerPool {
             config,
             containers: Mutex::new(HashMap::new()),
             root,
+            active_runs: ActiveRunRegistry::default(),
         }))
     }
 
@@ -985,6 +1055,7 @@ impl SandboxPool for DockerPool {
                     mount_root: user_mount_root(&self.config.work_dir),
                     work_dir: self.config.work_dir.clone(),
                     workspace_key: workspace_key.clone(),
+                    active_runs: self.active_runs.clone(),
                 }));
             }
             info!(name = %entry.container_name, "Cached container is stale, recreating");
@@ -1013,6 +1084,7 @@ impl SandboxPool for DockerPool {
             mount_root: user_mount_root(&self.config.work_dir),
             work_dir: self.config.work_dir.clone(),
             workspace_key: ws_key,
+            active_runs: self.active_runs.clone(),
         }))
     }
 
@@ -1021,6 +1093,7 @@ impl SandboxPool for DockerPool {
         sandbox: Arc<dyn Sandbox>,
         _task_workspace: &PathBuf,
     ) -> Result<(), TyclawError> {
+        if self.active_runs.active(sandbox.workspace_key()) { return Ok(()); }
         let sandbox_name = sandbox.id().to_string();
 
         let containers = self.containers.lock().await;
@@ -1049,18 +1122,6 @@ impl SandboxPool for DockerPool {
                     name = %entry.container_name,
                     "dws device login in progress, skipping reap kill"
                 );
-            } else {
-                // 杀掉容器内残留进程，但不移除容器（容器常驻复用）
-                let _ = Command::new("docker")
-                    .args([
-                        "exec",
-                        &entry.container_name,
-                        "sh",
-                        "-c",
-                        "kill -9 -1 2>/dev/null; true",
-                    ])
-                    .output()
-                    .await;
             }
         }
 
@@ -1084,6 +1145,7 @@ impl SandboxPool for DockerPool {
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
+    fn is_workspace_active(&self, workspace_key: &str) -> bool { self.active_runs.active(workspace_key) }
 }
 
 fn user_mount_root(_work_dir: &str) -> String {

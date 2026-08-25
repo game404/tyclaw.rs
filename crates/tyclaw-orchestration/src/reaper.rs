@@ -35,6 +35,11 @@ impl Orchestrator {
                     .sessions
                     .find_idle_workspaces(idle_timeout_secs);
                 for workspace_key in idle_keys {
+                    if orch.sandbox_pool.as_ref().is_some_and(|p| p.is_workspace_active(&workspace_key)) {
+                        orch.persistence.sessions.touch(&workspace_key);
+                        info!(workspace_key = %workspace_key, "Skipping reap: foreground command is active");
+                        continue;
+                    }
                     // 检查 work 目录下是否有近期文件修改（子 agent 可能仍在执行）
                     let work_dir = orch.persistence.workspace_mgr.work_dir(&workspace_key);
                     if has_recent_file_activity(&work_dir, idle_timeout_secs) {
