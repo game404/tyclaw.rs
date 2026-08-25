@@ -15,50 +15,28 @@ use tokio::process::Command;
 use tyclaw_tool_abi::Sandbox;
 
 use crate::base::{brief_truncate, truncate_head_tail, RiskLevel, Tool};
+use crate::skill_execution::{
+    validate_foreground_skill_command_in_workspace, ResolvedSkillExecution, SkillExecutionConfig,
+};
 use crate::truncation::current_truncation_limits;
 
 /// 命令执行的默认超时时间（秒）。
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
-const LONG_TIMER_JOB_IDS: &[&str] = &["7f088316", "addad09e", "c9cd54b0"];
 
-fn effective_timeout_secs(job: Option<&str>, cmd: &str, requested: Option<u64>, default: u64) -> u64 {
-    let lower = cmd.to_ascii_lowercase();
-    match job {
-        Some("52bb6d84" | "faa28743") => 120,
-        Some("7f088316" | "addad09e") if lower.contains("run_payment_report.py") => 2700,
-        Some("c9cd54b0") if lower.contains("run_ar_report.py") => 7200,
-        Some("c9cd54b0") if lower.contains("revenue_qa.py") => 600,
-        _ => requested.unwrap_or(default),
+fn format_sandbox_result(
+    result: &tyclaw_tool_abi::SandboxExecResult,
+    resolved_skill: Option<&ResolvedSkillExecution>,
+    timeout_secs: u64,
+) -> String {
+    if result.timed_out {
+        if let Some(resolved) = resolved_skill {
+            return format!(
+                "Error: Skill '{}' 执行超时（{} 秒）",
+                resolved.skill_name, timeout_secs
+            );
+        }
     }
-}
-
-fn validate_timer_command(job: Option<&str>, command: &str) -> Result<(), &'static str> {
-    if !job.is_some_and(|id| LONG_TIMER_JOB_IDS.contains(&id)) { return Ok(()); }
-    let lower = command.to_ascii_lowercase();
-    let known = ["run_payment_report.py", "run_ar_report.py", "revenue_qa.py"]
-        .iter().any(|s| lower.contains(s));
-    let forbidden_word = |word: &str| Regex::new(&format!(r"(?:^|[\s;&|]){}(?:$|[\s;&|])", word))
-        .is_ok_and(|r| r.is_match(&lower));
-    let bytes = command.as_bytes();
-    let background = bytes.iter().enumerate().any(|(i, byte)| {
-        *byte == b'&' && i.checked_sub(1).and_then(|n| bytes.get(n)) != Some(&b'>')
-    });
-    let shell_chain = command.contains(';') || command.contains('|')
-        || command.contains("&&") || background;
-    let direct = if known {
-        let executable = command.split_whitespace()
-            .find(|part| !part.contains('='))
-            .unwrap_or_default().trim_matches(['\'', '"']);
-        let executable = std::path::Path::new(executable).file_name()
-            .and_then(|name| name.to_str()).unwrap_or_default();
-        executable == "python" || executable.starts_with("python3")
-    } else { true };
-    if forbidden_word("setsid") || forbidden_word("nohup")
-        || forbidden_word("sleep") || forbidden_word("ps") || forbidden_word("tail")
-        || (known && (shell_chain || !direct)) {
-        return Err("该定时任务必须使用单次前台 exec：禁止 setsid、nohup、后台 &、命令串联以及 sleep/ps/tail 轮询");
-    }
-    Ok(())
+    result.to_tool_output()
 }
 
 /// 危险命令的正则匹配模式列表。
@@ -89,6 +67,7 @@ pub struct ExecTool {
     timeout_secs: u64,           // 超时时间
     working_dir: Option<String>, // 工作目录
     deny_patterns: Vec<Regex>,   // 编译后的危险命令模式
+    skill_execution: SkillExecutionConfig,
 }
 
 impl ExecTool {
@@ -97,6 +76,14 @@ impl ExecTool {
     /// - `working_dir`: 命令执行的工作目录（None 则使用当前目录）
     /// - `timeout_secs`: 超时时间（None 则使用默认60秒）
     pub fn new(working_dir: Option<String>, timeout_secs: Option<u64>) -> Self {
+        Self::with_skill_execution(working_dir, timeout_secs, SkillExecutionConfig::default())
+    }
+
+    pub fn with_skill_execution(
+        working_dir: Option<String>,
+        timeout_secs: Option<u64>,
+        skill_execution: SkillExecutionConfig,
+    ) -> Self {
         // 预编译所有危险命令正则表达式
         let deny_patterns = DENY_PATTERNS
             .iter()
@@ -106,7 +93,24 @@ impl ExecTool {
             timeout_secs: timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
             working_dir,
             deny_patterns,
+            skill_execution,
         }
+    }
+
+    fn resolve_command_policy(
+        &self,
+        command: &str,
+        requested_timeout: Option<u64>,
+    ) -> Result<(u64, Option<ResolvedSkillExecution>), &'static str> {
+        if let Some(resolved) = self.skill_execution.resolve_in_workspace(
+            command,
+            requested_timeout,
+            self.working_dir.as_deref(),
+        ) {
+            validate_foreground_skill_command_in_workspace(command, self.working_dir.as_deref())?;
+            return Ok((resolved.timeout_secs, Some(resolved)));
+        }
+        Ok((requested_timeout.unwrap_or(self.timeout_secs), None))
     }
 }
 
@@ -170,7 +174,6 @@ impl Tool for ExecTool {
             None => return "Error: Missing 'command' parameter".into(),
         };
         let timer_job_id = crate::timer::current_timer_job_id();
-        if let Err(e) = validate_timer_command(timer_job_id.as_deref(), command) { return format!("Error: {e}"); }
         let lower = command.trim().to_lowercase();
         for pattern in &self.deny_patterns {
             if pattern.is_match(&lower) {
@@ -178,15 +181,27 @@ impl Tool for ExecTool {
                 return "Error: Command blocked by safety guard".into();
             }
         }
-        let timeout_secs = effective_timeout_secs(timer_job_id.as_deref(), command,
-            params.get("timeout").and_then(|v| v.as_u64()), self.timeout_secs);
+        let (timeout_secs, resolved_skill) = match self
+            .resolve_command_policy(command, params.get("timeout").and_then(|v| v.as_u64()))
+        {
+            Ok(policy) => policy,
+            Err(error) => return format!("Error: {error}"),
+        };
+        if let Some(resolved) = &resolved_skill {
+            tracing::info!(
+                skill_name = %resolved.skill_name,
+                policy_source = resolved.source,
+                timeout_secs,
+                "Applying skill execution policy"
+            );
+        }
         match sandbox
             .exec_with_context(command, std::time::Duration::from_secs(timeout_secs),
                 tyclaw_tool_abi::SandboxExecContext { timer_job_id, cancellation: tyclaw_tool_abi::current_exec_cancel_token() })
             .await
         {
             Ok(r) => {
-                let text = r.to_tool_output();
+                let text = format_sandbox_result(&r, resolved_skill.as_ref(), timeout_secs);
                 let limits = current_truncation_limits();
                 truncate_head_tail(&text, limits.exec_truncate_chars, limits.tail_ratio)
             }
@@ -199,9 +214,6 @@ impl Tool for ExecTool {
             Some(c) => c,
             None => return "Error: Missing 'command' parameter".into(),
         };
-        let timer_job_id = crate::timer::current_timer_job_id();
-        if let Err(e) = validate_timer_command(timer_job_id.as_deref(), command) { return format!("Error: {e}"); }
-
         // 安全检查：匹配危险命令模式
         let lower = command.trim().to_lowercase();
         for pattern in &self.deny_patterns {
@@ -211,8 +223,20 @@ impl Tool for ExecTool {
             }
         }
 
-        let timeout_secs = effective_timeout_secs(timer_job_id.as_deref(), command,
-            params.get("timeout").and_then(|v| v.as_u64()), self.timeout_secs);
+        let (timeout_secs, resolved_skill) = match self
+            .resolve_command_policy(command, params.get("timeout").and_then(|v| v.as_u64()))
+        {
+            Ok(policy) => policy,
+            Err(error) => return format!("Error: {error}"),
+        };
+        if let Some(resolved) = &resolved_skill {
+            tracing::info!(
+                skill_name = %resolved.skill_name,
+                policy_source = resolved.source,
+                timeout_secs,
+                "Applying skill execution policy"
+            );
+        }
 
         // Host 执行
         let cwd = if let Some(wd) = params.get("working_directory").and_then(|v| v.as_str()) {
@@ -257,8 +281,16 @@ impl Tool for ExecTool {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     let _ = Command::new("kill").args(["-KILL", "--", &group]).output().await;
                 }
-                if matches!(result, HostFinish::Cancelled) { "Error: Command cancelled".into() }
-                else { format!("Error: Command timed out after {timeout_secs} seconds") }
+                if matches!(result, HostFinish::Cancelled) {
+                    "Error: Command cancelled".into()
+                } else if let Some(resolved) = resolved_skill {
+                    format!(
+                        "Error: Skill '{}' 执行超时（{} 秒）",
+                        resolved.skill_name, timeout_secs
+                    )
+                } else {
+                    format!("Error: Command timed out after {timeout_secs} seconds")
+                }
             }
             // 执行失败（如找不到 sh）
             HostFinish::Output(Err(e)) => format!("Error executing command: {e}"),
@@ -516,19 +548,64 @@ fn compress_git_diff(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{SkillExecutionConfig, SkillTimeoutOverride};
 
     #[test]
-    fn timer_timeout_policy_and_foreground_guard() {
-        assert_eq!(effective_timeout_secs(Some("7f088316"), "python run_payment_report.py", Some(1), 120), 2700);
-        assert_eq!(effective_timeout_secs(Some("c9cd54b0"), "python run_ar_report.py", None, 120), 7200);
-        assert_eq!(effective_timeout_secs(Some("c9cd54b0"), "python revenue_qa.py refresh", Some(9999), 120), 600);
-        assert_eq!(effective_timeout_secs(None, "python run_ar_report.py", Some(300), 120), 300);
-        for command in ["setsid python run_ar_report.py", "nohup python run_ar_report.py",
-            "python run_ar_report.py &", "python run_ar_report.py 2>&1 &",
-            "sh -c 'python run_ar_report.py'", "sleep 1; ps; tail x.log"] {
-            assert!(validate_timer_command(Some("c9cd54b0"), command).is_err());
-        }
-        assert!(validate_timer_command(Some("7f088316"), "python run_payment_report.py >x.log 2>&1").is_ok());
+    fn exec_tool_resolves_skill_and_ordinary_timeouts_separately() {
+        let mut config = SkillExecutionConfig::default();
+        config.skills.insert(
+            "finance-payment".into(),
+            SkillTimeoutOverride { timeout_secs: 2700 },
+        );
+        let tool = ExecTool::with_skill_execution(None, Some(120), config);
+
+        let (skill_timeout, skill) = tool
+            .resolve_command_policy(
+                "python3 /workspace/skills/finance/finance-payment/scripts/run.py",
+                Some(9999),
+            )
+            .unwrap();
+        assert_eq!(skill_timeout, 2700);
+        assert_eq!(skill.unwrap().skill_name, "finance-payment");
+
+        let (ordinary_timeout, skill) = tool.resolve_command_policy("echo ok", Some(7)).unwrap();
+        assert_eq!(ordinary_timeout, 7);
+        assert!(skill.is_none());
+    }
+
+    #[tokio::test]
+    async fn exec_tool_rejects_background_skill_without_running_it() {
+        let tool = ExecTool::with_skill_execution(None, Some(120), SkillExecutionConfig::default());
+        let mut params = HashMap::new();
+        params.insert(
+            "command".into(),
+            json!("python3 /workspace/skills/finance/a/scripts/run.py &"),
+        );
+        let result = tool.execute(params).await;
+        assert!(result.contains("Skill 必须使用单次前台 exec"));
+    }
+
+    #[test]
+    fn sandbox_timeout_uses_skill_aware_error_message() {
+        let timed_out = tyclaw_tool_abi::SandboxExecResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: -1,
+            timed_out: true,
+        };
+        let resolved = ResolvedSkillExecution {
+            skill_name: "finance-payment".into(),
+            timeout_secs: 2700,
+            source: "override",
+        };
+        assert_eq!(
+            format_sandbox_result(&timed_out, Some(&resolved), 2700),
+            "Error: Skill 'finance-payment' 执行超时（2700 秒）"
+        );
+        assert_eq!(
+            format_sandbox_result(&timed_out, None, 120),
+            "Error: Command timed out"
+        );
     }
 
     /// 测试：正常执行 echo 命令

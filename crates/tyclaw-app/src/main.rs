@@ -105,6 +105,13 @@ mod config_tests {
         let config: AppConfig = serde_yaml::from_str("privacy:\n  hide_content: false\n").unwrap();
         assert!(!config.privacy.hide_content);
     }
+
+    #[test]
+    fn timer_message_contains_only_job_name_and_payload() {
+        let content = timer_message_content("测试任务", "执行付款脚本");
+        assert_eq!(content, "[Scheduled Task: 测试任务] 执行付款脚本");
+        assert!(!content.contains("运行时强制约束"));
+    }
 }
 
 /// 将配置转为 `MonitorOptions`；非 loopback 且无 basic_auth 时返回 `None`（拒绝裸奔）。
@@ -490,6 +497,7 @@ async fn main() {
         email_config: cfg.email,
         control_config: cfg.control,
         workspace_config: cfg.workspace,
+        skill_execution: cfg.skill_execution,
         performance: cfg.performance,
         analytics: app_cfg.analytics,
         hide_content: app_cfg.privacy.hide_content,
@@ -593,6 +601,7 @@ struct RunConfig {
     email_config: tyclaw_tools::EmailConfig,
     control_config: tyclaw_orchestration::ControlConfig,
     workspace_config: tyclaw_orchestration::WorkspaceRuntimeConfig,
+    skill_execution: tyclaw_tools::SkillExecutionConfig,
     /// 统一性能治理配置（污染过滤 / 会话规模 / 截断 / 并发 / 超时 等）。
     performance: tyclaw_orchestration::PerformanceConfig,
     analytics: tyclaw_control::AnalyticsConfig,
@@ -618,6 +627,7 @@ impl RunConfig {
             .with_write_snapshot(self.write_snapshot)
             .with_workspaces_config(self.workspaces)
             .with_workspace_key_strategy(self.workspace_config.key_strategy.clone())
+            .with_skill_execution(self.skill_execution)
             .with_subtasks(self.subtasks_config)
             .with_web_search(self.web_search_config)
             .with_email(self.email_config)
@@ -919,12 +929,8 @@ async fn run_outbound_dispatcher(
 }
 
 /// 统一 Timer 消费 task：将 TimerJob 转换为 InboundMessage 推入 Bus。
-fn timer_execution_instruction(job_id: &str) -> &'static str {
-    match job_id {
-        "7f088316" | "addad09e" | "c9cd54b0" =>
-            "\n\n[运行时强制约束] 正式财务脚本必须在单次前台 exec 中运行并等待退出；禁止 setsid、nohup、尾部 &，禁止 sleep/ps/tail 轮询。脚本成功退出并校验产物后再执行后续步骤。",
-        _ => "",
-    }
+fn timer_message_content(name: &str, message: &str) -> String {
+    format!("[Scheduled Task: {name}] {message}")
 }
 
 fn spawn_timer_consumer(
@@ -935,7 +941,7 @@ fn spawn_timer_consumer(
         while let Some(job) = timer_rx.recv().await {
             info!(job_id = %job.id, name = %job.name, "Timer: dispatching job to bus");
             let msg = InboundMessage {
-                content: format!("[Scheduled Task: {}] {}{}", job.name, job.payload.message, timer_execution_instruction(&job.id)),
+                content: timer_message_content(&job.name, &job.payload.message),
                 user_id: job.payload.user_id.clone(),
                 user_name: "timer".into(),
                 emotion_context: None,

@@ -48,6 +48,7 @@ pub struct OrchestratorBuilder {
     pub(crate) workspace_key_strategy: tyclaw_control::WorkspaceKeyStrategy,
     pub(crate) path_config: tyclaw_control::PathConfig,
     pub(crate) performance: Option<crate::config::PerformanceConfig>,
+    pub(crate) skill_execution: Option<tyclaw_tools::SkillExecutionConfig>,
     pub(crate) analytics_config: Option<tyclaw_control::AnalyticsConfig>,
     pub(crate) hide_content: bool,
 }
@@ -73,6 +74,7 @@ impl OrchestratorBuilder {
             workspace_key_strategy: tyclaw_control::WorkspaceKeyStrategy::default(),
             path_config: tyclaw_control::PathConfig::default(),
             performance: None,
+            skill_execution: None,
             analytics_config: None,
             hide_content: false,
         }
@@ -216,6 +218,11 @@ impl OrchestratorBuilder {
         self
     }
 
+    pub fn with_skill_execution(mut self, config: tyclaw_tools::SkillExecutionConfig) -> Self {
+        self.skill_execution = Some(config);
+        self
+    }
+
     /// 显式注入使用统计配置；未调用时嵌入式 SDK 不采集。
     pub fn with_analytics(mut self, config: tyclaw_control::AnalyticsConfig) -> Self {
         self.analytics_config = Some(config);
@@ -250,6 +257,7 @@ impl OrchestratorBuilder {
             workspace_key_strategy,
             path_config,
             performance,
+            skill_execution,
             analytics_config,
             hide_content,
         } = self;
@@ -264,6 +272,7 @@ impl OrchestratorBuilder {
         // 性能治理配置：未注入时取需求默认值，并执行加载时 clamp（截断下限 / 并发下限 / node 超时上限）。
         let mut performance = performance.unwrap_or_default();
         performance.clamp();
+        let skill_execution = skill_execution.unwrap_or_default();
 
         // control.yaml 驱动 features 开关
         let features = OrchestratorFeatures {
@@ -280,6 +289,7 @@ impl OrchestratorBuilder {
             ctx_window,
             features.clone(),
             performance,
+            skill_execution.clone(),
         );
 
         // 初始化 prompt 路径变量替换
@@ -347,7 +357,7 @@ impl OrchestratorBuilder {
         };
 
         let mut runtime_registry = build_tool_surface_registry(
-            tools_for_loop.unwrap_or_else(|| default_tool_registry(&workspace)),
+            tools_for_loop.unwrap_or_else(|| default_tool_registry(&workspace, &skill_execution)),
             &surface_config,
         );
         attach_runtime_executor(&mut runtime_registry, features.enable_rbac);
@@ -398,7 +408,11 @@ fn apply_content_privacy(
 ///
 /// 包含：ReadFile, WriteFile, EditFile, ListDir, GrepSearch, Glob, Exec
 /// 不含交互类工具（AskUser, SendFile 等），由调用方按需追加。
-pub fn register_core_tools(tools: &mut ToolRegistry, workspace: &Path) {
+pub fn register_core_tools(
+    tools: &mut ToolRegistry,
+    workspace: &Path,
+    skill_execution: &tyclaw_tools::SkillExecutionConfig,
+) {
     let ws = Some(workspace.to_path_buf());
     tools.register(Box::new(ReadFileTool::new(ws.clone())));
     tools.register(Box::new(WriteFileTool::new(ws.clone())));
@@ -411,21 +425,29 @@ pub fn register_core_tools(tools: &mut ToolRegistry, workspace: &Path) {
     tools.register(Box::new(CopyFileTool::new(ws.clone())));
     tools.register(Box::new(MoveFileTool::new(ws.clone())));
     tools.register(Box::new(MkdirTool::new(ws)));
-    tools.register(Box::new(ExecTool::new(
+    tools.register(Box::new(ExecTool::with_skill_execution(
         Some(workspace.to_string_lossy().into()),
         None,
+        skill_execution.clone(),
     )));
 }
 
 /// 注册默认工具集到工具注册表（核心工具 + AskUser）。
-pub(crate) fn register_default_tools(tools: &mut ToolRegistry, workspace: &Path) {
-    register_core_tools(tools, workspace);
+pub(crate) fn register_default_tools(
+    tools: &mut ToolRegistry,
+    workspace: &Path,
+    skill_execution: &tyclaw_tools::SkillExecutionConfig,
+) {
+    register_core_tools(tools, workspace, skill_execution);
     tools.register(Box::new(AskUserTool::new()));
 }
 
-pub(crate) fn default_tool_registry(workspace: &Path) -> ToolRegistry {
+pub(crate) fn default_tool_registry(
+    workspace: &Path,
+    skill_execution: &tyclaw_tools::SkillExecutionConfig,
+) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
-    register_default_tools(&mut reg, workspace);
+    register_default_tools(&mut reg, workspace, skill_execution);
     reg
 }
 

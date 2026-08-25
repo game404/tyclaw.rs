@@ -25,6 +25,8 @@ pub struct AppContext {
     /// 统一性能治理配置（污染过滤 / 会话规模 / 截断 / 并发 / 超时 等）。
     /// 编排请求生命周期的治理关卡（污染剔除 / 配对修复 / 规模上限）据此读取阈值。
     pub performance: PerformanceConfig,
+    /// Skill 执行超时和前台执行策略。
+    pub skill_execution: tyclaw_tools::SkillExecutionConfig,
 }
 
 impl AppContext {
@@ -35,6 +37,7 @@ impl AppContext {
         context_window_tokens: usize,
         features: OrchestratorFeatures,
         performance: PerformanceConfig,
+        skill_execution: tyclaw_tools::SkillExecutionConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
             workspace,
@@ -43,6 +46,7 @@ impl AppContext {
             context_window_tokens,
             features,
             performance,
+            skill_execution,
         })
     }
 }
