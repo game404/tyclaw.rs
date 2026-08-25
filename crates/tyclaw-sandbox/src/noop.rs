@@ -4,6 +4,7 @@
 //! 行为与现有 ExecTool/ReadFileTool 完全一致。
 
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -23,28 +24,50 @@ pub struct NoopSandbox {
 #[async_trait]
 impl Sandbox for NoopSandbox {
     async fn exec(&self, cmd: &str, timeout: Duration) -> Result<SandboxExecResult, TyclawError> {
-        let result = tokio::time::timeout(
-            timeout,
-            Command::new("sh")
+        self.exec_with_context(cmd, timeout, SandboxExecContext::default()).await
+    }
+    async fn exec_with_context(&self, cmd: &str, timeout: Duration, context: SandboxExecContext) -> Result<SandboxExecResult, TyclawError> {
+        let mut process = Command::new("sh");
+        process
                 .arg("-c")
                 .arg(cmd)
                 .current_dir(&self.workspace)
-                .output(),
-        )
-        .await;
+                .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        #[cfg(unix)] process.process_group(0);
+        let child = process.spawn().map_err(|e| TyclawError::Tool {
+            tool: "sandbox_exec".into(), message: format!("Failed to execute: {e}") })?;
+        let pgid = child.id();
+        let output = child.wait_with_output();
+        tokio::pin!(output);
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        enum Finish { Output(std::io::Result<std::process::Output>), Timeout, Cancelled }
+        let finish = if let Some(token) = context.cancellation {
+            tokio::select! { result = &mut output => Finish::Output(result), _ = &mut deadline => Finish::Timeout, _ = token.cancelled() => Finish::Cancelled }
+        } else {
+            tokio::select! { result = &mut output => Finish::Output(result), _ = &mut deadline => Finish::Timeout }
+        };
 
-        match result {
-            Err(_) => Ok(SandboxExecResult {
+        match finish {
+            Finish::Timeout | Finish::Cancelled => {
+                #[cfg(unix)] if let Some(pgid) = pgid {
+                    let group = format!("-{pgid}");
+                    let _ = Command::new("kill").args(["-TERM", "--", &group]).output().await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let _ = Command::new("kill").args(["-KILL", "--", &group]).output().await;
+                }
+                let cancelled = matches!(finish, Finish::Cancelled);
+                Ok(SandboxExecResult {
                 stdout: String::new(),
-                stderr: String::new(),
+                stderr: if cancelled { "Command cancelled".into() } else { String::new() },
                 exit_code: -1,
-                timed_out: true,
-            }),
-            Ok(Err(e)) => Err(TyclawError::Tool {
+                timed_out: !cancelled,
+            })}
+            Finish::Output(Err(e)) => Err(TyclawError::Tool {
                 tool: "sandbox_exec".into(),
                 message: format!("Failed to execute: {e}"),
             }),
-            Ok(Ok(output)) => Ok(SandboxExecResult {
+            Finish::Output(Ok(output)) => Ok(SandboxExecResult {
                 stdout: String::from_utf8_lossy(&output.stdout).to_string(),
                 stderr: String::from_utf8_lossy(&output.stderr).to_string(),
                 exit_code: output.status.code().unwrap_or(-1),

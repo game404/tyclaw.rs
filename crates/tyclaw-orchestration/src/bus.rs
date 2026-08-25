@@ -35,6 +35,7 @@ pub struct InboundMessage {
     pub reply_tx: Option<oneshot::Sender<Result<AgentResponse, TyclawError>>>,
     /// 是否为 Timer 触发的消息（Bus 据此设置 TIMER_IN_CONTEXT task_local）。
     pub is_timer: bool,
+    pub timer_job_id: Option<String>,
     /// 钉钉 emotion 上下文：(msg_id, conversation_id)，用于心跳 emotion 贴/撤。
     pub emotion_context: Option<(String, String)>,
 }
@@ -143,6 +144,7 @@ impl MessageBus {
                         .collect(),
                 );
             r.conversation_id = msg.conversation_id;
+            r.timer_job_id = msg.timer_job_id.clone();
             r
         };
 
@@ -174,8 +176,9 @@ impl MessageBus {
         let run_future = tyclaw_agent::runtime::HEARTBEAT_TX.scope(heartbeat_sender, run_future);
 
         let result = if msg.is_timer {
-            tyclaw_tools::timer::TIMER_IN_CONTEXT
-                .scope(true, run_future)
+            tyclaw_tools::timer::TIMER_CURRENT_JOB_ID
+                .scope(msg.timer_job_id.unwrap_or_default(),
+                    tyclaw_tools::timer::TIMER_IN_CONTEXT.scope(true, run_future))
                 .await
         } else {
             run_future.await

@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::process::Stdio;
 use tokio::process::Command;
 
 use tyclaw_tool_abi::Sandbox;
@@ -18,6 +19,47 @@ use crate::truncation::current_truncation_limits;
 
 /// 命令执行的默认超时时间（秒）。
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
+const LONG_TIMER_JOB_IDS: &[&str] = &["7f088316", "addad09e", "c9cd54b0"];
+
+fn effective_timeout_secs(job: Option<&str>, cmd: &str, requested: Option<u64>, default: u64) -> u64 {
+    let lower = cmd.to_ascii_lowercase();
+    match job {
+        Some("52bb6d84" | "faa28743") => 120,
+        Some("7f088316" | "addad09e") if lower.contains("run_payment_report.py") => 2700,
+        Some("c9cd54b0") if lower.contains("run_ar_report.py") => 7200,
+        Some("c9cd54b0") if lower.contains("revenue_qa.py") => 600,
+        _ => requested.unwrap_or(default),
+    }
+}
+
+fn validate_timer_command(job: Option<&str>, command: &str) -> Result<(), &'static str> {
+    if !job.is_some_and(|id| LONG_TIMER_JOB_IDS.contains(&id)) { return Ok(()); }
+    let lower = command.to_ascii_lowercase();
+    let known = ["run_payment_report.py", "run_ar_report.py", "revenue_qa.py"]
+        .iter().any(|s| lower.contains(s));
+    let forbidden_word = |word: &str| Regex::new(&format!(r"(?:^|[\s;&|]){}(?:$|[\s;&|])", word))
+        .is_ok_and(|r| r.is_match(&lower));
+    let bytes = command.as_bytes();
+    let background = bytes.iter().enumerate().any(|(i, byte)| {
+        *byte == b'&' && i.checked_sub(1).and_then(|n| bytes.get(n)) != Some(&b'>')
+    });
+    let shell_chain = command.contains(';') || command.contains('|')
+        || command.contains("&&") || background;
+    let direct = if known {
+        let executable = command.split_whitespace()
+            .find(|part| !part.contains('='))
+            .unwrap_or_default().trim_matches(['\'', '"']);
+        let executable = std::path::Path::new(executable).file_name()
+            .and_then(|name| name.to_str()).unwrap_or_default();
+        executable == "python" || executable.starts_with("python3")
+    } else { true };
+    if forbidden_word("setsid") || forbidden_word("nohup")
+        || forbidden_word("sleep") || forbidden_word("ps") || forbidden_word("tail")
+        || (known && (shell_chain || !direct)) {
+        return Err("该定时任务必须使用单次前台 exec：禁止 setsid、nohup、后台 &、命令串联以及 sleep/ps/tail 轮询");
+    }
+    Ok(())
+}
 
 /// 危险命令的正则匹配模式列表。
 ///
@@ -127,6 +169,8 @@ impl Tool for ExecTool {
             Some(c) => c,
             None => return "Error: Missing 'command' parameter".into(),
         };
+        let timer_job_id = crate::timer::current_timer_job_id();
+        if let Err(e) = validate_timer_command(timer_job_id.as_deref(), command) { return format!("Error: {e}"); }
         let lower = command.trim().to_lowercase();
         for pattern in &self.deny_patterns {
             if pattern.is_match(&lower) {
@@ -134,12 +178,11 @@ impl Tool for ExecTool {
                 return "Error: Command blocked by safety guard".into();
             }
         }
-        let timeout_secs = params
-            .get("timeout")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(self.timeout_secs);
+        let timeout_secs = effective_timeout_secs(timer_job_id.as_deref(), command,
+            params.get("timeout").and_then(|v| v.as_u64()), self.timeout_secs);
         match sandbox
-            .exec(command, std::time::Duration::from_secs(timeout_secs))
+            .exec_with_context(command, std::time::Duration::from_secs(timeout_secs),
+                tyclaw_tool_abi::SandboxExecContext { timer_job_id, cancellation: tyclaw_tool_abi::current_exec_cancel_token() })
             .await
         {
             Ok(r) => {
@@ -156,6 +199,8 @@ impl Tool for ExecTool {
             Some(c) => c,
             None => return "Error: Missing 'command' parameter".into(),
         };
+        let timer_job_id = crate::timer::current_timer_job_id();
+        if let Err(e) = validate_timer_command(timer_job_id.as_deref(), command) { return format!("Error: {e}"); }
 
         // 安全检查：匹配危险命令模式
         let lower = command.trim().to_lowercase();
@@ -166,10 +211,8 @@ impl Tool for ExecTool {
             }
         }
 
-        let timeout_secs = params
-            .get("timeout")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(self.timeout_secs);
+        let timeout_secs = effective_timeout_secs(timer_job_id.as_deref(), command,
+            params.get("timeout").and_then(|v| v.as_u64()), self.timeout_secs);
 
         // Host 执行
         let cwd = if let Some(wd) = params.get("working_directory").and_then(|v| v.as_str()) {
@@ -186,22 +229,41 @@ impl Tool for ExecTool {
             self.working_dir.as_deref().unwrap_or(".").to_string()
         };
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(&cwd)
-                .output(),
-        )
-        .await;
+        let mut process = Command::new("sh");
+        process.arg("-c").arg(command).current_dir(&cwd)
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        #[cfg(unix)] process.process_group(0);
+        let child = match process.spawn() {
+            Ok(child) => child,
+            Err(e) => return format!("Error executing command: {e}"),
+        };
+        let pgid = child.id();
+        let output = child.wait_with_output();
+        tokio::pin!(output);
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
+        tokio::pin!(deadline);
+        enum HostFinish { Output(std::io::Result<std::process::Output>), Timeout, Cancelled }
+        let result = if let Some(token) = tyclaw_tool_abi::current_exec_cancel_token() {
+            tokio::select! { r = &mut output => HostFinish::Output(r), _ = &mut deadline => HostFinish::Timeout, _ = token.cancelled() => HostFinish::Cancelled }
+        } else {
+            tokio::select! { r = &mut output => HostFinish::Output(r), _ = &mut deadline => HostFinish::Timeout }
+        };
 
         match result {
-            Err(_) => format!("Error: Command timed out after {timeout_secs} seconds"),
+            HostFinish::Timeout | HostFinish::Cancelled => {
+                #[cfg(unix)] if let Some(pgid) = pgid {
+                    let group = format!("-{pgid}");
+                    let _ = Command::new("kill").args(["-TERM", "--", &group]).output().await;
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let _ = Command::new("kill").args(["-KILL", "--", &group]).output().await;
+                }
+                if matches!(result, HostFinish::Cancelled) { "Error: Command cancelled".into() }
+                else { format!("Error: Command timed out after {timeout_secs} seconds") }
+            }
             // 执行失败（如找不到 sh）
-            Ok(Err(e)) => format!("Error executing command: {e}"),
+            HostFinish::Output(Err(e)) => format!("Error executing command: {e}"),
             // 执行成功（可能有非0退出码）
-            Ok(Ok(output)) => {
+            HostFinish::Output(Ok(output)) => {
                 let mut parts = Vec::new();
                 // 收集标准输出
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -454,6 +516,20 @@ fn compress_git_diff(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timer_timeout_policy_and_foreground_guard() {
+        assert_eq!(effective_timeout_secs(Some("7f088316"), "python run_payment_report.py", Some(1), 120), 2700);
+        assert_eq!(effective_timeout_secs(Some("c9cd54b0"), "python run_ar_report.py", None, 120), 7200);
+        assert_eq!(effective_timeout_secs(Some("c9cd54b0"), "python revenue_qa.py refresh", Some(9999), 120), 600);
+        assert_eq!(effective_timeout_secs(None, "python run_ar_report.py", Some(300), 120), 300);
+        for command in ["setsid python run_ar_report.py", "nohup python run_ar_report.py",
+            "python run_ar_report.py &", "python run_ar_report.py 2>&1 &",
+            "sh -c 'python run_ar_report.py'", "sleep 1; ps; tail x.log"] {
+            assert!(validate_timer_command(Some("c9cd54b0"), command).is_err());
+        }
+        assert!(validate_timer_command(Some("7f088316"), "python run_payment_report.py >x.log 2>&1").is_ok());
+    }
 
     /// 测试：正常执行 echo 命令
     #[tokio::test]

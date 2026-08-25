@@ -258,6 +258,7 @@ impl CliChannel {
                 files: vec![],
                 reply_tx: None,
                 is_timer: false,
+                timer_job_id: None,
                 emotion_context: None,
             };
 

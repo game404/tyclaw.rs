@@ -379,6 +379,7 @@ impl OrchestratorBuilder {
             cancellations: parking_lot::Mutex::new(HashMap::new()),
             active_conversations: parking_lot::Mutex::new(HashMap::new()),
             run_locks: parking_lot::Mutex::new(HashMap::new()),
+            active_timer_jobs: crate::orchestrator::ActiveTimerRegistry::default(),
         }
     }
 }

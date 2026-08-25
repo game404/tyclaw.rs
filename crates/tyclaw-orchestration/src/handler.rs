@@ -261,10 +261,15 @@ impl Orchestrator {
             conversation_key: conversation_key.clone(),
             on_progress,
         };
+        let _timer_guard = if let Some(job_id) = req.timer_job_id.as_deref() {
+            Some(self.active_timer_jobs.try_acquire(&workspace_key, job_id).map_err(|_|
+                TyclawError::Other(format!("already_running: 定时任务 {job_id} 正在运行，本次未重复启动")))?)
+        } else { None };
 
         // 忙碌且属于同一会话：把消息注入到运行中的 agent loop，立即返回。
         // 不同会话不在此注入——往下走串行锁排队，避免把回复发到错误的会话。
-        if self.persistence.sessions.busy_elapsed(&workspace_key).is_some()
+        if req.timer_job_id.is_none()
+            && self.persistence.sessions.busy_elapsed(&workspace_key).is_some()
             && self.active_conversation_matches(&workspace_key, &conversation_key)
         {
             return self.handle_busy_workspace(&ctx, user_message, req).await;
@@ -1000,6 +1005,7 @@ impl Orchestrator {
             Some(&cache_scope),
             ctx.on_progress,
         );
+        let run_future = tyclaw_tool_abi::CURRENT_EXEC_CANCEL_TOKEN.scope(cancel_token.clone(), run_future);
 
         // task_local 注入
         let user_role_owned = user_role.to_string();

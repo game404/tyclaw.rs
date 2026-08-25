@@ -20,6 +20,20 @@ pub struct SandboxExecResult {
     pub timed_out: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SandboxExecContext {
+    pub timer_job_id: Option<String>,
+    pub cancellation: Option<tokio_util::sync::CancellationToken>,
+}
+
+tokio::task_local! {
+    pub static CURRENT_EXEC_CANCEL_TOKEN: tokio_util::sync::CancellationToken;
+}
+
+pub fn current_exec_cancel_token() -> Option<tokio_util::sync::CancellationToken> {
+    CURRENT_EXEC_CANCEL_TOKEN.try_with(Clone::clone).ok()
+}
+
 impl SandboxExecResult {
     /// 将 stdout + stderr 合并为工具输出格式。
     pub fn to_tool_output(&self) -> String {
@@ -111,6 +125,11 @@ pub struct PathMount {
 #[async_trait]
 pub trait Sandbox: Send + Sync {
     async fn exec(&self, cmd: &str, timeout: Duration) -> Result<SandboxExecResult, TyclawError>;
+    async fn exec_with_context(
+        &self, cmd: &str, timeout: Duration, _context: SandboxExecContext,
+    ) -> Result<SandboxExecResult, TyclawError> {
+        self.exec(cmd, timeout).await
+    }
     async fn stat(&self, path: &str) -> Result<SandboxFileStat, TyclawError>;
     async fn read_file(&self, path: &str) -> Result<Vec<u8>, TyclawError>;
     /// 安全读取当前 workspace 工作目录内的文件。
@@ -186,6 +205,7 @@ pub trait SandboxPool: Send + Sync {
     async fn available_count(&self) -> usize;
     async fn total_count(&self) -> usize;
     async fn is_available(&self) -> bool;
+    fn is_workspace_active(&self, _workspace_key: &str) -> bool { false }
 }
 
 // ── 执行门禁 ──

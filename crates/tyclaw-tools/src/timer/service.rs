@@ -101,6 +101,11 @@ tokio::task_local! {
     pub static TIMER_CURRENT_CONVERSATION_ID: String;
     /// 是否在 timer 回调中执行（per-request 递归防护）。
     pub static TIMER_IN_CONTEXT: bool;
+    pub static TIMER_CURRENT_JOB_ID: String;
+}
+
+pub fn current_timer_job_id() -> Option<String> {
+    TIMER_CURRENT_JOB_ID.try_with(Clone::clone).ok().filter(|id| !id.is_empty())
 }
 
 /// 按 workspace 隔离存储、单调度器的定时任务服务。
