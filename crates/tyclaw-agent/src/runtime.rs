@@ -97,6 +97,8 @@ pub struct RunDiagnosticsSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_after_last_edit: Option<bool>,
     pub ended_with_unverified_changes: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_codes: Vec<String>,
 }
 
 /// Agent 运行时执行结果。

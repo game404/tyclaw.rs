@@ -16,7 +16,7 @@ use tyclaw_tool_abi::Sandbox;
 
 use crate::base::{brief_truncate, truncate_head_tail, RiskLevel, Tool};
 use crate::skill_execution::{
-    validate_foreground_skill_command_in_workspace, ResolvedSkillExecution, SkillExecutionConfig,
+    validate_foreground_skill_command_in_workspace, validate_timer_exec_command_in_workspace, ResolvedSkillExecution, SkillExecutionConfig,
 };
 use crate::truncation::current_truncation_limits;
 
@@ -31,7 +31,7 @@ fn format_sandbox_result(
     if result.timed_out {
         if let Some(resolved) = resolved_skill {
             return format!(
-                "Error: Skill '{}' 执行超时（{} 秒）",
+                "Error: code=timeout Skill '{}' 执行超时（{} 秒）",
                 resolved.skill_name, timeout_secs
             );
         }
@@ -174,6 +174,7 @@ impl Tool for ExecTool {
             None => return "Error: Missing 'command' parameter".into(),
         };
         let timer_job_id = crate::timer::current_timer_job_id();
+        if timer_job_id.is_some() { if let Err(error) = validate_timer_exec_command_in_workspace(command, self.working_dir.as_deref()) { return format!("Error: {error}"); } }
         let lower = command.trim().to_lowercase();
         for pattern in &self.deny_patterns {
             if pattern.is_match(&lower) {
@@ -214,6 +215,7 @@ impl Tool for ExecTool {
             Some(c) => c,
             None => return "Error: Missing 'command' parameter".into(),
         };
+        if crate::timer::current_timer_job_id().is_some() { if let Err(error) = validate_timer_exec_command_in_workspace(command, self.working_dir.as_deref()) { return format!("Error: {error}"); } }
         // 安全检查：匹配危险命令模式
         let lower = command.trim().to_lowercase();
         for pattern in &self.deny_patterns {
@@ -592,6 +594,7 @@ mod tests {
             stderr: String::new(),
             exit_code: -1,
             timed_out: true,
+            termination: None,
         };
         let resolved = ResolvedSkillExecution {
             skill_name: "finance-payment".into(),
@@ -600,11 +603,11 @@ mod tests {
         };
         assert_eq!(
             format_sandbox_result(&timed_out, Some(&resolved), 2700),
-            "Error: Skill 'finance-payment' 执行超时（2700 秒）"
+            "Error: code=timeout Skill 'finance-payment' 执行超时（2700 秒）"
         );
         assert_eq!(
             format_sandbox_result(&timed_out, None, 120),
-            "Error: Command timed out"
+            "Error: code=timeout Command timed out"
         );
     }
 

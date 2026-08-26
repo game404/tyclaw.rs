@@ -15,6 +15,23 @@ use tyclaw_types::TyclawError;
 use crate::types::*;
 use crate::{validate_workspace_relative_path, workspace_read_error};
 
+#[cfg(target_os = "linux")]
+async fn cleanup_run_processes(run_id: &str) -> bool {
+    let marker = format!("TYCLAW_EXEC_RUN_ID={run_id}").into_bytes();
+    let pids: Vec<String> = std::fs::read_dir("/proc").into_iter().flatten().flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|pid| pid.chars().all(|c| c.is_ascii_digit()))
+        .filter(|pid| std::fs::read(format!("/proc/{pid}/environ")).ok().is_some_and(|env| env.split(|byte| *byte == 0).any(|item| item == marker)))
+        .collect();
+    if pids.is_empty() { return false; }
+    let _ = Command::new("kill").arg("-TERM").args(&pids).output().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _ = Command::new("kill").arg("-KILL").args(&pids).output().await;
+    true
+}
+#[cfg(not(target_os = "linux"))]
+async fn cleanup_run_processes(_run_id: &str) -> bool { false }
+
 /// Noop 沙箱：直接在 host 上执行，无隔离。
 pub struct NoopSandbox {
     workspace: PathBuf,
@@ -27,10 +44,12 @@ impl Sandbox for NoopSandbox {
         self.exec_with_context(cmd, timeout, SandboxExecContext::default()).await
     }
     async fn exec_with_context(&self, cmd: &str, timeout: Duration, context: SandboxExecContext) -> Result<SandboxExecResult, TyclawError> {
+        let run_id = uuid::Uuid::new_v4().simple().to_string();
         let mut process = Command::new("sh");
         process
                 .arg("-c")
                 .arg(cmd)
+                .env("TYCLAW_EXEC_RUN_ID", &run_id)
                 .current_dir(&self.workspace)
                 .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         #[cfg(unix)] process.process_group(0);
@@ -57,22 +76,22 @@ impl Sandbox for NoopSandbox {
                     let _ = Command::new("kill").args(["-KILL", "--", &group]).output().await;
                 }
                 let cancelled = matches!(finish, Finish::Cancelled);
+                cleanup_run_processes(&run_id).await;
                 Ok(SandboxExecResult {
                 stdout: String::new(),
                 stderr: if cancelled { "Command cancelled".into() } else { String::new() },
                 exit_code: -1,
                 timed_out: !cancelled,
+                termination: cancelled.then_some(SandboxTermination::Cancelled),
             })}
             Finish::Output(Err(e)) => Err(TyclawError::Tool {
                 tool: "sandbox_exec".into(),
                 message: format!("Failed to execute: {e}"),
             }),
-            Finish::Output(Ok(output)) => Ok(SandboxExecResult {
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                exit_code: output.status.code().unwrap_or(-1),
-                timed_out: false,
-            }),
+            Finish::Output(Ok(output)) => {
+                let detached = cleanup_run_processes(&run_id).await;
+                Ok(SandboxExecResult { stdout: String::from_utf8_lossy(&output.stdout).to_string(), stderr: String::from_utf8_lossy(&output.stderr).to_string(), exit_code: if detached { -1 } else { output.status.code().unwrap_or(-1) }, timed_out: false, termination: detached.then_some(SandboxTermination::DetachedProcessDetected) })
+            },
         }
     }
 

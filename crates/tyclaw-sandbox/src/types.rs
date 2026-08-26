@@ -2,5 +2,5 @@
 
 pub use tyclaw_tool_abi::{
     PathMount, Sandbox, SandboxDirEntry, SandboxExecContext, SandboxExecResult, SandboxFileStat, SandboxGlobEntry,
-    SandboxGrepRequest, SandboxGrepResponse, SandboxPool, SandboxWalkEntry,
+    SandboxGrepRequest, SandboxGrepResponse, SandboxPool, SandboxWalkEntry, SandboxTermination,
 };

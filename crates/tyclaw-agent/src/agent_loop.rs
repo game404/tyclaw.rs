@@ -1218,6 +1218,7 @@ fn build_run_diagnostics_summary(tool_events: &[ToolExecutionEvent]) -> RunDiagn
             .any(|e| is_verification_tool(&e.tool_name) && e.status == "ok")
     });
     let ended_with_unverified_changes = matches!(verified_after_last_edit, Some(false));
+    let failure_codes = tool_events.iter().filter_map(|event| event.result_preview.split("code=").nth(1)).filter_map(|tail| tail.split_whitespace().next()).map(str::to_owned).collect();
 
     RunDiagnosticsSummary {
         total_tool_calls,
@@ -1229,6 +1230,7 @@ fn build_run_diagnostics_summary(tool_events: &[ToolExecutionEvent]) -> RunDiagn
         host_tool_count,
         verified_after_last_edit,
         ended_with_unverified_changes,
+        failure_codes,
     }
 }
 

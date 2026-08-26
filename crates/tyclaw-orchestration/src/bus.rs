@@ -18,6 +18,8 @@ use tyclaw_types::TyclawError;
 use crate::orchestrator::Orchestrator;
 use crate::types::{AgentResponse, RequestContext};
 use tyclaw_control::UsageSource;
+#[derive(Debug, Clone)]
+pub struct TimerRunContext { pub user_id: String, pub job_id: String, pub started_at: std::time::Instant }
 
 /// 入站消息 —— 来自任意通道或 Timer。
 pub struct InboundMessage {
@@ -36,6 +38,7 @@ pub struct InboundMessage {
     /// 是否为 Timer 触发的消息（Bus 据此设置 TIMER_IN_CONTEXT task_local）。
     pub is_timer: bool,
     pub timer_job_id: Option<String>,
+    pub timer_run: Option<TimerRunContext>,
     /// 钉钉 emotion 上下文：(msg_id, conversation_id)，用于心跳 emotion 贴/撤。
     pub emotion_context: Option<(String, String)>,
 }
@@ -66,11 +69,13 @@ pub enum OutboundEvent {
         channel: String,
         chat_id: String,
         response: AgentResponse,
+        timer_run: Option<TimerRunContext>,
     },
     Error {
         channel: String,
         chat_id: String,
         message: String,
+        timer_run: Option<TimerRunContext>,
     },
 }
 
@@ -150,6 +155,7 @@ impl MessageBus {
 
         let channel_owned = channel.clone();
         let chat_id_owned = chat_id.clone();
+        let timer_run = msg.timer_run.clone();
 
         let source = if msg.is_timer {
             UsageSource::Automated
@@ -194,6 +200,7 @@ impl MessageBus {
                             channel: channel_owned,
                             chat_id: chat_id_owned,
                             response,
+                            timer_run,
                         })
                         .await;
                 }
@@ -203,6 +210,7 @@ impl MessageBus {
                             channel: channel_owned,
                             chat_id: chat_id_owned,
                             message: format!("{e}"),
+                            timer_run,
                         })
                         .await;
                 }

@@ -231,7 +231,7 @@ pub async fn send_markdown_by_channel(
     conversation_id: &str,
     title: &str,
     text: &str,
-) {
+) -> Result<(), String> {
     let msg_param = json!({"title": title, "text": text}).to_string();
 
     let (url, payload) = if channel.contains("private") {
@@ -270,12 +270,14 @@ pub async fn send_markdown_by_channel(
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
                 warn!(status = %status, body = %body, "send_markdown_by_channel failed");
+                return Err("markdown_send_failed".into());
             } else {
                 info!(channel = %channel, "send_markdown_by_channel sent successfully");
             }
         }
-        Err(e) => warn!(error = %e, "send_markdown_by_channel HTTP error"),
+        Err(e) => { warn!(error = %e, "send_markdown_by_channel HTTP error"); return Err("markdown_send_failed".into()); }
     }
+    Ok(())
 }
 
 /// 通过 session_webhook 回复文本消息。

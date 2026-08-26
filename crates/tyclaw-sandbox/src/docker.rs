@@ -124,6 +124,18 @@ kill -TERM -- "-$child" 2>/dev/null || true; sleep 0.1
 kill -KILL -- "-$child" 2>/dev/null || true
 exit "$status"
 "#;
+const CLEANUP_RUN_PROCESSES: &str = r#"
+run_id=$1; found=0; pids=""
+for env_file in /proc/[0-9]*/environ; do
+ [ -r "$env_file" ] || continue
+ if tr '\000' '\n' < "$env_file" 2>/dev/null | grep -Fxq "TYCLAW_EXEC_RUN_ID=$run_id"; then
+  pid=${env_file#/proc/}; pid=${pid%/environ}; case "$pid" in (*[!0-9]*|'') continue;; esac
+  pids="$pids $pid"; found=1
+ fi
+done
+[ "$found" -eq 1 ] || exit 0
+kill -TERM $pids 2>/dev/null || true; sleep 0.2; kill -KILL $pids 2>/dev/null || true; exit 42
+"#;
 const TERMINATE_GROUP: &str = r#"
 marker=$1; attempt=0
 while [ ! -f "$marker" ] && [ "$attempt" -lt 50 ]; do sleep 0.1; attempt=$((attempt+1)); done
@@ -160,6 +172,7 @@ impl Sandbox for DockerSandbox {
         let result = Command::new("docker")
                 .args([
                     "exec",
+                    "-e", &format!("TYCLAW_EXEC_RUN_ID={run_id}"),
                     "-e",
                     &format!("TMPDIR={tmpdir}"),
                     "-e",
@@ -201,23 +214,24 @@ impl Sandbox for DockerSandbox {
                     ])
                     .output()
                     .await;
+                let _ = Command::new("docker").args(["exec", &self.container_name, "sh", "-c", CLEANUP_RUN_PROCESSES, "tyclaw-cleanup", &run_id]).output().await;
                 Ok(SandboxExecResult {
                     stdout: String::new(),
                     stderr: if matches!(finish, Finish::Cancelled) { "Command cancelled".into() } else { String::new() },
                     exit_code: -1,
                     timed_out: matches!(finish, Finish::Timeout),
+                    termination: matches!(finish, Finish::Cancelled).then_some(SandboxTermination::Cancelled),
                 })
             }
             Finish::Output(Err(e)) => Err(TyclawError::Tool {
                 tool: "docker_exec".into(),
                 message: format!("docker exec failed: {e}"),
             }),
-            Finish::Output(Ok(output)) => Ok(SandboxExecResult {
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                exit_code: output.status.code().unwrap_or(-1),
-                timed_out: false,
-            }),
+            Finish::Output(Ok(output)) => {
+                let cleanup = Command::new("docker").args(["exec", &self.container_name, "sh", "-c", CLEANUP_RUN_PROCESSES, "tyclaw-cleanup", &run_id]).output().await;
+                let detached = cleanup.as_ref().ok().and_then(|o| o.status.code()) == Some(42);
+                Ok(SandboxExecResult { stdout: String::from_utf8_lossy(&output.stdout).to_string(), stderr: String::from_utf8_lossy(&output.stderr).to_string(), exit_code: if detached { -1 } else { output.status.code().unwrap_or(-1) }, timed_out: false, termination: detached.then_some(SandboxTermination::DetachedProcessDetected) })
+            },
         }
     }
 
