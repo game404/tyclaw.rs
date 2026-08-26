@@ -7,6 +7,7 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import tempfile
 from datetime import datetime, timezone
@@ -17,6 +18,11 @@ PAYMENT_PREFIXES = ("1aa59c11", "954631b2")
 REVENUE_PREFIXES = ("c9cd54b0",)
 KNOWN_OTHER_PREFIXES = ("52bb6d84",)
 RISK_TOKENS = ("setsid", "nohup", "sleep ", "ps ", "tail ", " &", "driver.sh", "driver.py")
+SHELL_RE = re.compile(
+    r"(?:^|[\s;&|])(python(?:3(?:\.\d+)?)?|sh|bash|zsh)(?:$|[\s;&|])"
+    r"|/skills/|/scripts/|(?:^|[\s;&|])[^\s;&|]+\.sh(?:$|[\s;&|])",
+    re.I,
+)
 
 PAYMENT_MESSAGE = """执行重点付款 Skill（finance-payment）。必须直接调用 SKILL.md 指定的正式入口，使用单次前台 exec 并等待退出；禁止 setsid、nohup、后台 &、sleep/ps/tail 轮询以及 work/tmp 下的临时 Python/Shell wrapper。执行时长由 skill_execution 上限管理。仅发送本次生成且非空的 Excel 文件；脚本失败或没有有效文件时明确报错，不发送历史文件。"""
 
@@ -37,7 +43,7 @@ def replacement(job_id):
 
 def has_risk(message):
     lowered = message.lower()
-    return any(token in lowered for token in RISK_TOKENS)
+    return any(token in lowered for token in RISK_TOKENS) or bool(SHELL_RE.search(message))
 
 
 def write_atomic(path, data):
