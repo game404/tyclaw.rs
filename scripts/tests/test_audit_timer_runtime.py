@@ -142,6 +142,49 @@ skill_execution:
         self.assertEqual(result["execution_class"], "legacy_skill_agent")
         self.assertTrue(result["migration_required"])
 
+    def test_managed_foreground_skill_message_is_not_a_legacy_risk(self):
+        result = audit.summarize_job(
+            {
+                "id": "1aa59c11",
+                "enabled": True,
+                "schedule": {"kind": "cron", "expr": "0 0 * * *"},
+                "payload": {
+                    "message": (
+                        "执行重点付款 Skill（finance-payment）。必须直接调用 SKILL.md "
+                        "指定的正式入口，使用单次前台 exec 并等待退出；"
+                        "禁止 setsid、nohup、后台 &、sleep/ps/tail 轮询以及临时 wrapper。"
+                        "执行时长由 skill_execution 上限管理。"
+                    )
+                },
+                "state": {},
+            }
+        )
+
+        self.assertEqual(result["execution_class"], "managed_skill_foreground")
+        self.assertFalse(result["migration_required"])
+        self.assertEqual(result["risk_flags"], [])
+
+    def test_managed_generic_skill_md_message_is_not_flagged(self):
+        result = audit.summarize_job(
+            {
+                "id": "52bb6d84",
+                "enabled": True,
+                "schedule": {"kind": "cron", "expr": "0 3 * * *"},
+                "payload": {
+                    "message": (
+                        "执行该任务对应的 Skill。必须直接调用 SKILL.md 指定的正式入口，"
+                        "使用单次前台 exec 并等待退出；禁止 setsid、nohup、后台 &。"
+                        "执行时长由 skill_execution 上限管理。"
+                    )
+                },
+                "state": {},
+            }
+        )
+
+        self.assertEqual(result["execution_class"], "managed_skill_foreground")
+        self.assertFalse(result["migration_required"])
+        self.assertEqual(result["risk_flags"], [])
+
     def test_summarizes_docker_processes_without_arguments(self):
         output = """PID PPID PGID COMMAND
 1 0 1 sleep

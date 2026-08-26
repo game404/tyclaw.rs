@@ -28,9 +28,10 @@ SHELL_RE = re.compile(
 WRAPPER_RE = re.compile(r"(?:driver|wrapper)[^\s/]*\.sh|qa_refresh_driver\.sh", re.I)
 SKILL_REFERENCE_RE = re.compile(
     r"/skills/|(?:^|[^a-z0-9_-])finance-[a-z0-9-]+(?:$|[^a-z0-9_-])"
-    r"|(?:^|[\s：:])skill(?:$|[\s：:])",
+    r"|(?:^|[\s：:（(])skill(?:\.md)?(?:$|[\s：:）。)])",
     re.I,
 )
+MANAGED_FOREGROUND_MARKERS = ("单次前台 exec", "禁止", "skill_execution 上限")
 
 
 def fingerprint(value: str) -> str:
@@ -172,6 +173,11 @@ def classify_target(message: str) -> str:
 
 def classify_message(message: str) -> Tuple[str, str, List[str]]:
     target = classify_target(message)
+    lower = message.lower()
+    skill = bool(SKILL_REFERENCE_RE.search(message)) or target != "other"
+    managed_foreground = skill and all(marker in lower for marker in MANAGED_FOREGROUND_MARKERS)
+    if managed_foreground:
+        return target, "managed_skill_foreground", []
     risk_flags: List[str] = []
     if DETACHED_RE.search(message):
         risk_flags.append("detached_process")
@@ -180,7 +186,6 @@ def classify_message(message: str) -> Tuple[str, str, List[str]]:
     if WRAPPER_RE.search(message):
         risk_flags.append("wrapper_script")
     shell = bool(SHELL_RE.search(message))
-    skill = bool(SKILL_REFERENCE_RE.search(message)) or target != "other"
     if shell and skill:
         execution_class = "legacy_skill_shell"
     elif shell:
@@ -223,7 +228,7 @@ def summarize_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "delivery_channel": channel if channel in safe_channels else ("unset" if not channel else "other"),
         "target": target,
         "execution_class": execution_class,
-        "migration_required": execution_class != "agent_message",
+        "migration_required": execution_class.startswith("legacy_"),
         "risk_flags": risk_flags,
         "last_status": str(state.get("last_status") or "unknown")[:40],
         "last_run_at_ms": state.get("last_run_at_ms"),

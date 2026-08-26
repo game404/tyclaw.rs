@@ -34,7 +34,7 @@ class TimerMigrationTest(unittest.TestCase):
                 {
                     "id": "faa28743-full-id",
                     "name": "未知任务",
-                    "payload": {"message": "nohup unknown.sh &"},
+                    "payload": {"message": "请运行 unknown_daily.sh 生成每日数据"},
                     "schedule": {"kind": "cron", "expr": "0 19 * * *"},
                     "state": {},
                 },
