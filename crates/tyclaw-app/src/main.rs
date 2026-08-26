@@ -24,7 +24,7 @@ use tyclaw_channel::{
 use tyclaw_orchestration::subtasks::SubtasksConfig;
 use tyclaw_orchestration::{
     load_yaml, mask_secret, BaseConfig, BusHandle, InboundMessage, LoggingConfig, MessageBus,
-    Orchestrator, OutboundEvent, WorkspaceConfig,
+    Orchestrator, OutboundEvent, TimerRunContext, WorkspaceConfig,
 };
 use tyclaw_provider::OpenAICompatProvider;
 
@@ -686,9 +686,9 @@ async fn run_cli(config: RunConfig, monitor_cfg: MonitorConfig) {
 
     let (bus, bus_handle, outbound_rx) = MessageBus::new(Arc::clone(&orchestrator), 64, 256);
 
-    spawn_timer_consumer(timer_rx, bus_handle.clone());
+    spawn_timer_consumer(timer_rx, bus_handle.clone(), timer_svc.clone());
 
-    let _dispatcher_handle = tokio::spawn(run_outbound_dispatcher(outbound_rx, None));
+    let _dispatcher_handle = tokio::spawn(run_outbound_dispatcher(outbound_rx, None, timer_svc.clone()));
     let _bus_handle_task = tokio::spawn(bus.run());
 
     let cli = CliChannel::new("cli_user", "default")
@@ -709,11 +709,30 @@ struct DingTalkSender {
     /// 把 Thinking / Tool 事件 feed 进去刷新"思考中"动画和工具行。
     card_registry: tyclaw_channel::dingtalk::AiCardRegistry,
 }
+fn timer_response(response: &tyclaw_orchestration::AgentResponse) -> (&'static str, Option<&'static str>) {
+ for (code, status) in [("cancelled","cancelled"),("timeout","timeout"),("rejected_execution_policy","rejected_execution_policy"),("detached_process_detected","detached_process_detected")] { if response.diagnostics_summary.failure_codes.iter().any(|f| f == code) { return (status, Some(code)); } }
+ if response.diagnostics_summary.error_tool_count > 0 || response.diagnostics_summary.denied_tool_count > 0 { ("failed",Some("tool_execution_failed")) } else { ("success",None) }
+}
+fn timer_error(message: &str) -> (&'static str, Option<&'static str>) { if message.starts_with("already_running:") { ("skipped_already_running",Some("already_running")) } else { ("failed",Some("orchestration_failed")) } }
+#[cfg(test)]
+mod timer_outcome_tests {
+    use super::*;
+    #[test]
+    fn classifies_structured_failures_and_redacts_errors() {
+        let mut response = tyclaw_orchestration::AgentResponse { text: String::new(), tools_used: vec![], duration_seconds: 0.0, prompt_tokens: 0, completion_tokens: 0, output_files: vec![], recommends: vec![], diagnostics_summary: Default::default() };
+        response.diagnostics_summary.error_tool_count = 1; response.diagnostics_summary.failure_codes.push("detached_process_detected".into());
+        assert_eq!(timer_response(&response).0, "detached_process_detected");
+        assert_eq!(timer_error("already_running: details").0, "skipped_already_running");
+        assert_eq!(timer_error("secret details").1, Some("orchestration_failed"));
+    }
+}
+async fn record_timer(svc: &tyclaw_tools::timer::TimerService, run: &Option<TimerRunContext>, status: &str, error: Option<&str>) { if let Some(run)=run { svc.record_result(&run.user_id,&run.job_id,status,run.started_at.elapsed().as_millis() as u64,error).await; } }
 
 /// Outbound Dispatcher：消费 outbound 事件，CLI 打印到 stdout，钉钉通过 API 发出。
 async fn run_outbound_dispatcher(
     mut outbound_rx: tokio::sync::mpsc::Receiver<OutboundEvent>,
     dt_sender: Option<DingTalkSender>,
+    timer_svc: Arc<tyclaw_tools::timer::TimerService>,
 ) {
     use tyclaw_channel::dingtalk::handler;
 
@@ -771,7 +790,7 @@ async fn run_outbound_dispatcher(
                     _ => {}
                 }
                 match &event {
-                    OutboundEvent::Reply { response, .. } => {
+                    OutboundEvent::Reply { response, timer_run, .. } => {
                         // chat_id 格式：群聊 "conversation_id:staff_id"，私聊 "staff_id"
                         let (conversation_id, user_id) = if chat_id.contains(':') {
                             let parts: Vec<&str> = chat_id.splitn(2, ':').collect();
@@ -779,8 +798,9 @@ async fn run_outbound_dispatcher(
                         } else {
                             ("", chat_id.as_str())
                         };
+                        let mut delivery_ok = true;
                         if let Ok(token) = sender.token_manager.get_token().await {
-                            handler::send_markdown_by_channel(
+                            if handler::send_markdown_by_channel(
                                 &sender.http_client,
                                 &token,
                                 &sender.robot_code,
@@ -790,7 +810,7 @@ async fn run_outbound_dispatcher(
                                 "执行结果",
                                 &response.text,
                             )
-                            .await;
+                            .await.is_err() { delivery_ok = false; }
 
                             // Timer/异步路径：发送 send_file 队列中的附件
                             for file_path in &response.output_files {
@@ -828,18 +848,22 @@ async fn run_outbound_dispatcher(
                                         };
                                         if let Err(e) = result {
                                             tracing::error!(file = %file_path, error = %e, "Dispatcher: file send failed");
+                                            delivery_ok = false;
                                         }
                                     }
                                     Err(e) => {
                                         tracing::error!(file = %file_path, error = %e, "Dispatcher: {media_type} upload failed");
+                                        delivery_ok = false;
                                     }
                                 }
                             }
-                        }
+                        } else { delivery_ok = false; }
+                        let (mut status, mut error)=timer_response(response); if status=="success" && !delivery_ok { status="delivery_failed"; error=Some("delivery_failed"); } record_timer(&timer_svc,timer_run,status,error).await;
                         // 同时在 CLI 滚动区打印（方便调试）
                         cli_print(&format!("\x1b[2m[DT:{chat_id}]\x1b[0m \x1b[1;37m{}\x1b[0m", response.text));
                     }
-                    OutboundEvent::Error { message, .. } => {
+                    OutboundEvent::Error { message, timer_run, .. } => {
+                        let (status,error)=timer_error(message); record_timer(&timer_svc,timer_run,status,error).await;
                         cli_print(&format!("\x1b[2;31m[DT:{chat_id}] Error: {message}\x1b[0m"));
                     }
                     OutboundEvent::Progress { message, .. } => {
@@ -901,7 +925,7 @@ async fn run_outbound_dispatcher(
                 };
                 cli_print(&format!("\x1b[2m  ▸ {line}\x1b[0m"));
             }
-            OutboundEvent::Reply { response, .. } => {
+            OutboundEvent::Reply { response, timer_run, .. } => {
                 // TyClaw.rs> 亮白色 —— 唯一醒目的输出
                 cli_print(&format!(
                     "\x1b[1;37mTyClaw.rs>\x1b[0m \x1b[1;37m{}\x1b[0m",
@@ -920,8 +944,10 @@ async fn run_outbound_dispatcher(
                         cli_print(&format!("\x1b[2m  → {f}\x1b[0m"));
                     }
                 }
+                let (status,error)=timer_response(response); record_timer(&timer_svc,timer_run,status,error).await;
             }
-            OutboundEvent::Error { message, .. } => {
+            OutboundEvent::Error { message, timer_run, .. } => {
+                let (status,error)=timer_error(message); record_timer(&timer_svc,timer_run,status,error).await;
                 cli_print(&format!("\x1b[2;31mError: {message}\x1b[0m"));
             }
         }
@@ -936,6 +962,7 @@ fn timer_message_content(name: &str, message: &str) -> String {
 fn spawn_timer_consumer(
     mut timer_rx: tokio::sync::mpsc::Receiver<tyclaw_tools::timer::TimerJob>,
     bus_handle: BusHandle,
+    timer_svc: Arc<tyclaw_tools::timer::TimerService>,
 ) {
     tokio::spawn(async move {
         while let Some(job) = timer_rx.recv().await {
@@ -954,9 +981,11 @@ fn spawn_timer_consumer(
                 reply_tx: None,
                 is_timer: true,
                 timer_job_id: Some(job.id.clone()),
+                timer_run: Some(TimerRunContext { user_id: job.user_id.clone(), job_id: job.id.clone(), started_at: std::time::Instant::now() }),
             };
             if let Err(e) = bus_handle.send(msg).await {
                 tracing::error!(job_id = %job.id, error = %e, "Timer: failed to send to bus");
+                timer_svc.record_result(&job.user_id,&job.id,"failed",0,Some("bus_send_failed")).await;
             }
         }
     });
@@ -1039,7 +1068,7 @@ async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig, monitor_cfg: M
 
     let (bus, bus_handle, outbound_rx) = MessageBus::new(Arc::clone(&orchestrator), 64, 256);
 
-    spawn_timer_consumer(timer_rx, bus_handle.clone());
+    spawn_timer_consumer(timer_rx, bus_handle.clone(), timer_svc.clone());
     let bus_task = tokio::spawn(bus.run());
 
     // DingTalk 卡片注册表——DingTalkBot 创建卡片时注册，dispatcher feed 进度时查表。
@@ -1067,7 +1096,7 @@ async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig, monitor_cfg: M
         robot_code: client_id.clone(),
         card_registry: card_registry.clone(),
     };
-    let dispatcher_task = tokio::spawn(run_outbound_dispatcher(outbound_rx, Some(dt_sender)));
+    let dispatcher_task = tokio::spawn(run_outbound_dispatcher(outbound_rx, Some(dt_sender), timer_svc.clone()));
 
     // 启动消息接收（后台运行）
     let bot = DingTalkBot::new(

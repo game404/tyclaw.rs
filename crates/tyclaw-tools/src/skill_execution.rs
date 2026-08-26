@@ -26,6 +26,7 @@ pub struct ResolvedSkillExecution {
 
 pub const FOREGROUND_REQUIRED_ERROR: &str =
     "Skill 必须使用单次前台 exec 执行：禁止 setsid、nohup、后台 & 以及 sleep/ps/tail 轮询";
+pub const TIMER_EXEC_POLICY_ERROR: &str = "code=rejected_execution_policy Timer exec policy rejected: 禁止后台执行、轮询以及通过临时 Python/Shell wrapper 间接运行 Skill";
 
 fn default_skill_timeout_secs() -> u64 {
     DEFAULT_SKILL_TIMEOUT_SECS
@@ -111,6 +112,11 @@ pub fn validate_foreground_skill_command_in_workspace(
     {
         return Err(FOREGROUND_REQUIRED_ERROR);
     }
+    Ok(())
+}
+
+pub fn validate_timer_exec_command_in_workspace(command: &str, workspace: Option<&str>) -> Result<(), &'static str> {
+    if contains_forbidden_wrapper(command, 0) || contains_background_operator(command, 0) || contains_polling_command(command, 0) || contains_timer_wrapper(command, workspace) { return Err(TIMER_EXEC_POLICY_ERROR); }
     Ok(())
 }
 
@@ -351,6 +357,22 @@ fn contains_polling_command(command: &str, depth: usize) -> bool {
     })
 }
 
+fn contains_timer_wrapper(command: &str, workspace: Option<&str>) -> bool {
+    split_shell_segments(command).into_iter().any(|segment| {
+        let Some(tokens) = shlex::split(segment) else { return true; };
+        let Some(index) = tokens.iter().position(|token| !is_environment_assignment(token)) else { return false; };
+        let executable = tokens.get(index).and_then(|token| Path::new(token).file_name()).and_then(|name| name.to_str()).unwrap_or_default();
+        if matches!(executable, "sh" | "bash" | "zsh") { return tokens.get(index + 1).is_some_and(|arg| arg == "-c" || is_temporary_wrapper_path(arg, workspace)); }
+        is_python_executable(executable) && tokens.get(index + 1).is_some_and(|arg| is_temporary_wrapper_path(arg, workspace))
+    })
+}
+
+fn is_temporary_wrapper_path(path: &str, workspace: Option<&str>) -> bool {
+    let normalized = path.replace('\\', "/");
+    if !normalized.ends_with(".py") && !normalized.ends_with(".sh") { return false; }
+    normalized.starts_with("/workspace/work/") || normalized.starts_with("work/") || normalized.starts_with("./work/") || workspace.is_some_and(|root| normalized.starts_with(&format!("{}/work/", root.trim_end_matches('/'))))
+}
+
 fn command_segments_match(
     command: &str,
     depth: usize,
@@ -567,5 +589,11 @@ mod tests {
     fn rejects_polling_inside_shell_wrapper_after_skill_setup() {
         let command = "python3 /workspace/skills/finance/a/scripts/run.py; bash -c 'sleep 5; ps'";
         assert!(validate_foreground_skill_command(command).is_err());
+    }
+
+    #[test]
+    fn timer_exec_policy_rejects_detached_and_temporary_wrappers() {
+        for command in ["setsid python3 /workspace/work/tmp/driver.py &", "sleep 20; ps -ef; tail work/tmp/run.log", "bash -c 'python3 /workspace/skills/finance/a/scripts/run.py'", "python3 /workspace/work/tmp/driver.py"] { assert!(validate_timer_exec_command_in_workspace(command, Some("/workspace")).is_err()); }
+        assert!(validate_timer_exec_command_in_workspace("python3 /workspace/skills/finance/a/scripts/run.py", Some("/workspace")).is_ok());
     }
 }

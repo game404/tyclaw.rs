@@ -160,6 +160,7 @@ pub struct AgentResponse {
     /// 由 `suggest_recommends` 工具写入，上层（如 DingTalk bot）渲染为卡片推荐组件。
     /// 为空表示本轮无推荐（默认）。
     pub recommends: Vec<String>,
+    pub diagnostics_summary: tyclaw_agent::runtime::RunDiagnosticsSummary,
 }
 
 #[derive(Debug, Clone, Copy)]

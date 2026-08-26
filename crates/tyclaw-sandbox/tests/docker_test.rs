@@ -68,6 +68,13 @@ async fn test_docker_exec() {
     pool.release(sandbox, &ws).await.expect("Release failed");
     cleanup(&users_dir);
 }
+#[tokio::test]
+async fn test_docker_exec_detects_detached_process() {
+    let users_dir = temp_users_dir(); let pool = DockerPool::new(DockerConfig::default(), users_dir.clone()).await.unwrap();
+    let ws = user_workspace(&users_dir, "test_detached"); let sandbox = pool.acquire("test_detached", &ws, &[]).await.unwrap();
+    let result = sandbox.exec("setsid sleep 30 >/dev/null 2>&1 &", Duration::from_secs(10)).await.unwrap();
+    assert_eq!(result.termination, Some(SandboxTermination::DetachedProcessDetected)); cleanup(&users_dir);
+}
 
 #[tokio::test]
 async fn test_docker_python() {

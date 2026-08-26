@@ -259,6 +259,7 @@ impl CliChannel {
                 reply_tx: None,
                 is_timer: false,
                 timer_job_id: None,
+                timer_run: None,
                 emotion_context: None,
             };
 

@@ -69,8 +69,7 @@ pub use registry::ToolRegistry;
 pub use shell::ExecTool;
 pub use skill_execution::{
     identify_skill, identify_skill_in_workspace, validate_foreground_skill_command,
-    validate_foreground_skill_command_in_workspace, ResolvedSkillExecution, SkillExecutionConfig,
-    SkillTimeoutOverride, DEFAULT_SKILL_TIMEOUT_SECS, FOREGROUND_REQUIRED_ERROR,
+    validate_foreground_skill_command_in_workspace, validate_timer_exec_command_in_workspace, ResolvedSkillExecution, SkillExecutionConfig, SkillTimeoutOverride, DEFAULT_SKILL_TIMEOUT_SECS, FOREGROUND_REQUIRED_ERROR, TIMER_EXEC_POLICY_ERROR,
 };
 pub use step_cache::{CachedValue, StepCache};
 pub use truncation::{

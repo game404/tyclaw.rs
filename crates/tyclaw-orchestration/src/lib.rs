@@ -65,7 +65,7 @@ pub mod term;
 // 重新导出核心类型
 pub use app_context::AppContext;
 pub use builder::OrchestratorBuilder;
-pub use bus::{BusHandle, InboundMessage, MessageBus, OutboundEvent};
+pub use bus::{BusHandle, InboundMessage, MessageBus, OutboundEvent, TimerRunContext};
 pub use config::{
     load_yaml, mask_secret, BaseConfig, ConcurrencyConfig, ConsolidationConfig, EmptyResultConfig,
     LlmConfig, LoggingConfig, PerformanceConfig, PollutionConfig, SizeLimitConfig, SseConfig,

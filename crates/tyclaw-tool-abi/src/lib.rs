@@ -18,7 +18,10 @@ pub struct SandboxExecResult {
     pub stderr: String,
     pub exit_code: i32,
     pub timed_out: bool,
+    pub termination: Option<SandboxTermination>,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxTermination { Cancelled, DetachedProcessDetected }
 
 #[derive(Debug, Clone, Default)]
 pub struct SandboxExecContext {
@@ -46,7 +49,9 @@ impl SandboxExecResult {
             parts.push(format!("STDERR:\n{stderr}"));
         }
         if self.timed_out {
-            parts.push("Error: Command timed out".into());
+            parts.push("Error: code=timeout Command timed out".into());
+        } else if self.termination == Some(SandboxTermination::Cancelled) { parts.push("Error: code=cancelled Command cancelled".into());
+        } else if self.termination == Some(SandboxTermination::DetachedProcessDetected) { parts.push("Error: code=detached_process_detected Detached process detected and terminated".into());
         } else if self.exit_code != 0 {
             parts.push(format!("\nExit code: {}", self.exit_code));
         }

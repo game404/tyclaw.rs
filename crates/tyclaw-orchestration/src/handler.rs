@@ -355,6 +355,7 @@ impl Orchestrator {
                     completion_tokens: result.total_completion_tokens,
                     output_files: Vec::new(),
                     recommends: Vec::new(),
+                    diagnostics_summary: result.diagnostics_summary,
                 });
             }
 
@@ -387,6 +388,7 @@ impl Orchestrator {
                 completion_tokens: result.total_completion_tokens,
                 output_files,
                 recommends: Vec::new(),
+                diagnostics_summary: result.diagnostics_summary,
             });
         }
 
@@ -489,6 +491,7 @@ impl Orchestrator {
             completion_tokens: 0,
             output_files: Vec::new(),
             recommends: Vec::new(),
+            diagnostics_summary: Default::default(),
         })
     }
 
@@ -512,6 +515,7 @@ impl Orchestrator {
                     completion_tokens: 0,
                     output_files: Vec::new(),
                     recommends: Vec::new(),
+                    diagnostics_summary: Default::default(),
                 }));
             }
 
@@ -540,6 +544,7 @@ impl Orchestrator {
                         completion_tokens: 0,
                         output_files: Vec::new(),
                         recommends: Vec::new(),
+                        diagnostics_summary: Default::default(),
                     }));
                 }
                 Err(e) => {
@@ -551,6 +556,7 @@ impl Orchestrator {
                         completion_tokens: 0,
                         output_files: Vec::new(),
                         recommends: Vec::new(),
+                        diagnostics_summary: Default::default(),
                     }));
                 }
             }
@@ -585,6 +591,7 @@ impl Orchestrator {
                         completion_tokens: 0,
                         output_files: Vec::new(),
                         recommends: Vec::new(),
+                        diagnostics_summary: Default::default(),
                     }));
                 }
             }
@@ -600,6 +607,7 @@ impl Orchestrator {
                 completion_tokens: 0,
                 output_files: Vec::new(),
                 recommends: Vec::new(),
+                diagnostics_summary: Default::default(),
             }));
         }
 
@@ -1160,6 +1168,7 @@ impl Orchestrator {
                 completion_tokens: result.total_completion_tokens,
                 output_files: Vec::new(),
                 recommends: Vec::new(),
+                diagnostics_summary: result.diagnostics_summary,
             }));
         }
 
@@ -1180,6 +1189,7 @@ impl Orchestrator {
             cache_write_tokens: result.cache_write_tokens,
             request_id,
             hit_max_iterations: result.hit_max_iterations,
+            diagnostics_summary: result.diagnostics_summary,
         }))
     }
 
@@ -1367,6 +1377,7 @@ impl Orchestrator {
             completion_tokens: run.total_completion_tokens,
             output_files,
             recommends,
+            diagnostics_summary: run.diagnostics_summary,
         })
     }
 
@@ -1507,6 +1518,7 @@ struct CompletedRun {
     /// 本轮是否因命中 `max_iterations` 上限而终止（R2.2/R14）。
     /// post_process 据此打 WARN 告警并写失败审计（原因码 hit_max_iterations）。
     hit_max_iterations: bool,
+    diagnostics_summary: tyclaw_agent::runtime::RunDiagnosticsSummary,
 }
 
 /// run_agent 的返回值：要么提前返回（ask_user），要么正常完成。
