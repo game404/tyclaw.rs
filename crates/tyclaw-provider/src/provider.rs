@@ -156,6 +156,10 @@ pub trait LLMProvider: Send + Sync {
         model: Option<String>,
         cache_scope: Option<String>,
     ) -> LLMResponse {
+        let call_context = crate::events::next_call_context();
+        let event_model = model.as_deref().unwrap_or_else(|| self.default_model()).to_string();
+        let event_endpoint = self.api_base();
+        crate::events::CURRENT_LLM_CALL.scope(call_context.clone(), async {
         let settings = self.generation_settings();
         let request = ChatRequest {
             messages,
@@ -217,6 +221,12 @@ pub trait LLMProvider: Send + Sync {
                     };
                     continue;
                 }
+                if call_context.saw_timeout() {
+                    crate::events::emit_call_outcome(
+                        crate::events::ProviderEventKind::RecoveredAfterTimeout,
+                        &event_model, &event_endpoint,
+                    );
+                }
                 return response;
             }
             // 如果不是临时性错误，不再重试
@@ -259,17 +269,62 @@ pub trait LLMProvider: Send + Sync {
                 error = final_resp.content.as_deref().unwrap_or(""),
                 "LLM retries exhausted on transient error, returning retry-later prompt"
             );
+            crate::events::emit_call_outcome(
+                crate::events::ProviderEventKind::RetryExhausted,
+                &event_model, &event_endpoint,
+            );
             return retry_exhausted_response();
         }
 
+        if final_resp.finish_reason != "error" && call_context.saw_timeout() {
+            crate::events::emit_call_outcome(
+                crate::events::ProviderEventKind::RecoveredAfterTimeout,
+                &event_model, &event_endpoint,
+            );
+        }
         final_resp
+        }).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{emit_send_timeout, install_provider_event_sink, ProviderEventKind, ProviderEventSink, TransportKind, EVENT_SINK_TEST_LOCK};
     use proptest::prelude::*;
+    use std::sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc};
+
+    struct EventfulProvider { calls: AtomicUsize, failures: usize }
+    #[async_trait]
+    impl LLMProvider for EventfulProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<LLMResponse, TyclawError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.failures {
+                emit_send_timeout(TransportKind::Sse, call + 1, "fake-model", "https://provider.test/v1");
+                Ok(LLMResponse::error("send timeout"))
+            } else { Ok(LLMResponse { content: Some("ok".into()), tool_calls: vec![], finish_reason: "stop".into(), usage: Default::default(), reasoning_content: None }) }
+        }
+        fn default_model(&self) -> &str { "fake-model" }
+        fn api_base(&self) -> String { "https://provider.test/v1".into() }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_and_exhaustion_share_one_call_id_and_keep_response() {
+        let _lock = EVENT_SINK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        install_provider_event_sink(Some(Arc::new(ProviderEventSink::new(tx, Arc::new(AtomicU64::new(0))))));
+        let recovered = EventfulProvider { calls: AtomicUsize::new(0), failures: 2 }.chat_with_retry(vec![], None, None, None).await;
+        assert_eq!(recovered.content.as_deref(), Some("ok"));
+        let mut events = vec![]; while let Ok(event) = rx.try_recv() { events.push(event); }
+        assert_eq!(events.iter().filter(|e| e.kind == ProviderEventKind::RecoveredAfterTimeout).count(), 1);
+        assert!(events.iter().all(|e| e.call_id == events[0].call_id));
+
+        let exhausted = EventfulProvider { calls: AtomicUsize::new(0), failures: usize::MAX }.chat_with_retry(vec![], None, None, None).await;
+        assert_eq!(exhausted.content.as_deref(), Some(RETRY_LATER_MESSAGE));
+        let mut exhausted_events = vec![]; while let Ok(event) = rx.try_recv() { exhausted_events.push(event); }
+        assert_eq!(exhausted_events.iter().filter(|e| e.kind == ProviderEventKind::RetryExhausted).count(), 1);
+        install_provider_event_sink(None);
+    }
 
     /// 失败兜底文案（污染关键词）样例，重试耗尽提示不得包含此类文本。
     const FAILURE_FALLBACK: &str = "I cannot make progress";

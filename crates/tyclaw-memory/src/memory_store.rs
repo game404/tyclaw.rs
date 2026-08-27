@@ -270,14 +270,14 @@ pub async fn consolidate_with_provider(
     user_msg.insert("role".into(), serde_json::Value::String("user".into()));
     user_msg.insert("content".into(), serde_json::Value::String(prompt));
 
-    match provider
-        .chat_with_retry(
+    match tyclaw_provider::CURRENT_WORKLOAD_KIND.scope(
+        tyclaw_provider::WorkloadKind::Memory,
+        provider.chat_with_retry(
             vec![sys_msg, user_msg],
             Some(tools_vec),
             Some(model.to_string()),
             None,
-        )
-        .await
+        )).await
     {
         response if response.has_tool_calls() => {
             let tc = &response.tool_calls[0];

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,24 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_NODE_MAX_DURATION_MS: u64 = 300_000;
 /// 默认 dispatch 整体最大执行时间（ms）= 10 分钟（R7.3）。
 const DEFAULT_DISPATCH_MAX_DURATION_MS: u64 = 600_000;
+
+async fn in_subtask_workload_scope<F: Future>(future: F) -> F::Output {
+    tyclaw_provider::CURRENT_WORKLOAD_KIND
+        .scope(tyclaw_provider::WorkloadKind::Subtask, future).await
+}
+
+#[cfg(test)]
+mod workload_tests {
+    use super::in_subtask_workload_scope;
+    use tyclaw_provider::{WorkloadKind, CURRENT_WORKLOAD_KIND};
+    #[tokio::test]
+    async fn spawned_task_uses_subtask_workload() {
+        let value = tokio::spawn(in_subtask_workload_scope(async {
+            CURRENT_WORKLOAD_KIND.with(|kind| *kind)
+        })).await.unwrap();
+        assert_eq!(value, WorkloadKind::Subtask);
+    }
+}
 
 /// DAG 调度器：按拓扑序调度 ready 节点并行执行。
 pub struct DagScheduler {
@@ -292,7 +311,7 @@ impl DagScheduler {
                 let user_id_for_spawn =
                     tyclaw_provider::CURRENT_USER_ID.try_with(|u| u.clone()).ok();
                 tracing::debug!(node_id = %node_id, "Scheduler spawning task");
-                join_set.spawn(async move {
+                join_set.spawn(in_subtask_workload_scope(async move {
                     // 在 spawned task 中重建 sandbox scope
                     let inner = async {
                     tracing::debug!(node_id = %node_id, "Task started, acquiring semaphore");
@@ -346,7 +365,7 @@ impl DagScheduler {
                     } else {
                         with_user.await
                     }
-                });
+                }));
             }
 
             // 收割已完成的任务

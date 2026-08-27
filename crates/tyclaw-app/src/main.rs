@@ -7,6 +7,7 @@
 //! 配置优先级（从高到低）：命令行参数 > 环境变量 > config.yaml > 默认值
 
 mod monitor;
+mod llm_alerts;
 
 use clap::Parser;
 use serde::Deserialize;
@@ -41,6 +42,8 @@ struct AppConfig {
     analytics: tyclaw_control::AnalyticsConfig,
     #[serde(default)]
     privacy: PrivacyConfig,
+    #[serde(default)]
+    llm_alerts: llm_alerts::LlmAlertsConfig,
 }
 
 /// 内容隐私配置；默认不采集或展示问答正文。
@@ -107,6 +110,14 @@ mod config_tests {
     }
 
     #[test]
+    fn llm_alert_admin_ids_are_redacted_from_debug() {
+        let config: AppConfig = serde_yaml::from_str("llm_alerts:\n  notification:\n    admin_user_ids: [fake-admin-a, fake-admin-b]\n").unwrap();
+        let debug = format!("{:?}", config.llm_alerts);
+        assert!(debug.contains("admin_count: 2"));
+        assert!(!debug.contains("fake-admin-a"));
+    }
+
+    #[test]
     fn timer_message_contains_only_job_name_and_payload() {
         let content = timer_message_content("测试任务", "执行付款脚本");
         assert_eq!(content, "[Scheduled Task: 测试任务] 执行付款脚本");
@@ -118,6 +129,7 @@ mod config_tests {
 fn resolve_monitor_options(
     cfg: &MonitorConfig,
     hide_content: bool,
+    llm_alerts: Arc<parking_lot::RwLock<llm_alerts::AlertSnapshot>>,
 ) -> Option<monitor::MonitorOptions> {
     if !cfg.enabled {
         tracing::info!("Monitor disabled by config");
@@ -143,6 +155,7 @@ fn resolve_monitor_options(
         port: cfg.port,
         basic_auth: basic,
         hide_content,
+        llm_alerts,
     })
 }
 
@@ -178,6 +191,7 @@ fn format_effective_config(
     monitor: &MonitorConfig,
     analytics: &tyclaw_control::AnalyticsConfig,
     privacy: &PrivacyConfig,
+    llm_alerts: &llm_alerts::LlmAlertsConfig,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     macro_rules! p {
@@ -224,6 +238,11 @@ fn format_effective_config(
     p!("monitor.port: {}", monitor.port);
     p!("monitor.basic_auth: {}", if monitor.basic_auth.is_some() { "configured" } else { "<none>" });
     p!("privacy.hide_content: {}", privacy.hide_content);
+    p!("llm_alerts.enabled: {}", llm_alerts.enabled);
+    p!("llm_alerts.warning: {}/{}s", llm_alerts.warning.min_send_timeouts, llm_alerts.warning.window_secs);
+    p!("llm_alerts.critical: interactive={}, background={}/{}s", llm_alerts.critical.interactive_exhausted, llm_alerts.critical.background_exhausted, llm_alerts.critical.background_window_secs);
+    p!("llm_alerts.notification.channel: {}", llm_alerts.notification.channel);
+    p!("llm_alerts.notification.admin_count: {}", llm_alerts.notification.admin_user_ids.len());
     p!("analytics.enabled: {}", analytics.enabled);
     p!("analytics.timezone: {}", analytics.timezone);
     p!("analytics.detail_retention_days: {}", analytics.detail_retention_days);
@@ -438,6 +457,7 @@ async fn main() {
     let max_iterations = args.max_iterations.unwrap_or(cfg.llm.max_iterations);
     let context_window = args.context_window_tokens.or(cfg.llm.context_window_tokens);
     let snapshot = cfg.llm.snapshot;
+    let alert_runtime = llm_alerts::AlertRuntime::prepare(app_cfg.llm_alerts.clone());
 
     let config_lines = format_effective_config(
         &config_path,
@@ -456,6 +476,7 @@ async fn main() {
         &app_cfg.monitor,
         &app_cfg.analytics,
         &app_cfg.privacy,
+        &app_cfg.llm_alerts,
     );
 
     info!(
@@ -502,6 +523,7 @@ async fn main() {
         analytics: app_cfg.analytics,
         hide_content: app_cfg.privacy.hide_content,
         startup_lines: config_lines,
+        alert_runtime: Some(alert_runtime),
     };
 
     if args.dingtalk {
@@ -608,6 +630,7 @@ struct RunConfig {
     hide_content: bool,
     /// 启动时的配置摘要（在 CLI 滚动区显示）
     startup_lines: Vec<String>,
+    alert_runtime: Option<llm_alerts::AlertRuntime>,
 }
 
 impl RunConfig {
@@ -648,10 +671,13 @@ impl RunConfig {
 }
 
 /// 以 CLI 模式运行。
-async fn run_cli(config: RunConfig, monitor_cfg: MonitorConfig) {
+async fn run_cli(mut config: RunConfig, monitor_cfg: MonitorConfig) {
     let idle_timeout_secs = config.workspace_config.idle_timeout_secs;
     let startup_lines = config.startup_lines.clone();
     let hide_content = config.hide_content;
+    let mut alert_runtime = config.alert_runtime.take().expect("alert runtime prepared");
+    let alert_snapshot = Arc::clone(&alert_runtime.snapshot);
+    let alert_task = alert_runtime.start(None);
     let (timer_svc, timer_rx) = create_timer_service(&config.workspace);
 
     let mut orchestrator = config.build_orchestrator(timer_svc.clone(), None);
@@ -676,7 +702,7 @@ async fn run_cli(config: RunConfig, monitor_cfg: MonitorConfig) {
     // 监控 HTTP 服务
     monitor::spawn_monitor(
         Arc::clone(&orchestrator),
-        resolve_monitor_options(&monitor_cfg, hide_content),
+        resolve_monitor_options(&monitor_cfg, hide_content, alert_snapshot),
     );
 
     // 启动 workspace 超时回收后台任务
@@ -698,6 +724,7 @@ async fn run_cli(config: RunConfig, monitor_cfg: MonitorConfig) {
     _dispatcher_handle.abort();
     _bus_handle_task.abort();
     timer_svc.stop();
+    llm_alerts::shutdown_alert_manager(alert_task).await;
 }
 
 /// 钉钉发送器配置（可选，hybrid 模式下传入）。
@@ -996,9 +1023,12 @@ fn spawn_timer_consumer(
 /// 共享同一个 Orchestrator 和 MessageBus。
 /// DingTalk 消息通过 Stream 收发，CLI 消息通过 stdin/stdout。
 /// CLI 退出时整个进程退出。
-async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig, monitor_cfg: MonitorConfig) {
+async fn run_hybrid(mut config: RunConfig, dt_config: DingTalkConfig, monitor_cfg: MonitorConfig) {
     let idle_timeout_secs = config.workspace_config.idle_timeout_secs;
     let hide_content = config.hide_content;
+    let alert_instance = std::env::var("HOSTNAME").unwrap_or_else(|_| "tyclaw".into());
+    let mut alert_runtime = config.alert_runtime.take().expect("alert runtime prepared");
+    let alert_snapshot = Arc::clone(&alert_runtime.snapshot);
     let DingTalkConfig {
         client_id,
         client_secret,
@@ -1026,6 +1056,13 @@ async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig, monitor_cfg: M
     let (timer_svc, timer_rx) = create_timer_service(&config.workspace);
     let credential = Credential::new(&client_id, &client_secret);
     let token_manager = TokenManager::new(credential.clone());
+    let alert_notifier: Option<Arc<dyn llm_alerts::AlertNotifier>> = alert_runtime
+        .notification_config()
+        .filter(|notification| !notification.admin_user_ids.is_empty())
+        .map(|notification| Arc::new(llm_alerts::DingTalkNotifier::new(
+            token_manager.clone(), client_id.clone(), notification, alert_instance.clone(),
+        )) as Arc<dyn llm_alerts::AlertNotifier>);
+    let alert_task = alert_runtime.start(alert_notifier);
     let mut orchestrator = config.build_orchestrator(
         timer_svc.clone(),
         Some((outbound, token_manager.clone(), client_id.clone())),
@@ -1058,7 +1095,7 @@ async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig, monitor_cfg: M
     // 监控 HTTP 服务
     monitor::spawn_monitor(
         Arc::clone(&orchestrator),
-        resolve_monitor_options(&monitor_cfg, hide_content),
+        resolve_monitor_options(&monitor_cfg, hide_content, alert_snapshot),
     );
 
     // 启动 workspace 超时回收后台任务
@@ -1153,6 +1190,7 @@ async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig, monitor_cfg: M
         timer_svc.stop();
         bus_task.abort();
         dispatcher_task.abort();
+        llm_alerts::shutdown_alert_manager(alert_task).await;
     } else {
         info!("No terminal detected, running as background service (DingTalk + Timer only)");
         // 等待 Ctrl+C 信号退出
@@ -1161,5 +1199,6 @@ async fn run_hybrid(config: RunConfig, dt_config: DingTalkConfig, monitor_cfg: M
         timer_svc.stop();
         bus_task.abort();
         dispatcher_task.abort();
+        llm_alerts::shutdown_alert_manager(alert_task).await;
     }
 }
