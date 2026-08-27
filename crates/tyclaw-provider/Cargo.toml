@@ -12,6 +12,7 @@ reqwest = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 futures-util = { workspace = true }
+arc-swap = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

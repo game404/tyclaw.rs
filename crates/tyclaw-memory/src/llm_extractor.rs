@@ -79,7 +79,9 @@ pub async fn llm_extract_case(
         },
     ];
 
-    let response = provider.chat_with_retry(messages, None, None, None).await;
+    let response = tyclaw_provider::CURRENT_WORKLOAD_KIND
+        .scope(tyclaw_provider::WorkloadKind::Memory, provider.chat_with_retry(messages, None, None, None))
+        .await;
 
     if response.finish_reason == "error" {
         warn!("LLM case extraction failed: {:?}", response.content);

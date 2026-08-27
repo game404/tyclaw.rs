@@ -18,6 +18,21 @@ use tyclaw_types::TyclawError;
 use crate::orchestrator::Orchestrator;
 use crate::types::{AgentResponse, RequestContext};
 use tyclaw_control::UsageSource;
+
+fn provider_workload(is_timer: bool) -> tyclaw_provider::WorkloadKind {
+    if is_timer { tyclaw_provider::WorkloadKind::Timer } else { tyclaw_provider::WorkloadKind::Interactive }
+}
+
+#[cfg(test)]
+mod workload_tests {
+    use super::provider_workload;
+    use tyclaw_provider::WorkloadKind;
+    #[test]
+    fn timer_and_interactive_messages_map_to_provider_workloads() {
+        assert_eq!(provider_workload(true), WorkloadKind::Timer);
+        assert_eq!(provider_workload(false), WorkloadKind::Interactive);
+    }
+}
 #[derive(Debug, Clone)]
 pub struct TimerRunContext { pub user_id: String, pub job_id: String, pub started_at: std::time::Instant }
 
@@ -164,6 +179,8 @@ impl MessageBus {
         };
         let run_future =
             orchestrator.handle_with_source(&msg.content, &req, Some(&progress_cb), source);
+        let run_future = tyclaw_provider::CURRENT_WORKLOAD_KIND
+            .scope(provider_workload(msg.is_timer), run_future);
 
         // 构建心跳发送器：子任务通过 task_local 转发 [heartbeat] 消息到消息总线
         let heartbeat_outbound = outbound_tx.clone();

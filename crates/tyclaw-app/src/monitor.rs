@@ -16,6 +16,7 @@ pub struct MonitorOptions {
     pub port: u16,
     pub basic_auth: Option<(String, String)>,
     pub hide_content: bool,
+    pub llm_alerts: Arc<parking_lot::RwLock<crate::llm_alerts::AlertSnapshot>>,
 }
 
 pub fn spawn_monitor(orchestrator: Arc<Orchestrator>, options: Option<MonitorOptions>) {
@@ -23,6 +24,7 @@ pub fn spawn_monitor(orchestrator: Arc<Orchestrator>, options: Option<MonitorOpt
     let addr = format!("{}:{}", opts.bind.trim(), opts.port);
     let basic = opts.basic_auth.clone();
     let hide_content = opts.hide_content;
+    let llm_alerts = opts.llm_alerts.clone();
     tokio::spawn(async move {
         let listener = match TcpListener::bind(&addr).await {
             Ok(l) => {
@@ -42,6 +44,7 @@ pub fn spawn_monitor(orchestrator: Arc<Orchestrator>, options: Option<MonitorOpt
             let orch = Arc::clone(&orchestrator);
             let basic = basic.clone();
             let hide_content = hide_content;
+            let llm_alerts = llm_alerts.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 16384];
                 let n = match stream.read(&mut buf).await {
@@ -81,7 +84,7 @@ pub fn spawn_monitor(orchestrator: Arc<Orchestrator>, options: Option<MonitorOpt
                     ("GET", "/api/stats") => http_response(
                         "200 OK",
                         "application/json; charset=utf-8",
-                        &build_stats_json(&orch, hide_content),
+                        &build_stats_json(&orch, hide_content, &llm_alerts),
                     ),
                     ("GET", "/api/analytics") => {
                         build_analytics_response(&orch, raw_query, hide_content).await
@@ -335,7 +338,7 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn build_stats_json(orch: &Orchestrator, hide_content: bool) -> String {
+fn build_stats_json(orch: &Orchestrator, hide_content: bool, llm_alerts: &Arc<parking_lot::RwLock<crate::llm_alerts::AlertSnapshot>>) -> String {
     let active_tasks = {
         let tasks = orch.active_tasks().lock();
         tasks
@@ -373,6 +376,7 @@ fn build_stats_json(orch: &Orchestrator, hide_content: bool) -> String {
     };
     let works_stats = build_works_stats(orch);
     let app = orch.app();
+    let alert = llm_alerts.read();
     serde_json::json!({
         "model": app.model,
         "workspace": app.workspace.display().to_string(),
@@ -384,6 +388,12 @@ fn build_stats_json(orch: &Orchestrator, hide_content: bool) -> String {
         "skills": skills,
         "skill_count": skills.len(),
         "works_stats": works_stats,
+        "llm_alerts": {
+            "level": alert.level, "available": alert.available, "reason": alert.reason,
+            "send_timeouts": alert.send_timeouts, "exhausted_calls": alert.exhausted_calls,
+            "dropped_events": alert.dropped_events, "state_evictions": alert.state_evictions,
+            "notification_status": alert.notification_status, "last_error_kind": alert.last_error_kind,
+        },
     })
     .to_string()
 }
@@ -534,7 +544,7 @@ function table(target,headers,rows,wrapColumns=[]){const root=byId(target);clear
 async function getJson(url){const response=await fetch(url,{headers:{Accept:'application/json'},cache:'no-store'});let body={};try{body=await response.json()}catch(_){}if(!response.ok)throw new Error(body.error||('HTTP '+response.status));return body}
 function renderAudit(data){const rows=data.audit_recent||[];if(data.privacy_mode){table('audit',['时间','渠道','工具','耗时'],rows.map(v=>[v.time,v.channel,fmt(v.tools),v.duration||'']))}else{table('audit',['时间','渠道','请求','工具','耗时'],rows.map(v=>[v.time,v.channel,v.request,fmt(v.tools),v.duration||'']),[2])}}
 function renderRecent(data){const rows=data.recent||[];if(data.privacy_mode){table('recent',['时间','用户','渠道','来源','状态','耗时','工具'],rows.map(v=>[v.started_at,v.user_name||v.masked_user_id,v.channel,v.source,v.status,fmt(v.duration_ms)+' ms',(v.tools||[]).map(t=>t.name).join(', ')]),[6])}else{table('recent',['时间','用户','渠道','来源','状态','问题摘要','回答摘要','耗时','工具'],rows.map(v=>[v.started_at,v.user_name||v.masked_user_id,v.channel,v.source,v.status,v.request_preview,v.response_preview,fmt(v.duration_ms)+' ms',(v.tools||[]).map(t=>t.name).join(', ')]),[5,6,8])}}
-async function loadOverview(){try{const data=await getJson('/api/stats');byId('instance').textContent=data.model+' | '+data.workspace+' | ctx '+data.context_window;byId('overview-updated').textContent=new Date().toLocaleTimeString('zh-CN');renderMetrics('overview-metrics',[['活跃任务',fmt(data.active_task_count)],['Skill',fmt(data.skill_count)],['工作区',fmt(data.works_stats?.workspaces_total)],['上下文窗口',fmt(data.context_window)]]);table('tasks',['工作区','用户','任务','运行秒数'],(data.active_tasks||[]).map(v=>[v.workspace,v.user_id,v.summary,fmt(v.elapsed_secs)]),[2]);const ws=data.works_stats||{};const workRows=Object.entries(ws.buckets||{});table('works',['类别','数量'],workRows);if(ws.note){byId('works').append(make('div','muted',ws.note))}table('skills',['名称','分类','状态'],(data.skills||[]).map(v=>[v.name,v.category,v.status]),[0]);renderAudit(data)}catch(error){byId('instance').textContent='运行状态不可用';empty('tasks',error.message)}}
+async function loadOverview(){try{const data=await getJson('/api/stats');byId('instance').textContent=data.model+' | '+data.workspace+' | ctx '+data.context_window;byId('overview-updated').textContent=new Date().toLocaleTimeString('zh-CN');const alert=data.llm_alerts||{};renderMetrics('overview-metrics',[['活跃任务',fmt(data.active_task_count)],['Skill',fmt(data.skill_count)],['工作区',fmt(data.works_stats?.workspaces_total)],['上下文窗口',fmt(data.context_window)],['LLM告警',alert.level||'unknown','超时 '+fmt(alert.send_timeouts)+' | 耗尽 '+fmt(alert.exhausted_calls)+' | 通知 '+(alert.notification_status||'unknown')]]);table('tasks',['工作区','用户','任务','运行秒数'],(data.active_tasks||[]).map(v=>[v.workspace,v.user_id,v.summary,fmt(v.elapsed_secs)]),[2]);const ws=data.works_stats||{};const workRows=Object.entries(ws.buckets||{});table('works',['类别','数量'],workRows);if(ws.note){byId('works').append(make('div','muted',ws.note))}table('skills',['名称','分类','状态'],(data.skills||[]).map(v=>[v.name,v.category,v.status]),[0]);renderAudit(data)}catch(error){byId('instance').textContent='运行状态不可用';empty('tasks',error.message)}}
 document.querySelectorAll('.tab').forEach(button=>button.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(tab=>tab.setAttribute('aria-selected',String(tab===button)));document.querySelectorAll('.view').forEach(view=>view.hidden=view.id!==button.dataset.view);if(button.dataset.view==='analytics')loadAnalytics()}));
 function syncOptions(id,values){const select=byId(id);const current=select.value;while(select.options.length>1)select.remove(1);values.forEach(value=>{const option=make('option','',value);option.value=value;select.append(option)});if(values.includes(current))select.value=current}
 let activeRange='month';

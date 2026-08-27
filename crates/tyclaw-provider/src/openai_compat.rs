@@ -633,6 +633,12 @@ impl OpenAICompatProvider {
                 }
                 Err(_) => {
                     last_err = format!("send timeout ({SEND_TIMEOUT_SECS}s)");
+                    crate::events::emit_send_timeout(
+                        crate::events::TransportKind::Sse,
+                        attempt as usize,
+                        request.model.as_deref().unwrap_or(self.default_model.as_str()),
+                        &self.api_base,
+                    );
                     warn!(attempt, timeout_s = SEND_TIMEOUT_SECS, "SSE send timeout, retrying");
                 }
             }
@@ -1049,6 +1055,12 @@ impl OpenAICompatProvider {
                 }
                 Err(_) => {
                     last_err = format!("send timeout ({NON_STREAM_TIMEOUT_SECS}s)");
+                    crate::events::emit_send_timeout(
+                        crate::events::TransportKind::NonStream,
+                        attempt as usize,
+                        request.model.as_deref().unwrap_or(self.default_model.as_str()),
+                        &self.api_base,
+                    );
                     warn!(attempt, timeout_s = NON_STREAM_TIMEOUT_SECS, "Non-stream send timeout, retrying");
                 }
             }

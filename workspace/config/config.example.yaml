@@ -339,6 +339,32 @@ subtasks:
 #   hide_content: true
 
 # ============================================================================
+# LLM Provider 超时两级预警（默认关闭；配置变更后需重启）
+# 管理员 userId 仅可配置在应用级 config.yaml；真实 ID 属于敏感信息，不得提交或输出日志。
+# ============================================================================
+# llm_alerts:
+#   enabled: true
+#   warning:
+#     window_secs: 900                 # 15 分钟滑动窗口
+#     min_send_timeouts: 15            # 第 15 次底层发送超时触发普通告警
+#     cooldown_secs: 7200              # 普通告警 2 小时冷却
+#   critical:
+#     interactive_exhausted: 1         # 交互请求最终耗尽 1 次立即严重告警
+#     background_exhausted: 2          # 后台任务 60 分钟内最终耗尽 2 次
+#     background_window_secs: 3600
+#     cooldown_secs: 7200              # 严重告警 2 小时冷却
+#   recovery:
+#     quiet_window_secs: 1800           # 连续 30 分钟稳定后恢复
+#     max_send_timeouts: 2
+#     notify: true
+#   notification:
+#     channel: "dingtalk"
+#     admin_user_ids:
+#       - "YOUR_DINGTALK_ADMIN_USER_ID"
+#     max_recipients: 20
+#     timeout_secs: 15
+
+# ============================================================================
 # 监控 HTTP 服务（可选）
 # ============================================================================
 # monitor:

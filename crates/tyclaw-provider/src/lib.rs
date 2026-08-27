@@ -19,6 +19,9 @@ pub mod openai_compat;
 /// Reasoning 结构化解析器 —— 解析 thinking/reasoning 内容为结构化块
 pub mod reasoning;
 
+/// Provider 生命周期事件；供应用层旁路观测，不参与请求控制。
+pub mod events;
+
 // 重新导出核心类型
 pub use concurrency::{
     acquire_permit, controller, init_concurrency_controller, ConcurrencyConfig,
@@ -33,3 +36,7 @@ pub use provider::{
 };
 pub use reasoning::{parse_reasoning, ParsedReasoning, ReasoningBlock};
 pub use types::{ChatRequest, GenerationSettings, LLMResponse, ThinkingConfig, ToolCallRequest};
+pub use events::{
+    install_provider_event_sink, provider_event_dropped_count, ProviderEvent, ProviderEventKind,
+    ProviderEventSink, TransportKind, WorkloadKind, CURRENT_WORKLOAD_KIND,
+};

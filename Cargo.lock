@@ -3114,9 +3114,11 @@ dependencies = [
 name = "tyclaw-app"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "clap",
+ "parking_lot",
  "reqwest 0.12.28",
  "rustyline",
  "serde",
@@ -3265,6 +3267,7 @@ dependencies = [
 name = "tyclaw-provider"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "futures-util",
  "proptest",

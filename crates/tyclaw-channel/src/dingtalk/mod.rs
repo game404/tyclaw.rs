@@ -8,6 +8,7 @@
 //! - `bot`: 编排器适配层（把消息交给 Orchestrator）
 
 pub mod ai_card;
+pub mod admin;
 pub mod bot;
 pub mod credential;
 pub mod gateway;
@@ -20,6 +21,7 @@ pub use ai_card::{
     new_card_registry, reap_stale_cards, AiCardCallbackHandler, AiCardRegistry, CardReplier,
     CARD_CALLBACK_TOPIC,
 };
+pub use admin::{AdminMarkdownSender, AdminSendError, AdminSendErrorKind};
 pub use bot::DingTalkBot;
 pub use credential::{Credential, TokenManager};
 /// 表格修复：把畸形/单行拼接的管道表格修复为合法 GFM 表格（供出口与手动测试使用）。
