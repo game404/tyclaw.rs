@@ -89,6 +89,10 @@ fn extract_modules(text: &str) -> Vec<String> {
     Vec::new()
 }
 
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
 /// 生成确定性的案例 ID。
 ///
 /// 基于问题和回答的内容计算 SHA256 哈希值，取前6个字节（12个十六进制字符）。
@@ -144,13 +148,10 @@ pub fn extract_case(
     }
 
     // 构建案例记录
-    let mut record = CaseRecord::new(
-        &question[..question.len().min(500)], // 问题截断到500字符
-        workspace_id,
-    );
+    let mut record = CaseRecord::new(truncate_chars(question, 500), workspace_id);
     record.case_id = deterministic_id(question, answer); // 使用确定性 ID
-    record.root_cause = root_cause.chars().take(500).collect(); // 根因截断到500字符
-    record.solution = solution.chars().take(500).collect(); // 方案截断到500字符
+    record.root_cause = truncate_chars(&root_cause, 500);
+    record.solution = truncate_chars(&solution, 500);
     record.modules = modules;
     record.tools_used = tools_used.to_vec();
     record.user_id = user_id.to_string();
@@ -162,6 +163,7 @@ pub fn extract_case(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     /// 测试：包含解决关键词的回答应被识别
     #[test]
@@ -180,6 +182,44 @@ mod tests {
         assert!(case.is_some());
         let c = case.unwrap();
         assert!(c.root_cause.contains("missing import"));
+    }
+
+    #[test]
+    fn test_extract_case_truncates_multibyte_question_without_panicking() {
+        let question = "行".repeat(501);
+        let answer = "问题已修复，原因是配置错误";
+        let case = extract_case(&question, answer, &[], "ws1", "u1", 1.0)
+            .expect("resolved issue should produce a case");
+
+        assert_eq!(case.question.chars().count(), 500);
+        assert_eq!(case.question, "行".repeat(500));
+        assert_eq!(case.case_id, deterministic_id(&question, answer));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn extract_case_question_is_always_a_valid_500_char_prefix(question in any::<String>()) {
+            let case = extract_case(
+                &question,
+                "问题已修复，原因是测试",
+                &[],
+                "ws1",
+                "u1",
+                0.0,
+            )
+            .expect("resolved issue should produce a case");
+            let expected: String = question.chars().take(500).collect();
+
+            prop_assert_eq!(&case.question, &expected);
+            prop_assert!(case.question.chars().count() <= 500);
+        }
+    }
+
+    #[test]
+    fn test_truncate_chars_preserves_short_and_mixed_unicode_text() {
+        assert_eq!(truncate_chars("short", 500), "short");
+        assert_eq!(truncate_chars("中A🙂文", 3), "中A🙂");
+        assert_eq!(truncate_chars("anything", 0), "");
     }
 
     /// 测试：确定性 ID 的一致性和唯一性
