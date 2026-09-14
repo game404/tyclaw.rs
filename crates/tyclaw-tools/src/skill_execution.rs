@@ -21,6 +21,8 @@ pub struct SkillTimeoutOverride {
 pub struct ResolvedSkillExecution {
     pub skill_name: String,
     pub timeout_secs: u64,
+    pub configured_timeout_secs: u64,
+    pub requested_timeout_secs: Option<u64>,
     pub source: &'static str,
 }
 
@@ -83,12 +85,12 @@ impl SkillExecutionConfig {
         workspace: Option<&str>,
     ) -> Option<ResolvedSkillExecution> {
         let skill_name = identify_skill_in_workspace(command, workspace)?;
-        let configured_timeout = self.timeout_for(&skill_name);
-        let timeout_secs = requested_timeout
-            .filter(|value| *value > 0)
-            .map_or(configured_timeout, |value| value.min(configured_timeout));
+        let configured_timeout_secs = self.timeout_for(&skill_name);
+        let requested_timeout_secs = requested_timeout.filter(|value| *value > 0);
         Some(ResolvedSkillExecution {
-            timeout_secs,
+            timeout_secs: configured_timeout_secs,
+            configured_timeout_secs,
+            requested_timeout_secs,
             source: self.source_for(&skill_name),
             skill_name,
         })
@@ -529,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_skill_timeout_as_a_cap() {
+    fn configured_skill_timeout_is_authoritative() {
         let cfg: SkillExecutionConfig = serde_yaml::from_str(
             "default_timeout_secs: 1800\nskills:\n  finance-payment:\n    timeout_secs: 2700\n",
         )
@@ -537,16 +539,33 @@ mod tests {
         let command =
             "python3 /workspace/skills/finance/finance-payment/scripts/run_payment_report.py";
 
-        let capped = cfg.resolve(command, Some(9999)).unwrap();
-        assert_eq!(capped.skill_name, "finance-payment");
-        assert_eq!(capped.timeout_secs, 2700);
-        assert_eq!(capped.source, "override");
+        let cases = [
+            (None, None),
+            (Some(0), None),
+            (Some(5), Some(5)),
+            (Some(2700), Some(2700)),
+            (Some(9999), Some(9999)),
+        ];
 
-        let shorter = cfg.resolve(command, Some(5)).unwrap();
-        assert_eq!(shorter.timeout_secs, 5);
+        for (requested, normalized_requested) in cases {
+            let resolved = cfg.resolve(command, requested).unwrap();
+            assert_eq!(resolved.skill_name, "finance-payment");
+            assert_eq!(resolved.timeout_secs, 2700);
+            assert_eq!(resolved.configured_timeout_secs, 2700);
+            assert_eq!(resolved.requested_timeout_secs, normalized_requested);
+            assert_eq!(resolved.source, "override");
+        }
 
-        let zero = cfg.resolve(command, Some(0)).unwrap();
-        assert_eq!(zero.timeout_secs, 2700);
+        let defaulted = cfg
+            .resolve(
+                "python3 /workspace/skills/finance/other/scripts/run.py",
+                Some(5),
+            )
+            .unwrap();
+        assert_eq!(defaulted.timeout_secs, 1800);
+        assert_eq!(defaulted.configured_timeout_secs, 1800);
+        assert_eq!(defaulted.requested_timeout_secs, Some(5));
+        assert_eq!(defaulted.source, "default");
     }
 
     #[test]
