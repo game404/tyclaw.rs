@@ -135,7 +135,7 @@ impl Tool for ExecTool {
             "properties": {
                 "command": { "type": "string", "description": "The shell command to execute" },
                 "working_directory": { "type": "string", "description": "Working directory for command execution. Relative paths resolved against workspace root. Default: workspace root." },
-                "timeout": { "type": "integer", "description": "Command timeout in seconds. Default: 120. Increase for long-running builds." }
+                "timeout": { "type": "integer", "description": "Timeout in seconds for ordinary commands. Recognized Skill commands ignore this parameter and use the administrator-configured skill_execution timeout. Default for ordinary commands: 120." }
             },
             "required": ["command"]
         })
@@ -192,7 +192,10 @@ impl Tool for ExecTool {
             tracing::info!(
                 skill_name = %resolved.skill_name,
                 policy_source = resolved.source,
-                timeout_secs,
+                configured_timeout_secs = resolved.configured_timeout_secs,
+                requested_timeout_secs = ?resolved.requested_timeout_secs,
+                effective_timeout_secs = resolved.timeout_secs,
+                requested_timeout_ignored = resolved.requested_timeout_secs.is_some(),
                 "Applying skill execution policy"
             );
         }
@@ -235,7 +238,10 @@ impl Tool for ExecTool {
             tracing::info!(
                 skill_name = %resolved.skill_name,
                 policy_source = resolved.source,
-                timeout_secs,
+                configured_timeout_secs = resolved.configured_timeout_secs,
+                requested_timeout_secs = ?resolved.requested_timeout_secs,
+                effective_timeout_secs = resolved.timeout_secs,
+                requested_timeout_ignored = resolved.requested_timeout_secs.is_some(),
                 "Applying skill execution policy"
             );
         }
@@ -564,15 +570,35 @@ mod tests {
         let (skill_timeout, skill) = tool
             .resolve_command_policy(
                 "python3 /workspace/skills/finance/finance-payment/scripts/run.py",
-                Some(9999),
+                Some(5),
             )
             .unwrap();
+        let skill = skill.unwrap();
         assert_eq!(skill_timeout, 2700);
-        assert_eq!(skill.unwrap().skill_name, "finance-payment");
+        assert_eq!(skill.skill_name, "finance-payment");
+        assert_eq!(skill.configured_timeout_secs, 2700);
+        assert_eq!(skill.requested_timeout_secs, Some(5));
 
-        let (ordinary_timeout, skill) = tool.resolve_command_policy("echo ok", Some(7)).unwrap();
-        assert_eq!(ordinary_timeout, 7);
+        let (ordinary_default, skill) = tool.resolve_command_policy("echo ok", None).unwrap();
+        assert_eq!(ordinary_default, 120);
         assert!(skill.is_none());
+
+        let (ordinary_requested, skill) = tool.resolve_command_policy("echo ok", Some(7)).unwrap();
+        assert_eq!(ordinary_requested, 7);
+        assert!(skill.is_none());
+    }
+
+    #[test]
+    fn timeout_parameter_explains_skill_policy() {
+        let tool = ExecTool::new(None, None);
+        let parameters = tool.parameters();
+        let description = parameters["properties"]["timeout"]["description"]
+            .as_str()
+            .unwrap();
+
+        assert!(description.contains("ordinary commands"));
+        assert!(description.contains("Recognized Skill commands ignore this parameter"));
+        assert!(description.contains("skill_execution"));
     }
 
     #[tokio::test]
@@ -599,6 +625,8 @@ mod tests {
         let resolved = ResolvedSkillExecution {
             skill_name: "finance-payment".into(),
             timeout_secs: 2700,
+            configured_timeout_secs: 2700,
+            requested_timeout_secs: Some(5),
             source: "override",
         };
         assert_eq!(

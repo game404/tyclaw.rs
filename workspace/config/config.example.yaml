@@ -129,8 +129,9 @@ workspace:
 # Skill 执行策略
 # ============================================================================
 skill_execution:
-  # 所有可识别 Skill 的执行超时；定时任务和手动任务共用，默认 30 分钟。
-  # 该值与 workspace.idle_timeout_secs 相互独立。
+  # 已识别 Skill 的权威执行期限；定时任务和手动任务共用。
+  # exec 工具调用中的 timeout 不会缩短或延长该值。
+  # 用户或系统主动取消仍可立即终止；该值与 workspace.idle_timeout_secs 独立。
   default_timeout_secs: 1800
 
   # 可按 SKILL.md 所在目录名覆盖；未列出的 Skill 使用上方默认值。
